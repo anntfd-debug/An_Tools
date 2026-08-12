@@ -46,6 +46,6 @@ build/
 dist/
 *.egg-info/
 
-# pyRevit / local runtime leftovers
+# pyRevit / generated leftovers
 *.pyc
 *.pyo
