@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__ = "Correct Pipes & Fittings"
-__doc__ = "V4.9: giữ V4.8 reducing fitting; kết quả chỉ ghi vào log, UI tự co theo màn hình và luôn thấy nút chạy."
+__doc__ = "V5.2 Universal / Revit 2025-2026: mỗi nhóm fitting chỉ cho chọn đúng một type (Tee/Elbow/Transition/Cross; fitting giảm: Tee/Elbow/Transition)."
 
 import os
 import traceback
@@ -17,6 +17,9 @@ except Exception:
 uidoc = revit.uidoc
 doc = revit.doc
 
+SUPPORTED_REVIT_VERSIONS = (2025, 2026)
+REVIT_VERSION = 0
+
 
 # ============================================================
 # Helper functions
@@ -32,6 +35,88 @@ def safe_text(value):
             return str(value)
         except Exception:
             return u""
+
+
+def get_revit_major_version():
+    """Return current Revit major version as int without hard-failing."""
+    try:
+        return int(safe_text(revit.app.VersionNumber))
+    except Exception:
+        try:
+            return int(safe_text(doc.Application.VersionNumber))
+        except Exception:
+            return 0
+
+
+REVIT_VERSION = get_revit_major_version()
+
+
+# ============================================================
+# Revit 2025/2026 universal compatibility - ElementId is 64-bit
+# ============================================================
+
+def element_id_value(eid):
+    """Return a Python int from ElementId on Revit 2024-2026+.
+
+    Revit 2025 and 2026 use the 64-bit ElementId.Value API. IntegerValue is
+    retained only as a compatibility fallback for older Revit versions.
+    """
+    if eid is None:
+        return None
+    try:
+        return int(eid.Value)
+    except Exception:
+        try:
+            return int(eid.IntegerValue)
+        except Exception:
+            try:
+                return int(safe_text(eid))
+            except Exception:
+                return None
+
+
+def make_element_id(value):
+    """Create ElementId using Int64 on Revit 2025/2026, with legacy fallback."""
+    if isinstance(value, DB.ElementId):
+        return value
+    try:
+        return DB.ElementId(System.Int64(int(value)))
+    except Exception:
+        try:
+            return DB.ElementId(int(value))
+        except Exception:
+            return DB.ElementId.InvalidElementId
+
+
+def same_element_id(a, b):
+    av = element_id_value(a)
+    bv = element_id_value(b)
+    return av is not None and bv is not None and av == bv
+
+
+def is_valid_element_id(eid):
+    value = element_id_value(eid)
+    invalid = element_id_value(DB.ElementId.InvalidElementId)
+    return value is not None and value != invalid
+
+
+def enum_int64(value):
+    try:
+        return int(System.Convert.ToInt64(value))
+    except Exception:
+        try:
+            return int(value)
+        except Exception:
+            return None
+
+
+def category_is(elem, built_in_category):
+    try:
+        if elem is None or elem.Category is None:
+            return False
+        return element_id_value(elem.Category.Id) == enum_int64(built_in_category)
+    except Exception:
+        return False
 
 
 def get_real_name(elem):
@@ -65,7 +150,7 @@ def get_real_name(elem):
         pass
 
     try:
-        return u"Đối tượng ID {}".format(elem.Id.IntegerValue)
+        return u"Đối tượng ID {}".format(element_id_value(elem.Id))
     except Exception:
         return u"Không xác định"
 
@@ -92,34 +177,101 @@ def get_real_family_name(elem):
     return u"Family Không Xác Định"
 
 
+def _is_piping_system_type_id(eid):
+    """True only when eid resolves to Autodesk.Revit.DB.Plumbing.PipingSystemType."""
+    if not is_valid_element_id(eid):
+        return False
+    try:
+        return isinstance(doc.GetElement(eid), DB.Plumbing.PipingSystemType)
+    except Exception:
+        return False
+
+
+def _system_type_id_from_mep_system(mep_system):
+    try:
+        if mep_system is None:
+            return DB.ElementId.InvalidElementId
+        tid = mep_system.GetTypeId()
+        if _is_piping_system_type_id(tid):
+            return tid
+    except Exception:
+        pass
+    return DB.ElementId.InvalidElementId
+
+
+def _system_type_id_from_owner_parameter(owner):
+    if owner is None:
+        return DB.ElementId.InvalidElementId
+    try:
+        p = owner.get_Parameter(DB.BuiltInParameter.RBS_PIPING_SYSTEM_TYPE_PARAM)
+        if p and p.StorageType == DB.StorageType.ElementId:
+            eid = p.AsElementId()
+            if _is_piping_system_type_id(eid):
+                return eid
+    except Exception:
+        pass
+    return DB.ElementId.InvalidElementId
+
+
 def get_system_type_id(elem):
-    """Return Piping System Type ElementId used by a Pipe/Fitting.
-    This intentionally uses System Type, not System Name.
+    """Return the PipingSystemType ElementId for a Pipe or Pipe Fitting.
+
+    Revit 2025/2026-safe order:
+      1. Built-in System Type parameter (RBS_PIPING_SYSTEM_TYPE_PARAM).
+      2. Element.MEPSystem.GetTypeId().
+      3. Connector.MEPSystem.GetTypeId().
+      4. System Type of physically connected owners (normally the pipes).
+
+    RBS_SYSTEM_CLASSIFICATION_PARAM is deliberately NOT treated as a system
+    type id; classification and PipingSystemType are different concepts.
     """
-    if not elem:
+    if elem is None:
         return DB.ElementId.InvalidElementId
 
-    # Most reliable on PipeCurves / PipeFittings: system type parameter.
-    for bip in [
-        DB.BuiltInParameter.RBS_PIPING_SYSTEM_TYPE_PARAM,
-        DB.BuiltInParameter.RBS_SYSTEM_CLASSIFICATION_PARAM,
-    ]:
-        try:
-            p = elem.get_Parameter(bip)
-            if p and p.StorageType == DB.StorageType.ElementId:
-                eid = p.AsElementId()
-                if eid and eid != DB.ElementId.InvalidElementId:
-                    return eid
-        except Exception:
-            pass
+    # Primary path: Autodesk's built-in piping System Type parameter.
+    eid = _system_type_id_from_owner_parameter(elem)
+    if is_valid_element_id(eid):
+        return eid
 
-    # Fallback: use actual MEPSystem type if available.
+    # Pipe/MEP element may expose a direct MEPSystem.
     try:
-        mep = elem.MEPSystem
-        if mep:
-            tid = mep.GetTypeId()
-            if tid and tid != DB.ElementId.InvalidElementId:
-                return tid
+        eid = _system_type_id_from_mep_system(elem.MEPSystem)
+        if is_valid_element_id(eid):
+            return eid
+    except Exception:
+        pass
+
+    # Fittings frequently resolve their system through their connectors.
+    try:
+        for conn in get_connectors(elem):
+            try:
+                eid = _system_type_id_from_mep_system(conn.MEPSystem)
+                if is_valid_element_id(eid):
+                    return eid
+            except Exception:
+                pass
+
+            # Last fallback: inspect owners physically referenced by this connector.
+            try:
+                refs = conn.AllRefs
+            except Exception:
+                refs = []
+            for ref_conn in refs:
+                try:
+                    owner = ref_conn.Owner
+                except Exception:
+                    owner = None
+                if owner is None or owner == elem:
+                    continue
+                eid = _system_type_id_from_owner_parameter(owner)
+                if is_valid_element_id(eid):
+                    return eid
+                try:
+                    eid = _system_type_id_from_mep_system(owner.MEPSystem)
+                    if is_valid_element_id(eid):
+                        return eid
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -158,19 +310,15 @@ def get_symbol_from_instance(elem):
 
 def is_pipe(elem):
     try:
-        return isinstance(elem, DB.Plumbing.Pipe)
+        if isinstance(elem, DB.Plumbing.Pipe):
+            return True
     except Exception:
-        try:
-            return elem.Category and elem.Category.Id.IntegerValue == int(DB.BuiltInCategory.OST_PipeCurves)
-        except Exception:
-            return False
+        pass
+    return category_is(elem, DB.BuiltInCategory.OST_PipeCurves)
 
 
 def is_pipe_fitting(elem):
-    try:
-        return elem.Category and elem.Category.Id.IntegerValue == int(DB.BuiltInCategory.OST_PipeFitting)
-    except Exception:
-        return False
+    return category_is(elem, DB.BuiltInCategory.OST_PipeFitting)
 
 
 # Tolerance used by the forced reconnect fallback.
@@ -191,16 +339,6 @@ TEMP_STUB_LENGTH_FT = 1.0
 AXIS_ALIGNMENT_DOT_MIN = 0.98
 CENTERLINE_TOLERANCE_FT = 1.0 / (12.0 * 16.0)  # 1/16 inch
 MIN_CURVE_LENGTH_FT = 1.0 / 120.0              # 0.1 inch
-
-
-def element_id_value(eid):
-    try:
-        return int(eid.Value)
-    except Exception:
-        try:
-            return int(eid.IntegerValue)
-        except Exception:
-            return None
 
 
 def get_connector_manager(elem):
@@ -1488,6 +1626,41 @@ def part_type_enum_name(family_symbol):
     except Exception:
         pass
     return safe_text(value)
+
+
+# V5.2: the UI intentionally supports exactly one selected FamilySymbol for
+# each configured PartType.  This prevents two Tee types (or two Elbow types)
+# from being selected at the same time and makes replacement deterministic.
+NORMAL_FITTING_ROLES = (u"Tee", u"Elbow", u"Transition", u"Cross")
+REDUCING_FITTING_ROLES = (u"Tee", u"Elbow", u"Transition")
+
+
+def fitting_role_from_part_type_value(value):
+    """Map a Revit DB.PartType integer to one of the V5.2 UI roles."""
+    if value is None:
+        return u""
+    try:
+        name = System.Enum.GetName(DB.PartType, value)
+        name = safe_text(name) if name else safe_text(value)
+    except Exception:
+        name = safe_text(value)
+    key = name.strip().lower()
+    if key == u"tee":
+        return u"Tee"
+    if key == u"elbow":
+        return u"Elbow"
+    if key == u"transition":
+        return u"Transition"
+    if key == u"cross":
+        return u"Cross"
+    return u""
+
+
+def fitting_role_from_symbol(symbol):
+    try:
+        return fitting_role_from_part_type_value(get_part_type(symbol))
+    except Exception:
+        return u""
 
 
 def connector_axis(conn):
@@ -3771,7 +3944,7 @@ def collect_pipes_and_fittings(selected_only=False, selected_ids=None):
         selected_ids = list(selected_ids or [])
         for raw_id in selected_ids:
             try:
-                eid = raw_id if isinstance(raw_id, DB.ElementId) else DB.ElementId(int(raw_id))
+                eid = raw_id if isinstance(raw_id, DB.ElementId) else make_element_id(raw_id)
                 elem = doc.GetElement(eid)
                 if elem is None:
                     continue
@@ -3817,13 +3990,17 @@ class SkipWarningsPreprocessor(DB.IFailuresPreprocessor):
 
 
 # ============================================================
-# Main window - modal, preselection snapshot (V4.9)
+# Main window - modal, preselection snapshot (V5.2 Universal / Revit 2025-2026)
 # ============================================================
 
 
 class ReplaceElementsWindow(forms.WPFWindow):
     def __init__(self, xaml_file_name, preselected_ids):
         forms.WPFWindow.__init__(self, xaml_file_name)
+        try:
+            self.Title = u"Correct Pipes & Fittings V5.2 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
+        except Exception:
+            pass
         # V4.9: size the dialog against the actual Windows work area.  The XAML
         # also keeps the settings area inside a ScrollViewer, so on laptops or
         # high-DPI displays the Run button can never be pushed below the screen.
@@ -3861,7 +4038,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self._preselected_fitting_count = 0
         for value in self.preselected_element_ids:
             try:
-                elem = doc.GetElement(DB.ElementId(value))
+                elem = doc.GetElement(make_element_id(value))
                 if is_pipe(elem):
                     self._preselected_pipe_count += 1
                 elif is_pipe_fitting(elem):
@@ -3904,7 +4081,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         system_values = set()
         for value in self.preselected_element_ids:
             try:
-                elem = doc.GetElement(DB.ElementId(value))
+                elem = doc.GetElement(make_element_id(value))
                 sid = get_system_type_id(elem)
                 sid_value = self.id_value(sid)
                 if sid_value is not None and sid != DB.ElementId.InvalidElementId:
@@ -3942,13 +4119,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             pass
 
     def id_value(self, eid):
-        try:
-            return int(eid.Value)
-        except Exception:
-            try:
-                return int(eid.IntegerValue)
-            except Exception:
-                return None
+        return element_id_value(eid)
 
     def _config_get(self, config, name, default=None):
         try:
@@ -4007,7 +4178,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                             result.add(self.id_value(symbol_id))
                     else:
                         try:
-                            if part.Category and part.Category.Id.IntegerValue == int(DB.BuiltInCategory.OST_PipeFitting):
+                            if category_is(part, DB.BuiltInCategory.OST_PipeFitting):
                                 result.add(self.id_value(part.Id))
                         except Exception:
                             pass
@@ -4026,6 +4197,11 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         if clear_invalid and self.routing_fitting_type_ids is not None:
             self.selected_fitting_type_ids.intersection_update(self.routing_fitting_type_ids)
+        try:
+            self._normalize_selected_ids(
+                self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=True)
+        except Exception:
+            pass
 
         self.refresh_fitting_list(self.txt_FilterFittings.Text)
         try:
@@ -4081,9 +4257,16 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 self.txt_FilterReducingFittings.Text = reducing_filter_text
             except Exception:
                 pass
+            try:
+                self._normalize_selected_ids(
+                    self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=False)
+                self._normalize_selected_ids(
+                    self.selected_reducing_fitting_type_ids, REDUCING_FITTING_ROLES, require_routing=False)
+            except Exception:
+                pass
             self._loading_choices = False
             self.update_fittings_for_selected_pipe_type(clear_invalid=True)
-            self.log(u"Đã khôi phục lựa chọn từ lần chạy trước.")
+            self.log(u"Đã khôi phục lựa chọn từ lần chạy trước (V5.2 tự giới hạn 1 type mỗi PartType).")
         except Exception as ex:
             self._loading_choices = False
             self.update_fittings_for_selected_pipe_type(clear_invalid=True)
@@ -4117,23 +4300,56 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
     def setup_data(self):
         self.log(u"Đang đọc dữ liệu trong model...")
+        self.log(u"V5.2 Universal | Revit {} | ElementId 64-bit Value mode.".format(
+            REVIT_VERSION if REVIT_VERSION else u"không xác định"))
+        if REVIT_VERSION and REVIT_VERSION not in SUPPORTED_REVIT_VERSIONS:
+            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.2 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
         pipes, fittings = collect_pipes_and_fittings()
 
-        # Piping System Types that are actually used by current pipe/fitting elements.
-        # IMPORTANT: process by System Type, not System Name.
+        # Revit 2025/2026: ElementId is 64-bit. Never depend on IntegerValue here.
+        # First detect PipingSystemType from actual Pipe/Fitting instances.
         system_type_ids = set()
         for e in pipes + fittings:
             sid = get_system_type_id(e)
-            try:
-                if sid and sid != DB.ElementId.InvalidElementId:
-                    system_type_ids.add(sid.IntegerValue)
-            except Exception:
-                pass
+            sid_value = element_id_value(sid)
+            if sid_value is not None and is_valid_element_id(sid):
+                system_type_ids.add(sid_value)
+
+        # Build from the real PipingSystemType elements. If instance-based
+        # detection returns nothing (for example disconnected/partially built
+        # MEP content), fall back to all PipingSystemType definitions in model.
+        all_system_types = []
+        try:
+            all_system_types = list(DB.FilteredElementCollector(doc)\
+                                    .OfClass(DB.Plumbing.PipingSystemType)\
+                                    .WhereElementIsElementType()\
+                                    .ToElements())
+        except Exception:
+            all_system_types = []
+
+        all_by_value = {}
+        for st in all_system_types:
+            value = element_id_value(st.Id)
+            if value is not None:
+                all_by_value[value] = st
+
+        if not system_type_ids and all_by_value:
+            system_type_ids.update(all_by_value.keys())
+            self.log(u"Revit {}: không đọc được System Type từ instance; đã fallback sang {} Piping System Type trong model.".format(REVIT_VERSION if REVIT_VERSION else u"?", len(all_by_value)))
 
         system_type_items = []
-        for int_id in system_type_ids:
-            eid = DB.ElementId(int_id)
-            system_type_items.append(CmbItem(get_system_type_name_by_id(eid), eid))
+        for raw_id in sorted(system_type_ids):
+            st = all_by_value.get(raw_id)
+            eid = st.Id if st is not None else make_element_id(raw_id)
+            # Only show real PipingSystemType elements; ignore classification ids.
+            if _is_piping_system_type_id(eid):
+                system_type_items.append(CmbItem(get_system_type_name_by_id(eid), eid))
+
+        # Absolute fallback: if the instance ids were stale/incomplete, show all
+        # real PipingSystemType definitions so the System combo is never empty.
+        if not system_type_items and all_by_value:
+            for raw_id, st in sorted(all_by_value.items(), key=lambda kv: get_real_name(kv[1]).lower()):
+                system_type_items.append(CmbItem(get_real_name(st), st.Id))
 
         for item in sorted(system_type_items, key=lambda x: x.Name.lower()):
             self.system_items.append(item)
@@ -4172,11 +4388,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         for fs in sorted(fitting_symbols, key=fitting_sort_key):
             part_type = get_part_type(fs)
-            label = u"{} : {}".format(get_real_family_name(fs), get_real_name(fs))
-            if part_type is not None:
-                label += u"  | PartType {}".format(part_type)
+            role = fitting_role_from_part_type_value(part_type)
+            role_text = role if role else part_type_enum_name(fs)
+            label = u"[{}] {} : {}".format(
+                role_text or u"Khác", get_real_family_name(fs), get_real_name(fs))
             item = CmbItem(label, fs.Id)
             item.PartType = part_type
+            item.Role = role
             self.fitting_type_items.append(item)
         self.lst_FittingTypes.DisplayMemberPath = "Name"
         self.refresh_fitting_list(u"")
@@ -4193,50 +4411,48 @@ class ReplaceElementsWindow(forms.WPFWindow):
         ))
 
     def choose_replacement_fitting_type(self, fitting, selected_items, selected_reducing_items):
-        """Choose replacement symbol by PartType AND actual connector-size profile.
+        """V5.2: choose exactly one configured symbol for the fitting PartType.
 
-        Equal-size fittings use the normal Routing-Preferences selection.
-        Unequal-size fittings (reducing Tee/Elbow/etc.) use the dedicated
-        ``Fitting giảm`` box. This prevents an equal-port family of the same
-        PartType from being forced onto unequal connected pipes.
+        Normal fittings support Tee / Elbow / Transition / Cross.
+        Reducing fittings support Tee / Elbow / Transition.  There is never a
+        fallback to the first item of another PartType; doing so could recreate
+        a Tee as an Elbow or use the wrong reducing family.
         """
         old_symbol = get_symbol_from_instance(fitting)
         old_part_type = get_part_type(old_symbol)
+        role = fitting_role_from_part_type_value(old_part_type)
         variable_size = fitting_has_variable_port_sizes(fitting)
         size_text = fitting_size_profile_text(fitting)
 
-        candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
+        allowed_roles = REDUCING_FITTING_ROLES if variable_size else NORMAL_FITTING_ROLES
         source_label = u"Fitting giảm" if variable_size else u"Fitting thường"
-        if not candidates:
-            if variable_size:
-                raise Exception(
-                    u"fitting có kích thước connector không bằng nhau {} nhưng ô '{}' chưa chọn type"
-                    .format(size_text, source_label))
-            return None
-
-        same_part = []
-        if old_part_type is not None:
-            for item in candidates:
-                try:
-                    if item.PartType == old_part_type:
-                        same_part.append(item)
-                except Exception:
-                    pass
-
-        if same_part:
-            chosen = same_part[0]
-        elif variable_size:
+        if role not in allowed_roles:
             raise Exception(
-                u"fitting giảm {} có PartType '{}' nhưng ô Fitting giảm không có type cùng PartType; "
-                u"hãy chọn đúng Tee/Elbow/Transition giảm"
-                .format(size_text, part_type_enum_name(old_symbol)))
-        else:
-            chosen = candidates[0]
+                u"PartType '{}' không nằm trong nhóm được cấu hình ở {} V5.2"
+                .format(part_type_enum_name(old_symbol), source_label))
 
+        candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
+        same_role = []
+        for item in candidates:
+            try:
+                if getattr(item, 'Role', u'') == role:
+                    same_role.append(item)
+            except Exception:
+                pass
+
+        if len(same_role) == 0:
+            raise Exception(u"{} chưa chọn type '{}'".format(source_label, role))
+        if len(same_role) > 1:
+            raise Exception(
+                u"{} đang có {} type '{}' được chọn; V5.2 chỉ cho phép đúng 1 type mỗi nhóm"
+                .format(source_label, len(same_role), role))
+
+        chosen = same_role[0]
         if variable_size:
-            self.log(u"Fitting {}: phát hiện size đầu nối KHÔNG BẰNG NHAU {} -> dùng ô Fitting giảm: '{}'"
-                     .format(self.id_value(fitting.Id), size_text, chosen.Name))
+            self.log(u"Fitting {}: size đầu nối KHÔNG BẰNG NHAU {} -> dùng {} {}: '{}'"
+                     .format(self.id_value(fitting.Id), size_text, source_label, role, chosen.Name))
         return chosen.Value
+
 
     def create_replacement_fitting_from_partners(self, old_symbol, partner_connectors,
                                                  expected_port_count=None):
@@ -4342,7 +4558,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             old_port_records, links)
         if not axes_have_nonparallel_pair(target_axes_pre):
             raise Exception(u"Direct-align V4.8: CENTERLINE pipe không có ít nhất một cặp không song song")
-        self.log(u"V4.9 PIPE-center: {}".format(
+        self.log(u"V5.2/Universal PIPE-center: {}".format(
             target_pipe_geometry_description(old_port_records, links)))
         place_point = virtual_junction_center(target_points_pre, target_axes_pre)
         if place_point is None:
@@ -4620,7 +4836,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 (total_port_count == 2 and port_axes_have_nonparallel_pair(old_port_records))
             )
             if use_direct_axis:
-                self.log(u"{}: V4.9 topology {} cổng có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
+                self.log(u"{}: V5.2/Universal topology {} cổng có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
                          .format(label, total_port_count, get_real_name(desired_symbol)))
                 # Temporary topology pipes are not needed for exact direct placement;
                 # remove any stubs created earlier before placing the exact family.
@@ -4860,7 +5076,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if allow_force_reconnect and is_pipe_fitting(elem):
             try:
                 if not same_family_for_type_ids(elem.GetTypeId(), new_type_id):
-                    self.log(u"{}: V4.9 phát hiện khác Family -> KHÔNG ChangeTypeId; chuyển sang recreate/direct-align.".format(label))
+                    self.log(u"{}: V5.2/Universal phát hiện khác Family -> KHÔNG ChangeTypeId; chuyển sang recreate/direct-align.".format(label))
                     return self.change_fitting_family_by_recreate(elem_id, new_type_id, label)
             except Exception as ex:
                 return False, u"{} | Không kiểm tra được Family cũ/mới: {}".format(label, safe_text(ex))
@@ -4885,32 +5101,94 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return False, u"{} | {}".format(label, safe_text(first_error))
 
     def element_id_int(self, eid):
-        try:
-            return eid.IntegerValue
-        except Exception:
-            return None
+        return element_id_value(eid)
 
-    def refresh_fitting_list(self, filter_text=None):
-        """Refresh fitting type list by text filter while preserving selections across filters."""
+    def _item_role(self, item):
         try:
-            # Save current visible selections into persistent set before rebuilding list.
-            for item in list(self.lst_FittingTypes.SelectedItems):
+            role = getattr(item, 'Role', u'')
+            if role:
+                return safe_text(role)
+            return fitting_role_from_part_type_value(getattr(item, 'PartType', None))
+        except Exception:
+            return u''
+
+    def _remove_other_selected_ids_for_role(self, selected_ids, keep_item, allowed_roles):
+        """Keep at most one selected symbol for one PartType role."""
+        role = self._item_role(keep_item)
+        if role not in allowed_roles:
+            return False
+        keep_id = self.id_value(keep_item.Value)
+        for other in self.fitting_type_items:
+            try:
+                if self._item_role(other) == role:
+                    other_id = self.id_value(other.Value)
+                    if other_id != keep_id:
+                        selected_ids.discard(other_id)
+            except Exception:
+                pass
+        selected_ids.add(keep_id)
+        return True
+
+    def _normalize_selected_ids(self, selected_ids, allowed_roles, require_routing=False):
+        """Normalize old config/multi-selections to one symbol per PartType."""
+        chosen_by_role = {}
+        # Prefer selected IDs in deterministic fitting-list order.  This also
+        # migrates V5.1 configs that may contain multiple types of one PartType.
+        for item in self.fitting_type_items:
+            try:
+                item_id = self.id_value(item.Value)
+                if item_id not in selected_ids:
+                    continue
+                role = self._item_role(item)
+                if role not in allowed_roles:
+                    continue
+                if require_routing and self.routing_fitting_type_ids is not None and item_id not in self.routing_fitting_type_ids:
+                    continue
+                if role not in chosen_by_role:
+                    chosen_by_role[role] = item_id
+            except Exception:
+                pass
+        selected_ids.clear()
+        for role in allowed_roles:
+            if role in chosen_by_role:
+                selected_ids.add(chosen_by_role[role])
+
+    def _selection_summary(self, selected_ids, roles):
+        parts = []
+        for role in roles:
+            found = False
+            for item in self.fitting_type_items:
                 try:
-                    self.selected_fitting_type_ids.add(self.id_value(item.Value))
+                    if self._item_role(item) == role and self.id_value(item.Value) in selected_ids:
+                        found = True
+                        break
                 except Exception:
                     pass
+            parts.append(u"{} {}/1".format(role, 1 if found else 0))
+        return u" | ".join(parts)
 
+    def refresh_fitting_list(self, filter_text=None):
+        """Normal list: Routing Preferences + only Tee/Elbow/Transition/Cross."""
+        try:
+            self._normalize_selected_ids(
+                self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=True)
             self._refreshing_fitting_list = True
             self.lst_FittingTypes.Items.Clear()
 
             ft = safe_text(filter_text).strip().lower()
+            available_items = []
+            for item in self.fitting_type_items:
+                try:
+                    item_id = self.id_value(item.Value)
+                    if self._item_role(item) not in NORMAL_FITTING_ROLES:
+                        continue
+                    if self.routing_fitting_type_ids is not None and item_id not in self.routing_fitting_type_ids:
+                        continue
+                    available_items.append(item)
+                except Exception:
+                    pass
+
             visible_count = 0
-            selected_visible = 0
-            available_items = [
-                item for item in self.fitting_type_items
-                if self.routing_fitting_type_ids is None
-                or self.id_value(item.Value) in self.routing_fitting_type_ids
-            ]
             for item in available_items:
                 name = safe_text(item.Name).lower()
                 if (not ft) or (ft in name):
@@ -4919,66 +5197,45 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     try:
                         if self.id_value(item.Value) in self.selected_fitting_type_ids:
                             self.lst_FittingTypes.SelectedItems.Add(item)
-                            selected_visible += 1
                     except Exception:
                         pass
-
             self._refreshing_fitting_list = False
-
             try:
-                self.txt_FittingCount.Text = u"Hiển thị {}/{} fitting type | Đã chọn {}".format(
-                    visible_count,
-                    len(available_items),
-                    len(self.selected_fitting_type_ids)
-                )
+                self.txt_FittingCount.Text = (
+                    u"Hiển thị {}/{} | Mỗi nhóm tối đa 1 type — {}"
+                    .format(visible_count, len(available_items),
+                            self._selection_summary(self.selected_fitting_type_ids, NORMAL_FITTING_ROLES)))
             except Exception:
                 pass
         except Exception as ex:
             self._refreshing_fitting_list = False
-            self.log(u"Lỗi filter fitting list: {}".format(safe_text(ex)))
+            self.log(u"Lỗi filter Fitting thường: {}".format(safe_text(ex)))
 
     def fitting_selection_changed(self, sender, args):
-        """Persist selected fitting types even when they are hidden by text filter."""
+        """V5.2: selecting a second type in the same normal role replaces the first."""
+        if self._refreshing_fitting_list:
+            return
         try:
-            if self._refreshing_fitting_list:
-                return
-            try:
-                for item in list(args.AddedItems):
-                    self.selected_fitting_type_ids.add(self.id_value(item.Value))
-            except Exception:
-                pass
-            try:
-                for item in list(args.RemovedItems):
+            for item in list(args.RemovedItems):
+                try:
                     self.selected_fitting_type_ids.discard(self.id_value(item.Value))
-            except Exception:
-                pass
-            try:
-                self.txt_FittingCount.Text = u"Hiển thị {}/{} fitting type | Đã chọn {}".format(
-                    self.lst_FittingTypes.Items.Count,
-                    len(self.fitting_type_items),
-                    len(self.selected_fitting_type_ids)
-                )
-            except Exception:
-                pass
-        except Exception:
-            pass
+                except Exception:
+                    pass
+            for item in list(args.AddedItems):
+                self._remove_other_selected_ids_for_role(
+                    self.selected_fitting_type_ids, item, NORMAL_FITTING_ROLES)
+            self.refresh_fitting_list(self.txt_FilterFittings.Text)
+        except Exception as ex:
+            self.log(u"Không thể cập nhật lựa chọn Fitting thường: {}".format(safe_text(ex)))
 
     def get_selected_fitting_items(self):
-        """Return selected fitting type items, including items selected before applying another filter."""
-        try:
-            # Sync visible selected items one more time before running replace.
-            for item in list(self.lst_FittingTypes.SelectedItems):
-                self.selected_fitting_type_ids.add(self.id_value(item.Value))
-        except Exception:
-            pass
-        if len(self.selected_fitting_type_ids) > 0:
-            return [
-                item for item in self.fitting_type_items
+        self._normalize_selected_ids(
+            self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=True)
+        return [item for item in self.fitting_type_items
                 if self.id_value(item.Value) in self.selected_fitting_type_ids
+                and self._item_role(item) in NORMAL_FITTING_ROLES
                 and (self.routing_fitting_type_ids is None
-                     or self.id_value(item.Value) in self.routing_fitting_type_ids)
-            ]
-        return list(self.lst_FittingTypes.SelectedItems)
+                     or self.id_value(item.Value) in self.routing_fitting_type_ids)]
 
     def filter_fittings_text_changed(self, sender, args):
         try:
@@ -4994,69 +5251,25 @@ class ReplaceElementsWindow(forms.WPFWindow):
             pass
 
     def clear_selected_fittings_click(self, sender, args):
-        """Clear all fitting type selections, including selections hidden by filter."""
         try:
             self.selected_fitting_type_ids.clear()
-            self._refreshing_fitting_list = True
-            self.lst_FittingTypes.SelectedItems.Clear()
-            self._refreshing_fitting_list = False
-            try:
-                self.txt_FittingCount.Text = u"Hiển thị {}/{} fitting type | Đã chọn 0".format(
-                    self.lst_FittingTypes.Items.Count,
-                    len(self.fitting_type_items)
-                )
-            except Exception:
-                pass
-            self.log(u"Đã xóa tất cả fitting type đã chọn.")
+            self.refresh_fitting_list(self.txt_FilterFittings.Text)
+            self.log(u"Đã bỏ chọn toàn bộ Fitting thường.")
         except Exception as ex:
-            self._refreshing_fitting_list = False
-            self.log(u"Không thể xóa fitting đã chọn: {}".format(safe_text(ex)))
-
-    def select_visible_fittings_click(self, sender, args):
-        """Add all currently visible fitting types to persistent selection."""
-        try:
-            self._refreshing_fitting_list = True
-            for item in list(self.lst_FittingTypes.Items):
-                try:
-                    self.selected_fitting_type_ids.add(self.id_value(item.Value))
-                    if not self.lst_FittingTypes.SelectedItems.Contains(item):
-                        self.lst_FittingTypes.SelectedItems.Add(item)
-                except Exception:
-                    pass
-            self._refreshing_fitting_list = False
-            try:
-                self.txt_FittingCount.Text = u"Hiển thị {}/{} fitting type | Đã chọn {}".format(
-                    self.lst_FittingTypes.Items.Count,
-                    len(self.fitting_type_items),
-                    len(self.selected_fitting_type_ids)
-                )
-            except Exception:
-                pass
-            self.log(u"Đã chọn thêm fitting type đang hiển thị. Tổng đã chọn: {}".format(len(self.selected_fitting_type_ids)))
-        except Exception as ex:
-            self._refreshing_fitting_list = False
-            self.log(u"Không thể chọn tất cả fitting đang hiển thị: {}".format(safe_text(ex)))
+            self.log(u"Không thể bỏ chọn Fitting thường: {}".format(safe_text(ex)))
 
     def refresh_reducing_fitting_list(self, filter_text=None):
-        """Refresh the dedicated reducing-fitting box.
-
-        Unlike the normal list, this list intentionally shows ALL loaded Pipe
-        Fitting symbols, not only symbols in Routing Preferences. Cross-family
-        direct placement can use an exact loaded symbol and many offices keep
-        reducing families outside normal routing rules.
-        """
+        """Reducing list: all loaded symbols, but only Tee/Elbow/Transition."""
         try:
-            for item in list(self.lst_ReducingFittingTypes.SelectedItems):
-                try:
-                    self.selected_reducing_fitting_type_ids.add(self.id_value(item.Value))
-                except Exception:
-                    pass
-
+            self._normalize_selected_ids(
+                self.selected_reducing_fitting_type_ids, REDUCING_FITTING_ROLES, require_routing=False)
             self._refreshing_reducing_fitting_list = True
             self.lst_ReducingFittingTypes.Items.Clear()
             ft = safe_text(filter_text).strip().lower()
+            available_items = [item for item in self.fitting_type_items
+                               if self._item_role(item) in REDUCING_FITTING_ROLES]
             visible_count = 0
-            for item in self.fitting_type_items:
+            for item in available_items:
                 name = safe_text(item.Name).lower()
                 if (not ft) or (ft in name):
                     self.lst_ReducingFittingTypes.Items.Add(item)
@@ -5069,53 +5282,39 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self._refreshing_reducing_fitting_list = False
             try:
                 self.txt_ReducingFittingCount.Text = (
-                    u"Hiển thị {}/{} fitting type | Đã chỉ định giảm {}"
-                    .format(visible_count, len(self.fitting_type_items),
-                            len(self.selected_reducing_fitting_type_ids)))
+                    u"Hiển thị {}/{} | Mỗi nhóm tối đa 1 type — {}"
+                    .format(visible_count, len(available_items),
+                            self._selection_summary(self.selected_reducing_fitting_type_ids,
+                                                    REDUCING_FITTING_ROLES)))
             except Exception:
                 pass
         except Exception as ex:
             self._refreshing_reducing_fitting_list = False
-            self.log(u"Lỗi refresh ô Fitting giảm: {}".format(safe_text(ex)))
+            self.log(u"Lỗi filter Fitting giảm: {}".format(safe_text(ex)))
 
     def reducing_fitting_selection_changed(self, sender, args):
+        """V5.2: selecting a second reducing type in one role replaces the first."""
+        if self._refreshing_reducing_fitting_list:
+            return
         try:
-            if self._refreshing_reducing_fitting_list:
-                return
-            try:
-                for item in list(args.AddedItems):
-                    self.selected_reducing_fitting_type_ids.add(self.id_value(item.Value))
-            except Exception:
-                pass
-            try:
-                for item in list(args.RemovedItems):
+            for item in list(args.RemovedItems):
+                try:
                     self.selected_reducing_fitting_type_ids.discard(self.id_value(item.Value))
-            except Exception:
-                pass
-            try:
-                self.txt_ReducingFittingCount.Text = (
-                    u"Hiển thị {}/{} fitting type | Đã chỉ định giảm {}"
-                    .format(self.lst_ReducingFittingTypes.Items.Count,
-                            len(self.fitting_type_items),
-                            len(self.selected_reducing_fitting_type_ids)))
-            except Exception:
-                pass
-        except Exception:
-            pass
+                except Exception:
+                    pass
+            for item in list(args.AddedItems):
+                self._remove_other_selected_ids_for_role(
+                    self.selected_reducing_fitting_type_ids, item, REDUCING_FITTING_ROLES)
+            self.refresh_reducing_fitting_list(self.txt_FilterReducingFittings.Text)
+        except Exception as ex:
+            self.log(u"Không thể cập nhật lựa chọn Fitting giảm: {}".format(safe_text(ex)))
 
     def get_selected_reducing_fitting_items(self):
-        try:
-            for item in list(self.lst_ReducingFittingTypes.SelectedItems):
-                self.selected_reducing_fitting_type_ids.add(self.id_value(item.Value))
-        except Exception:
-            pass
-        if self.selected_reducing_fitting_type_ids:
-            return [item for item in self.fitting_type_items
-                    if self.id_value(item.Value) in self.selected_reducing_fitting_type_ids]
-        try:
-            return list(self.lst_ReducingFittingTypes.SelectedItems)
-        except Exception:
-            return []
+        self._normalize_selected_ids(
+            self.selected_reducing_fitting_type_ids, REDUCING_FITTING_ROLES, require_routing=False)
+        return [item for item in self.fitting_type_items
+                if self.id_value(item.Value) in self.selected_reducing_fitting_type_ids
+                and self._item_role(item) in REDUCING_FITTING_ROLES]
 
     def filter_reducing_fittings_text_changed(self, sender, args):
         try:
@@ -5133,71 +5332,70 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def clear_selected_reducing_fittings_click(self, sender, args):
         try:
             self.selected_reducing_fitting_type_ids.clear()
-            self._refreshing_reducing_fitting_list = True
-            self.lst_ReducingFittingTypes.SelectedItems.Clear()
-            self._refreshing_reducing_fitting_list = False
             self.refresh_reducing_fitting_list(self.txt_FilterReducingFittings.Text)
-            self.log(u"Đã xóa toàn bộ chỉ định Fitting giảm.")
+            self.log(u"Đã bỏ chọn toàn bộ Fitting giảm.")
         except Exception as ex:
-            self._refreshing_reducing_fitting_list = False
-            self.log(u"Không thể xóa Fitting giảm: {}".format(safe_text(ex)))
+            self.log(u"Không thể bỏ chọn Fitting giảm: {}".format(safe_text(ex)))
 
-    def select_visible_reducing_fittings_click(self, sender, args):
-        try:
-            self._refreshing_reducing_fitting_list = True
-            for item in list(self.lst_ReducingFittingTypes.Items):
-                self.selected_reducing_fitting_type_ids.add(self.id_value(item.Value))
-                try:
-                    if not self.lst_ReducingFittingTypes.SelectedItems.Contains(item):
-                        self.lst_ReducingFittingTypes.SelectedItems.Add(item)
-                except Exception:
-                    pass
-            self._refreshing_reducing_fitting_list = False
-            self.refresh_reducing_fitting_list(self.txt_FilterReducingFittings.Text)
-        except Exception as ex:
-            self._refreshing_reducing_fitting_list = False
-            self.log(u"Không thể chọn list Fitting giảm: {}".format(safe_text(ex)))
+    def _validate_fitting_type_selection(self, target_fittings, normal_items, reducing_items):
+        """Require exactly one selected type for every PartType used by this batch."""
+        normal_by_role = {}
+        reducing_by_role = {}
+        for item in list(normal_items or []):
+            role = self._item_role(item)
+            if role in NORMAL_FITTING_ROLES:
+                normal_by_role.setdefault(role, []).append(item)
+        for item in list(reducing_items or []):
+            role = self._item_role(item)
+            if role in REDUCING_FITTING_ROLES:
+                reducing_by_role.setdefault(role, []).append(item)
 
-    def _validate_reducing_fitting_selection(self, target_fittings, reducing_items):
-        """Validate reducing-box coverage before starting a destructive batch."""
-        variable_rows = []
-        needed_part_types = set()
-        for f in list(target_fittings or []):
+        needed_normal = set()
+        needed_reducing = set()
+        unsupported = []
+        for fit in list(target_fittings or []):
             try:
-                if not fitting_has_variable_port_sizes(f):
-                    continue
-                sym = get_symbol_from_instance(f)
-                pt = get_part_type(sym)
-                needed_part_types.add(pt)
-                variable_rows.append((self.id_value(f.Id), part_type_enum_name(sym),
-                                      fitting_size_profile_text(f)))
+                sym = get_symbol_from_instance(fit)
+                role = fitting_role_from_symbol(sym)
+                variable = fitting_has_variable_port_sizes(fit)
+                fit_id = self.id_value(fit.Id)
+                if variable:
+                    if role in REDUCING_FITTING_ROLES:
+                        needed_reducing.add(role)
+                    else:
+                        unsupported.append(u"ID {}: {} giảm".format(
+                            fit_id, part_type_enum_name(sym) or u"PartType không xác định"))
+                else:
+                    if role in NORMAL_FITTING_ROLES:
+                        needed_normal.add(role)
+                    else:
+                        unsupported.append(u"ID {}: {}".format(
+                            fit_id, part_type_enum_name(sym) or u"PartType không xác định"))
             except Exception:
                 pass
-        if not variable_rows:
-            return True, u""
-        if not reducing_items:
-            ids = u", ".join([safe_text(r[0]) for r in variable_rows[:8]])
-            return False, (u"Selection có {} fitting với các đầu connector khác size (ID {}). "
-                           u"Hãy chọn type tương ứng trong ô 'Fitting giảm / đầu không bằng nhau'."
-                           .format(len(variable_rows), ids))
 
-        available_parts = set()
-        for item in reducing_items:
-            try:
-                available_parts.add(item.PartType)
-            except Exception:
-                pass
-        missing = [pt for pt in needed_part_types if pt not in available_parts]
-        if missing:
-            names = []
-            for pt in missing:
-                try:
-                    names.append(safe_text(System.Enum.GetName(DB.PartType, pt)))
-                except Exception:
-                    names.append(safe_text(pt))
-            return False, (u"Ô Fitting giảm chưa có type cho PartType: {}. "
-                           u"Hãy chọn đúng type giảm trước khi chạy."
-                           .format(u", ".join(names)))
+        if unsupported:
+            return False, (u"Selection có fitting ngoài 7 nhóm V5.2 hỗ trợ: {}. "
+                           u"Fitting thường chỉ hỗ trợ Tee/Elbow/Transition/Cross; "
+                           u"Fitting giảm chỉ hỗ trợ Tee/Elbow/Transition."
+                           .format(u"; ".join(unsupported[:8])))
+
+        problems = []
+        for role in NORMAL_FITTING_ROLES:
+            count = len(normal_by_role.get(role, []))
+            if count > 1:
+                problems.append(u"Fitting thường {} đang chọn {} type (chỉ được 1)".format(role, count))
+            if role in needed_normal and count != 1:
+                problems.append(u"Fitting thường {} cần đúng 1 type, hiện có {}".format(role, count))
+        for role in REDUCING_FITTING_ROLES:
+            count = len(reducing_by_role.get(role, []))
+            if count > 1:
+                problems.append(u"Fitting giảm {} đang chọn {} type (chỉ được 1)".format(role, count))
+            if role in needed_reducing and count != 1:
+                problems.append(u"Fitting giảm {} cần đúng 1 type, hiện có {}".format(role, count))
+
+        if problems:
+            return False, u"; ".join(problems)
         return True, u""
 
 
@@ -5225,7 +5423,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             forms.alert(u"Vui lòng chọn Pipe Type mới.", title="Thiếu dữ liệu")
             return
         if overwrite_fittings and not selected_fitting_items and not selected_reducing_fitting_items:
-            forms.alert(u"Vui lòng chọn ít nhất một Fitting Type thường hoặc Fitting giảm.", title="Thiếu dữ liệu")
+            forms.alert(u"Vui lòng chọn type cần dùng trong các nhóm Fitting thường/Fitting giảm. Mỗi nhóm PartType chỉ được chọn 1 type.", title="Thiếu dữ liệu")
             return
 
         system_type_id = selected_system.Value
@@ -5244,36 +5442,21 @@ class ReplaceElementsWindow(forms.WPFWindow):
             forms.alert(u"Các đối tượng đã chọn trước khi mở tool không còn hợp lệ. Hãy đóng tool, chọn lại Pipe/Fitting rồi chạy lệnh lại.", title="Không có đối tượng hợp lệ")
             return
 
-        target_pipes = [p for p in pipes if get_system_type_id(p) == system_type_id] if overwrite_pipes else []
-        target_fittings = [f for f in fittings if get_system_type_id(f) == system_type_id] if overwrite_fittings else []
+        target_pipes = [p for p in pipes if same_element_id(get_system_type_id(p), system_type_id)] if overwrite_pipes else []
+        target_fittings = [f for f in fittings if same_element_id(get_system_type_id(f), system_type_id)] if overwrite_fittings else []
         if not target_pipes and not target_fittings:
             forms.alert(u"Không tìm thấy Pipe/Fitting phù hợp với System Type và phạm vi đã chọn.", title="Không có phần tử")
             return
 
         if overwrite_fittings:
-            # Equal-size and unequal-size fittings intentionally use two
-            # independent UI boxes. Validate both groups before opening the
-            # transaction so a missing family never causes a partial batch.
-            equal_targets = []
-            for _fit in target_fittings:
-                try:
-                    if not fitting_has_variable_port_sizes(_fit):
-                        equal_targets.append(_fit)
-                except Exception:
-                    equal_targets.append(_fit)
-            if equal_targets and not selected_fitting_items:
-                msg = (u"Selection có {} fitting đầu bằng nhau nhưng ô Fitting thường chưa chọn type. "
-                       u"Hãy chọn Fitting Type thuộc Routing Preferences trước khi chạy."
-                       .format(len(equal_targets)))
-                forms.alert(msg, title="Thiếu Fitting thường")
-                self.log(msg)
-                return
-
-            reduce_ok, reduce_msg = self._validate_reducing_fitting_selection(
-                target_fittings, selected_reducing_fitting_items)
-            if not reduce_ok:
-                forms.alert(reduce_msg, title="Thiếu Fitting giảm")
-                self.log(reduce_msg)
+            # V5.2: every supported PartType has exactly one deterministic UI
+            # slot. Validate all required normal/reducing roles before opening
+            # the destructive transaction.
+            fit_ok, fit_msg = self._validate_fitting_type_selection(
+                target_fittings, selected_fitting_items, selected_reducing_fitting_items)
+            if not fit_ok:
+                forms.alert(fit_msg, title="Kiểm tra Fitting Type")
+                self.log(fit_msg)
                 return
 
         changed, skipped, failed = 0, 0, []
@@ -5417,7 +5600,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
 
 # ============================================================
-# Entry point - require preselection before opening UI (V4.9)
+# Entry point - require preselection before opening UI (V5.2 Universal / Revit 2025-2026)
 # ============================================================
 
 script_dir = os.path.dirname(__file__)
@@ -5446,10 +5629,10 @@ def get_valid_preselection_ids():
             else:
                 ignored_count += 1
                 continue
-            try:
-                value = int(eid.Value)
-            except Exception:
-                value = int(eid.IntegerValue)
+            value = element_id_value(eid)
+            if value is None:
+                ignored_count += 1
+                continue
             if value not in seen:
                 seen.add(value)
                 valid.append(value)
@@ -5478,5 +5661,5 @@ else:
             win.show_dialog()
         except Exception as ex:
             forms.alert(
-                u"Không thể mở UI V4.9:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
+                u"Không thể mở UI V5.2 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
                 title="Correct Pipes & Fittings")

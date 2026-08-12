@@ -1,6 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Correct Pipes &amp; Fittings V4.9 - Preselection + Reducing Fittings"
+        Title="Correct Pipes &amp; Fittings V5.2 Universal - Revit 2025/2026"
         Height="900" Width="1180" MinHeight="620" MinWidth="820"
         WindowStartupLocation="CenterScreen" ResizeMode="CanResizeWithGrip">
     <Grid Margin="12">
@@ -23,7 +23,7 @@
                 <Border Background="#EEF6FF" BorderBrush="#B7D7F2" BorderThickness="1" Padding="10" Margin="0,0,0,9">
                     <StackPanel>
                         <TextBlock Text="Thay Pipe và Fitting theo System Type" FontSize="16" FontWeight="Bold" Foreground="#0B4778"/>
-                        <TextBlock Text="V4.9: chọn Pipe/Pipe Fitting trong Revit trước → chạy lệnh → cài đặt thông số → Thực hiện. Kết quả không hiện popup sau khi chạy; toàn bộ phần tử thành công, bỏ qua và lỗi được ghi trong Log. Fitting có các đầu khác kích thước dùng ô Fitting giảm bên phải." TextWrapping="Wrap" Margin="0,4,0,0"/>
+                        <TextBlock Text="V5.2 Universal / Revit 2025-2026: dùng chung một bộ script.py + ui.xaml. Chọn Pipe/Pipe Fitting trước → chạy lệnh → cài đặt → Thực hiện. System Type dùng PipingSystemType + ElementId 64-bit tương thích cả 2025/2026; kết quả chỉ ghi trong Log. Fitting khác kích thước dùng ô Fitting giảm bên phải." TextWrapping="Wrap" Margin="0,4,0,0"/>
                     </StackPanel>
                 </Border>
 
@@ -50,7 +50,7 @@
                     </StackPanel>
                 </Grid>
 
-                <TextBlock Text="3. Chỉ định Fitting Type thường và Fitting Type giảm:" FontWeight="Bold" Margin="0,0,0,5"/>
+                <TextBlock Text="3. Chỉ định duy nhất 1 type cho từng nhóm Fitting:" FontWeight="Bold" Margin="0,0,0,5"/>
 
                 <Grid Height="270" Margin="0,0,0,9">
                     <Grid.ColumnDefinitions>
@@ -59,7 +59,7 @@
                         <ColumnDefinition Width="1*"/>
                     </Grid.ColumnDefinitions>
 
-                    <GroupBox Grid.Column="0" Header="Fitting thường — các đầu cùng kích thước" FontWeight="Bold">
+                    <GroupBox Grid.Column="0" Header="Fitting thường — tối đa 1 type / PartType: Tee, Elbow, Transition, Cross" FontWeight="Bold">
                         <Grid Margin="8">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
@@ -70,17 +70,16 @@
                                 <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="Normal"/>
                                 <Button x:Name="btn_ClearFilter" Content="Xóa" Width="48" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="clear_filter_click"/>
                                 <Button x:Name="btn_ClearSelectedFittings" Content="Bỏ chọn" Width="66" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="clear_selected_fittings_click"/>
-                                <Button x:Name="btn_SelectVisibleFittings" Content="Chọn list" Width="68" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="select_visible_fittings_click"/>
                                 <TextBox x:Name="txt_FilterFittings" Height="24" TextChanged="filter_fittings_text_changed"/>
                             </DockPanel>
-                            <TextBlock Grid.Row="1" x:Name="txt_FittingCount" FontWeight="Normal" Text="Hiển thị 0/0 fitting type | Đã chọn 0" Foreground="#6A6A6A" Margin="0,0,0,6" TextWrapping="Wrap"/>
-                            <ListBox Grid.Row="2" x:Name="lst_FittingTypes" FontWeight="Normal" SelectionMode="Extended"
+                            <TextBlock Grid.Row="1" x:Name="txt_FittingCount" FontWeight="Normal" Text="Mỗi nhóm tối đa 1 type — Tee 0/1 | Elbow 0/1 | Transition 0/1 | Cross 0/1" Foreground="#6A6A6A" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                            <ListBox Grid.Row="2" x:Name="lst_FittingTypes" FontWeight="Normal" SelectionMode="Multiple"
                                      SelectionChanged="fitting_selection_changed"
                                      ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
                         </Grid>
                     </GroupBox>
 
-                    <GroupBox Grid.Column="2" Header="Fitting giảm — các đầu KHÔNG bằng kích thước" FontWeight="Bold" BorderBrush="#D18A00">
+                    <GroupBox Grid.Column="2" Header="Fitting giảm — tối đa 1 type / PartType: Tee, Elbow, Transition" FontWeight="Bold" BorderBrush="#D18A00">
                         <Grid Margin="8">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
@@ -91,11 +90,10 @@
                                 <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="Normal"/>
                                 <Button x:Name="btn_ClearReducingFilter" Content="Xóa" Width="48" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="clear_reducing_filter_click"/>
                                 <Button x:Name="btn_ClearSelectedReducingFittings" Content="Bỏ chọn" Width="66" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="clear_selected_reducing_fittings_click"/>
-                                <Button x:Name="btn_SelectVisibleReducingFittings" Content="Chọn list" Width="68" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="select_visible_reducing_fittings_click"/>
                                 <TextBox x:Name="txt_FilterReducingFittings" Height="24" TextChanged="filter_reducing_fittings_text_changed"/>
                             </DockPanel>
-                            <TextBlock Grid.Row="1" x:Name="txt_ReducingFittingCount" FontWeight="Normal" Text="Hiển thị 0/0 fitting type | Đã chỉ định giảm 0" Foreground="#9A4D00" Margin="0,0,0,6" TextWrapping="Wrap"/>
-                            <ListBox Grid.Row="2" x:Name="lst_ReducingFittingTypes" FontWeight="Normal" SelectionMode="Extended"
+                            <TextBlock Grid.Row="1" x:Name="txt_ReducingFittingCount" FontWeight="Normal" Text="Mỗi nhóm tối đa 1 type — Tee 0/1 | Elbow 0/1 | Transition 0/1" Foreground="#9A4D00" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                            <ListBox Grid.Row="2" x:Name="lst_ReducingFittingTypes" FontWeight="Normal" SelectionMode="Multiple"
                                      SelectionChanged="reducing_fitting_selection_changed"
                                      ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
                         </Grid>
@@ -104,8 +102,8 @@
 
                 <Border Background="#FFF8E8" BorderBrush="#E1B65A" BorderThickness="1" Padding="8" Margin="0,0,0,8">
                     <TextBlock TextWrapping="Wrap">
-                        <Run Text="Fitting giảm: " FontWeight="Bold"/>
-                        <Run Text="chọn type dành cho Tê giảm / Co giảm / Transition… Tool kiểm tra kích thước connector thực tế của fitting cũ. Nếu 2/3/4 đầu không bằng nhau, type bên phải được ưu tiên theo PartType và auto-size theo profile kích thước thực tế."/>
+                        <Run Text="Quy tắc V5.2: " FontWeight="Bold"/>
+                        <Run Text="mỗi PartType chỉ giữ 1 type. Nếu chọn Tee thứ hai, Tee đã chọn trước sẽ tự bỏ; Elbow/Transition/Cross không bị ảnh hưởng. Fitting thường chỉ hiển thị Tee/Elbow/Transition/Cross trong Routing Preferences. Fitting giảm chỉ hiển thị Tee/Elbow/Transition đã load và dùng khi connector cũ có kích thước không bằng nhau."/>
                     </TextBlock>
                 </Border>
 
