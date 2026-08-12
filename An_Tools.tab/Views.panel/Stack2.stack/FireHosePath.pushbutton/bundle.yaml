@@ -1,0 +1,12 @@
+title: "Auto FHR Lines"
+tooltip: |-
+  Automatic draw FHR lines to show the adaptable fire.
+
+  Use:
+  1. Pick fire compartment filled region.
+  2. Select mode:
+  2.1 Rebuild all: Create all new FHR lines
+  2.2 Add only selected point to Create wherever you want to add FHR line.
+  3. Check cabinet quantity & FHR lines were created.
+
+author: "Nguyen Thien An"

@@ -1,0 +1,148 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Pipe Local Up/Down"
+        Width="500"
+        Height="670"
+        ResizeMode="NoResize"
+        WindowStartupLocation="CenterScreen"
+        ShowInTaskbar="False">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Grid.Row="0"
+                   Text="Tạo đoạn Pipe thay đổi cao độ"
+                   FontSize="18"
+                   FontWeight="SemiBold"
+                   Margin="0,0,0,14"/>
+
+        <GroupBox Grid.Row="1"
+                  Header="Phương pháp xác định vị trí"
+                  Margin="0,0,0,12">
+            <StackPanel Margin="10,8,10,10">
+                <RadioButton x:Name="beam_mode_radio"
+                             Content="Chọn trực tiếp một dầm"
+                             Margin="0,0,0,7"/>
+                <TextBlock Text="Tool đọc Solid dầm và tự xác định hai mép giao với từng Pipe. Hỗ trợ dầm trong model và Revit Link."
+                           TextWrapping="Wrap"
+                           Foreground="#666666"
+                           Margin="22,0,0,10"/>
+                <RadioButton x:Name="union_mode_radio"
+                             Content="Đoạn Pipe nằm giữa hai Union"/>
+            </StackPanel>
+        </GroupBox>
+
+        <GroupBox Grid.Row="2"
+                  Header="Kiểu thay đổi cao độ"
+                  Margin="0,0,0,12">
+            <StackPanel Margin="10,8,10,10">
+                <RadioButton x:Name="local_profile_radio"
+                             Content="Né cục bộ hai phía — nâng/hạ rồi trở về cao độ cũ"
+                             Margin="0,0,0,8"/>
+                <RadioButton x:Name="one_side_up_radio"
+                             Content="Một phía UP — phía ngoài mép dầm giữ nguyên, phía còn lại nâng lên"
+                             Margin="0,0,0,8"/>
+                <RadioButton x:Name="one_side_down_radio"
+                             Content="Một phía DOWN — phía ngoài mép dầm giữ nguyên, phía còn lại hạ xuống"/>
+                <TextBlock Text="Hai chế độ một phía chỉ dùng với phương pháp chọn trực tiếp dầm. Sau khi pick dầm, tool sẽ yêu cầu click mép dầm muốn dùng làm vị trí chuyển cao độ."
+                           TextWrapping="Wrap"
+                           Foreground="#666666"
+                           Margin="22,9,0,0"/>
+            </StackPanel>
+        </GroupBox>
+
+        <Grid Grid.Row="3" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="225"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0"
+                       Text="Độ cao thay đổi (mm)"
+                       VerticalAlignment="Center"/>
+            <TextBox x:Name="offset_text"
+                     Grid.Column="1"
+                     Height="27"
+                     VerticalContentAlignment="Center"/>
+        </Grid>
+
+        <Grid Grid.Row="4" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="225"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0"
+                       Text="Góc đoạn xiên / góc co (độ)"
+                       VerticalAlignment="Center"/>
+            <ComboBox x:Name="angle_combo"
+                      Grid.Column="1"
+                      Height="27"
+                      IsEditable="True"
+                      IsTextSearchEnabled="False">
+                <ComboBoxItem Content="90"/>
+                <ComboBoxItem Content="60"/>
+                <ComboBoxItem Content="45"/>
+                <ComboBoxItem Content="30"/>
+                <ComboBoxItem Content="22.5"/>
+                <ComboBoxItem Content="15"/>
+            </ComboBox>
+        </Grid>
+
+        <Grid Grid.Row="5" Margin="0,0,0,12">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="225"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0"
+                       Text="Khoảng hở khỏi mép dầm (mm)"
+                       VerticalAlignment="Center"/>
+            <TextBox x:Name="clearance_text"
+                     Grid.Column="1"
+                     Height="27"
+                     VerticalContentAlignment="Center"/>
+        </Grid>
+
+        <Border Grid.Row="6"
+                Background="#F3F3F3"
+                BorderBrush="#D0D0D0"
+                BorderThickness="1"
+                Padding="10"
+                Margin="0,0,0,14">
+            <TextBlock TextWrapping="Wrap">
+                <Run Text="Quy ước:" FontWeight="SemiBold"/>
+                <LineBreak/>
+                <Run Text="• Né cục bộ: số dương là UP, số âm là DOWN."/>
+                <LineBreak/>
+                <Run Text="• Một phía UP/DOWN: chỉ cần nhập độ lớn; tool tự áp dấu theo option."/>
+                <LineBreak/>
+                <Run Text="• Với góc nhỏ hơn 90°, Run = |H| / tan(góc)."/>
+                <LineBreak/>
+                <Run Text="• Các giá trị và option được lưu cho lần chạy sau."/>
+                <LineBreak/>
+                <Run Text="• Pipe Type phải có elbow tương ứng trong Routing Preferences."/>
+            </TextBlock>
+        </Border>
+
+        <StackPanel Grid.Row="7"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right">
+            <Button x:Name="cancel_button"
+                    Content="Hủy"
+                    Width="90"
+                    Height="30"
+                    Margin="0,0,8,0"/>
+            <Button x:Name="ok_button"
+                    Content="Tiếp tục"
+                    Width="100"
+                    Height="30"
+                    IsDefault="True"/>
+        </StackPanel>
+    </Grid>
+</Window>

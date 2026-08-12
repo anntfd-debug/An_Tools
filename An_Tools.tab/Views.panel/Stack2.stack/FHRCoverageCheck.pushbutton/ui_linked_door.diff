@@ -1,0 +1,49 @@
+--- /mnt/data/FireCabinetCoverage_ui.xaml	2026-08-04 06:51:18.771927375 +0000
++++ /mnt/data/FireCabinetCoverage_ui_linkdoor.xaml	2026-08-04 06:54:05.014004741 +0000
+@@ -4,9 +4,9 @@
+     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+     Title="Fire Cabinet Coverage"
+     Width="560"
+-    Height="730"
++    Height="790"
+     MinWidth="520"
+-    MinHeight="680"
++    MinHeight="730"
+     WindowStartupLocation="CenterOwner"
+     ResizeMode="CanResizeWithGrip"
+     Background="#F5F7F9"
+@@ -116,6 +116,7 @@
+                     <RowDefinition Height="14"/>
+                     <RowDefinition Height="Auto"/>
+                     <RowDefinition Height="Auto"/>
++                    <RowDefinition Height="Auto"/>
+                 </Grid.RowDefinitions>
+ 
+                 <CheckBox x:Name="auto_scan_cb"
+@@ -172,11 +173,23 @@
+                           Foreground="#23384D"
+                           Content="Force nearby cabinets to pass selected doors"/>
+ 
+-                <TextBlock Grid.Row="5"
+-                           Margin="22,5,0,0"
++                <StackPanel Grid.Row="5"
++                            Margin="22,8,0,0"
++                            Orientation="Horizontal">
++                    <TextBlock Width="105"
++                               VerticalAlignment="Center"
++                               FontWeight="SemiBold"
++                               Foreground="#2B3137"
++                               Text="Door source"/>
++                    <ComboBox x:Name="door_source_cb"
++                              Width="180"/>
++                </StackPanel>
++
++                <TextBlock Grid.Row="6"
++                           Margin="22,7,0,0"
+                            Foreground="#687078"
+                            TextWrapping="Wrap"
+-                           Text="After Run, select multiple host-model doors. Each door is assigned to the cabinet with the shortest real path; that cabinet must route through the selected door before covering other areas."/>
++                           Text="After Run, select multiple doors from the chosen source. Linked doors are transformed into host coordinates. Each door is assigned to the cabinet with the shortest real path; that cabinet must route through the selected door before covering other areas."/>
+             </Grid>
+         </Border>
+ 

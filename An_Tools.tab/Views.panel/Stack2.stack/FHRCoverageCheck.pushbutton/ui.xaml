@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="Fire Cabinet Coverage"
+    Width="560"
+    Height="650"
+    MinWidth="520"
+    MinHeight="600"
+    WindowStartupLocation="CenterOwner"
+    ResizeMode="CanResizeWithGrip"
+    Background="#F5F7F9"
+    FontFamily="Segoe UI"
+    FontSize="13">
+
+    <Window.Resources>
+        <Style TargetType="TextBox">
+            <Setter Property="MinHeight" Value="32"/>
+            <Setter Property="Padding" Value="8,5"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="BorderBrush" Value="#B8C0C8"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Background" Value="White"/>
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="MinHeight" Value="32"/>
+            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="BorderBrush" Value="#B8C0C8"/>
+            <Setter Property="Background" Value="White"/>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="MinWidth" Value="105"/>
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Padding" Value="14,5"/>
+            <Setter Property="Margin" Value="8,0,0,0"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+        <Style x:Key="FieldLabel" TargetType="TextBlock">
+            <Setter Property="Margin" Value="0,0,0,5"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="#2B3137"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,14">
+            <TextBlock Text="Check Coverage of Fire Hose Reel (FHR)"
+                       FontSize="21"
+                       FontWeight="Bold"
+                       Foreground="#1E3A5F"/>
+            <TextBlock Margin="0,5,0,0"
+                       Text="Calculate uncovered walkable areas from selected fire cabinets by bounded multi-source Dijkstra inside the Filled Region compartment."
+                       TextWrapping="Wrap"
+                       Foreground="#5C6670"/>
+        </StackPanel>
+
+        <Border Grid.Row="1"
+                Padding="16"
+                Margin="0,0,0,14"
+                Background="White"
+                BorderBrush="#D8DDE2"
+                BorderThickness="1"
+                CornerRadius="7">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="18"/>
+                    <ColumnDefinition Width="*"/>
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="14"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+
+                <StackPanel Grid.Row="0" Grid.Column="0">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Maximum length of FHR (m)"/>
+                    <TextBox x:Name="max_distance_tb"/>
+                </StackPanel>
+
+                <StackPanel Grid.Row="0" Grid.Column="2">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Mesh size (mm)"/>
+                    <TextBox x:Name="grid_size_tb"/>
+                </StackPanel>
+
+                <StackPanel Grid.Row="2" Grid.Column="0">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Obstacle clearance (mm)"/>
+                    <TextBox x:Name="clearance_tb"/>
+                </StackPanel>
+
+                <StackPanel Grid.Row="2" Grid.Column="2">
+                    <TextBlock Style="{StaticResource FieldLabel}" Text="Result Filled Region Type"/>
+                    <ComboBox x:Name="region_type_cb"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Border Grid.Row="2"
+                Padding="16"
+                Background="White"
+                BorderBrush="#D8DDE2"
+                BorderThickness="1"
+                CornerRadius="7">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="12"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <CheckBox x:Name="auto_scan_cb"
+                          Grid.Row="0"
+                          FontSize="14"
+                          FontWeight="SemiBold"
+                          Foreground="#23384D"
+                          Content="Automatically scan FHR cabinets inside compartment"/>
+
+                <Border x:Name="keyword_panel"
+                        Grid.Row="2"
+                        Padding="13"
+                        BorderThickness="1"
+                        CornerRadius="6">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0"
+                                   Style="{StaticResource FieldLabel}"
+                                   Text="Text in the Family / Type / Name"/>
+
+                        <TextBlock x:Name="keyword_hint"
+                                   Grid.Row="1"
+                                   Margin="0,0,0,8"
+                                   Foreground="#687078"
+                                   TextWrapping="Wrap"
+                                   Text="Separated by , ; or new line. Just match one keyword. Tool can check the Category, Mark and Description."/>
+
+                        <TextBox x:Name="keyword_tb"
+                                 Grid.Row="2"
+                                 MinHeight="92"
+                                 AcceptsReturn="True"
+                                 TextWrapping="Wrap"
+                                 VerticalContentAlignment="Top"
+                                 VerticalScrollBarVisibility="Auto"/>
+
+                        <TextBlock x:Name="keyword_status"
+                                   Grid.Row="3"
+                                   Margin="0,8,0,0"
+                                   FontSize="12"
+                                   TextWrapping="Wrap"/>
+                    </Grid>
+                </Border>
+
+
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="3" Margin="0,14,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock x:Name="error_text"
+                       Grid.Column="0"
+                       VerticalAlignment="Center"
+                       Foreground="#C62828"
+                       FontWeight="SemiBold"
+                       TextWrapping="Wrap"
+                       Visibility="Collapsed"/>
+
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button x:Name="cancel_btn"
+                        Content="Cancel"
+                        Background="#E9ECEF"
+                        BorderBrush="#C8CDD2"/>
+                <Button x:Name="run_btn"
+                        Content="Run"
+                        Foreground="White"
+                        Background="#1769AA"
+                        BorderBrush="#105A91"
+                        IsDefault="True"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

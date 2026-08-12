@@ -1,0 +1,68 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Sleeve Host Updater" Width="820" Height="720"
+        MinWidth="720" MinHeight="620" WindowStartupLocation="CenterScreen"
+        Background="#EEF3F8">
+    <Window.Resources>
+        <Style TargetType="Button"><Setter Property="FontFamily" Value="Segoe UI"/><Setter Property="FontSize" Value="12"/><Setter Property="Cursor" Value="Hand"/><Setter Property="Padding" Value="12,6"/></Style>
+        <Style TargetType="TextBlock"><Setter Property="FontFamily" Value="Segoe UI"/></Style>
+        <Style TargetType="CheckBox"><Setter Property="FontFamily" Value="Segoe UI"/><Setter Property="FontSize" Value="13"/></Style>
+        <Style TargetType="RadioButton"><Setter Property="FontFamily" Value="Segoe UI"/><Setter Property="FontSize" Value="12"/></Style>
+    </Window.Resources>
+    <Grid>
+        <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+        <Border Grid.Row="0" Background="#17324D" Padding="22,17">
+            <Grid><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel><TextBlock Text="SLEEVE HOST UPDATER" Foreground="White" FontSize="22" FontWeight="Bold"/><TextBlock Text="Existing sleeves | current and linked hosts | floor elevation extended search" Foreground="#CFE1F2" FontSize="12" Margin="0,5,0,0"/></StackPanel>
+                <Border Grid.Column="1" Background="#234A6D" CornerRadius="16" Padding="12,5" VerticalAlignment="Center"><TextBlock Text="Floor Search +/- 3000 mm" Foreground="#D9F2E6" FontWeight="SemiBold"/></Border>
+            </Grid>
+        </Border>
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="18">
+            <StackPanel>
+                <Border Background="White" CornerRadius="9" Padding="16" Margin="0,0,0,13"><StackPanel>
+                    <Grid Margin="0,0,0,11"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <StackPanel><TextBlock Text="1. SELECT EXISTING SLEEVES" Foreground="#17324D" FontWeight="Bold" FontSize="14"/><TextBlock Name="TxtSleeveSummary" Text="No sleeves selected" Foreground="#64748B" Margin="0,4,0,0"/></StackPanel>
+                        <Button Grid.Column="1" Name="BtnPickSleeves" Content="PICK MULTIPLE SLEEVES" Height="34" Margin="8,0,7,0" Background="#0F6CBD" Foreground="White" BorderBrush="#0F6CBD" FontWeight="SemiBold"/>
+                        <Button Grid.Column="2" Name="BtnClearSleeves" Content="Clear selection" Height="34" Background="#F8FAFC" Foreground="#475569" BorderBrush="#CBD5E1"/>
+                    </Grid>
+                    <Border BorderBrush="#C8D6E4" BorderThickness="1" CornerRadius="7" Background="#F7FAFD" Padding="9" MinHeight="90" MaxHeight="180"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Name="SleeveContainer"/></ScrollViewer></Border>
+                </StackPanel></Border>
+                <Border Background="White" CornerRadius="9" Padding="16" Margin="0,0,0,13"><StackPanel>
+                    <Grid Margin="0,0,0,11"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                        <StackPanel><TextBlock Text="2. HOST SOURCES" Foreground="#17324D" FontWeight="Bold" FontSize="14"/><TextBlock Name="TxtLinkSummary" Text="Current model | 0 Revit Links" Foreground="#64748B" Margin="0,4,0,0"/></StackPanel>
+                        <Button Grid.Column="1" Name="BtnPickLinks" Content="PICK REVIT LINKS" Height="34" Margin="8,0,7,0" Background="#0F6CBD" Foreground="White" BorderBrush="#0F6CBD" FontWeight="SemiBold"/>
+                        <Button Grid.Column="2" Name="BtnClearLinks" Content="Current model only" Height="34" Background="#F8FAFC" Foreground="#475569" BorderBrush="#CBD5E1"/>
+                    </Grid>
+                    <Border BorderBrush="#C8D6E4" BorderThickness="1" CornerRadius="7" Background="#F7FAFD" Padding="9" MinHeight="75" MaxHeight="160"><ScrollViewer VerticalScrollBarVisibility="Auto"><StackPanel Name="LinkContainer"/></ScrollViewer></Border>
+                </StackPanel></Border>
+                <Border Background="White" CornerRadius="9" Padding="16" Margin="0,0,0,13"><StackPanel>
+                    <TextBlock Text="3. HOST CATEGORIES" Foreground="#17324D" FontWeight="Bold" FontSize="14"/>
+                    <Grid Margin="0,12,0,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                        <Border Grid.Column="0" Background="#F8FAFC" BorderBrush="#D8E2EC" BorderThickness="1" CornerRadius="7" Padding="13" Margin="0,0,6,0"><CheckBox Name="ChkWall" IsChecked="True" Content="Wall"/></Border>
+                        <Border Grid.Column="1" Background="#F8FAFC" BorderBrush="#D8E2EC" BorderThickness="1" CornerRadius="7" Padding="13" Margin="6,0,6,0"><CheckBox Name="ChkFloor" IsChecked="True" Content="Floor"/></Border>
+                        <Border Grid.Column="2" Background="#F8FAFC" BorderBrush="#D8E2EC" BorderThickness="1" CornerRadius="7" Padding="13" Margin="6,0,0,0"><CheckBox Name="ChkBeam" IsChecked="True" Content="Structural Framing"/></Border>
+                    </Grid>
+                    <TextBlock Text="Floor matching checks XY coverage and searches vertically up to 3000 mm above or below the sleeve. It also probes around openings." Foreground="#64748B" FontSize="11" TextWrapping="Wrap" Margin="0,9,0,0"/>
+                </StackPanel></Border>
+                <Border Background="White" CornerRadius="9" Padding="16" Margin="0,0,0,13"><StackPanel>
+                    <TextBlock Text="4. THICKNESS PARAMETERS" Foreground="#17324D" FontWeight="Bold" FontSize="14"/>
+                    <TextBlock Text="Enter instance parameter names separated by semicolons." Foreground="#64748B" Margin="0,4,0,8"/>
+                    <TextBox Name="TxtThicknessParameters" Height="32" Padding="8,5"/>
+                </StackPanel></Border>
+                <Border Background="White" CornerRadius="9" Padding="16"><StackPanel>
+                    <TextBlock Text="5. ACTION" Foreground="#17324D" FontWeight="Bold" FontSize="14"/>
+                    <StackPanel Margin="0,12,0,0"><RadioButton Name="RbBoth" Content="Update thickness and center sleeve" IsChecked="True" Margin="0,0,0,8"/><RadioButton Name="RbThicknessOnly" Content="Update thickness only" Margin="0,0,0,8"/><RadioButton Name="RbCenterOnly" Content="Center sleeve only"/></StackPanel>
+                    <CheckBox Name="ChkIncludeCurrent" IsChecked="True" Margin="0,14,0,0" Content="Always scan hosts in the current model"/>
+                    <TextBlock Text="Offset from Host is set to the host Height Offset From Level. Sloped floors use the elevation at the sleeve XY position." Foreground="#64748B" FontSize="11" TextWrapping="Wrap" Margin="0,9,0,0"/>
+                </StackPanel></Border>
+                <TextBlock Name="TxtValidation" Foreground="#B42318" FontWeight="SemiBold" TextWrapping="Wrap" Margin="4,10,4,0"/>
+            </StackPanel>
+        </ScrollViewer>
+        <Border Grid.Row="2" Background="White" BorderBrush="#D5DEE8" BorderThickness="0,1,0,0" Padding="18,13"><Grid>
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+            <TextBlock Text="All selections and options are saved automatically." VerticalAlignment="Center" Foreground="#64748B"/>
+            <Button Grid.Column="1" Name="BtnCancel" Content="Cancel" Width="95" Height="36" Margin="0,0,9,0" Background="#F8FAFC" Foreground="#475569" BorderBrush="#CBD5E1"/>
+            <Button Grid.Column="2" Name="BtnRun" Content="UPDATE SLEEVES" Width="175" Height="36" Background="#17324D" Foreground="White" BorderBrush="#17324D" FontWeight="Bold"/>
+        </Grid></Border>
+    </Grid>
+</Window>

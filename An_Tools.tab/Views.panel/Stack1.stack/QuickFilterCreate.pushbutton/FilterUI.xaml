@@ -1,0 +1,62 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="MEP Filter Creator" Height="450" Width="700" WindowStartupLocation="CenterScreen">
+    <Grid Margin="10">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="1*"/>
+            <ColumnDefinition Width="1.5*"/>
+        </Grid.ColumnDefinitions>
+
+        <GroupBox Header="Categories" Grid.Column="0" Margin="0,0,5,0">
+            <Grid>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/> <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+                
+                <TextBlock Grid.Row="0" Text="Select categories to include:" TextWrapping="Wrap" Margin="5" FontStyle="Italic" Foreground="Gray"/>
+                
+                <TextBox x:Name="tb_SearchCategory" Grid.Row="1" Margin="5,0,5,5" Height="22" 
+                         TextChanged="tb_SearchCategory_TextChanged" ToolTip="Tìm kiếm category..."/>
+                
+                <ListBox x:Name="lb_Categories" Grid.Row="2" ScrollViewer.VerticalScrollBarVisibility="Auto" Margin="5">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <CheckBox Content="{Binding Name}" Tag="{Binding Id}" 
+                                      IsChecked="{Binding IsChecked, Mode=TwoWay}" 
+                                      Click="Category_Checked"/>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </GroupBox>
+
+        <GroupBox Header="Filter Rules" Grid.Column="1" Margin="5,0,0,0">
+            <StackPanel Margin="10">
+                <TextBlock Text="Filter Name:" FontWeight="Bold" Margin="0,0,0,5"/>
+                <TextBox x:Name="tb_FilterName" Height="24" Margin="0,0,0,20"/>
+
+                <Border BorderBrush="Green" BorderThickness="1" Padding="10">
+                    <StackPanel>
+                        <TextBlock Text="AND (All rules must be true)" FontWeight="Bold" Foreground="Green" Margin="0,0,0,15"/>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="1.2*"/>
+                                <ColumnDefinition Width="0.8*"/>
+                                <ColumnDefinition Width="1.5*"/>
+                            </Grid.ColumnDefinitions>
+                            
+                            <ComboBox x:Name="cb_Parameters" Grid.Column="0" Margin="0,0,5,0" Height="24" DisplayMemberPath="Name"/>
+                            <ComboBox Grid.Column="1" Margin="5,0,5,0" Height="24" SelectedIndex="0" IsEnabled="False">
+                                <ComboBoxItem Content="equals"/>
+                            </ComboBox>
+                            <TextBox x:Name="tb_Value" Grid.Column="2" Margin="5,0,0,0" Height="24"/>
+                        </Grid>
+                    </StackPanel>
+                </Border>
+
+                <Button x:Name="btn_Create" Content="Tạo và Gán Filter" Height="35" Margin="0,30,0,0" Click="btn_Create_Click"/>
+            </StackPanel>
+        </GroupBox>
+    </Grid>
+</Window>

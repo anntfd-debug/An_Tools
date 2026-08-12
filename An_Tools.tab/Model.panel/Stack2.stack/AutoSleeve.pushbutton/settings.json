@@ -1,0 +1,43 @@
+{
+  "scan_floor": true, 
+  "replace_mode": false, 
+  "mapping": [
+    {
+      "size": "110", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_160mm"
+    }, 
+    {
+      "size": "160", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_210mm"
+    }, 
+    {
+      "size": "125", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_170mm"
+    }, 
+    {
+      "size": "150", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_190mm"
+    }, 
+    {
+      "size": "50", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_100mm"
+    }, 
+    {
+      "size": "63", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_120mm"
+    }, 
+    {
+      "size": "315", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_365mm"
+    }, 
+    {
+      "size": "75", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_120mm"
+    }
+  ], 
+  "scan_beam": true, 
+  "root_link_ids": [
+    13713061
+  ], 
+  "scan_wall": true
+}

@@ -1,0 +1,10 @@
+title: "Room Filled Region"
+tooltip: |-
+  Tạo Filled Region theo đúng đường bao Room nằm trong Revit Link.
+
+  Cách sử dụng:
+  1. Nhập từ khóa Room Name.
+  2. Chọn Filled Region Type và loại đường bao.
+  3. Chọn một hoặc nhiều Revit Link rồi nhấn Finish.
+  4. Tool mở một cửa sổ Output pyRevit duy nhất, có Element ID và kính lúp để zoom.
+author: "Nguyen Thien An"

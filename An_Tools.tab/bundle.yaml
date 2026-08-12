@@ -1,0 +1,7 @@
+layout:
+  - Model
+  - Views
+  - Graphic
+  - Tag
+  - Parameter
+  - Link

@@ -1,0 +1,13 @@
+title: "Load Families\nAnd Sync"
+
+tooltip: |-
+  Load hoặc reload tất cả Revit Family trong một thư mục vào model hiện hữu.
+
+  Quy trình:
+  1. Chọn thư mục chứa Family.
+  2. Quét tất cả file .rfa.
+  3. Load hoặc reload Family.
+  4. Ghi đè giá trị parameter.
+  5. Tự động Synchronize with Central.
+
+author: "Nguyen Thien An"

@@ -1,0 +1,15 @@
+title: "Pipe Local Up Down"
+tooltip: |-
+  Tạo đoạn Pipe thay đổi cao độ khi giao với dầm.
+
+  Các kiểu xử lý:
+  1. Né cục bộ hai phía rồi trở về cao độ ban đầu.
+  2. Một phía UP: phía ngoài mép dầm giữ nguyên, phía còn lại nâng lên.
+  3. Một phía DOWN: phía ngoài mép dầm giữ nguyên, phía còn lại hạ xuống.
+
+  Hỗ trợ:
+  - Chọn trực tiếp dầm trong model hoặc Revit Link.
+  - Chọn nhiều Pipe.
+  - Góc 90°, 60°, 45°, 30° hoặc góc nhập tay.
+  - Lưu lại thiết lập lần trước.
+author: "Nguyen Thien An"

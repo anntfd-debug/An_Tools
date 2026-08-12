@@ -1,0 +1,17 @@
+{
+  "max_length_mm": "1500", 
+  "max_size_mm": "315", 
+  "min_length_mm": "1200", 
+  "min_size_mm": "15", 
+  "orientation": "horizontal", 
+  "scope": "view", 
+  "spacing_mm": "0.1", 
+  "tag_condition": "untagged", 
+  "tag_side": "left", 
+  "tag_type": "AUR_TAG PIPE SIZE & TYPE - STANDARD", 
+  "use_max_length": true, 
+  "use_max_size": true, 
+  "view_range_bottom_mm": "2900", 
+  "view_range_mode": "active", 
+  "view_range_top_mm": "3000"
+}

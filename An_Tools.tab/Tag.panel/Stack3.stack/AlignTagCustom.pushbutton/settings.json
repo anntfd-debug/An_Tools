@@ -1,0 +1,14 @@
+{
+    "custom_angle_enabled": true, 
+    "shoulder_enabled": true, 
+    "tag_spacing_mm": 1270.0, 
+    "distribute_axis": "Y", 
+    "custom_angle_deg": 75.0, 
+    "elbow_enabled": true, 
+    "shoulder_mm": 1500.0, 
+    "leader_types": [
+        "45UD"
+    ], 
+    "elbow_mm": 600.0, 
+    "mode": "Customize"
+}

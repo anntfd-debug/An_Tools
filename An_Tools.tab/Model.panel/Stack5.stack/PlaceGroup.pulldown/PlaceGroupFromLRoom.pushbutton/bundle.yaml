@@ -1,0 +1,9 @@
+title: >-
+  Place Group
+  From Room
+tooltip: >-
+  Pick nhiều Revit Link, lọc Family đang hiển thị trong Active View và đặt
+  Model Group tại bốn góc cục bộ. Bản Duplicate-Safe loại nested Family,
+  nguồn trùng tuyệt đối, nguồn cùng Family/Type chồng vị trí và Group đã tồn tại.
+  Có cache bền, tạo thử Family thứ N, progress bar, Cancel và báo cáo Zoom.
+author: Nguyen Thien An

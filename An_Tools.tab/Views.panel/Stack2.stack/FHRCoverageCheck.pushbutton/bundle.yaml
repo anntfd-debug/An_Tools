@@ -1,0 +1,10 @@
+title: "FHR Coverage Check"
+tooltip: |-
+  Check FHR coverage and display the calculation result.
+
+  Use:
+  1. Pick fire compartment filled region.
+  2. Set up parapeters.
+  3. Check cabinet quantity & filled region created.
+
+author: "Nguyen Thien An"

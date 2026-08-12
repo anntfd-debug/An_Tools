@@ -1,0 +1,186 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Auto Tag Pipe - View Range"
+        Height="760" Width="560"
+        MinHeight="720" MinWidth="540"
+        WindowStartupLocation="CenterScreen"
+        Topmost="True"
+        Background="#EEF2F7"
+        FontFamily="Segoe UI">
+
+    <Window.Resources>
+        <Style x:Key="CardGroupBox" TargetType="GroupBox">
+            <Setter Property="Margin" Value="0,0,0,12"/>
+            <Setter Property="Padding" Value="12"/>
+            <Setter Property="Background" Value="White"/>
+            <Setter Property="BorderBrush" Value="#D9E2EC"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+
+        <Style TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#243B53"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+
+        <Style TargetType="TextBox">
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="Padding" Value="8,3"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="BorderBrush" Value="#BCCCDC"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Background" Value="#FFFFFF"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Height" Value="30"/>
+            <Setter Property="Padding" Value="6,2"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="BorderBrush" Value="#BCCCDC"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+        </Style>
+
+        <Style TargetType="RadioButton">
+            <Setter Property="Margin" Value="0,0,18,8"/>
+            <Setter Property="FontWeight" Value="Normal"/>
+            <Setter Property="Foreground" Value="#243B53"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+
+        <Style TargetType="Button">
+            <Setter Property="Height" Value="34"/>
+            <Setter Property="Padding" Value="16,0"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <Border Grid.Row="0" Background="#102A43" CornerRadius="10" Padding="16" Margin="0,0,0,14">
+            <StackPanel>
+                <TextBlock Text="TAG PIPE WITH LEADER" Foreground="White" FontSize="18" FontWeight="Bold"/>
+                <TextBlock Text="Lọc theo View Range, tự xoay tag theo hướng ống; ống ngang giãn cách theo Y, ống dọc/xéo giãn cách theo X."
+                           Foreground="#D9E2EC" Margin="0,4,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+        </Border>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
+            <StackPanel>
+
+                <GroupBox Header="1. Thông số lọc ống và xếp tag (mm)" Style="{StaticResource CardGroupBox}">
+                    <Grid Grid.IsSharedSizeScope="True">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="220" SharedSizeGroup="LabelGroup"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <TextBlock Grid.Row="0" Grid.Column="0" Text="Chiều dài ống tối thiểu" VerticalAlignment="Center" Margin="0,0,0,8"/>
+                        <TextBox x:Name="txtMinLen" Grid.Row="0" Grid.Column="1" Text="1000" Margin="8,0,0,8"/>
+
+                        <TextBlock Grid.Row="1" Grid.Column="0" Text="Đường kính ống Min" VerticalAlignment="Center" Margin="0,0,0,8"/>
+                        <TextBox x:Name="txtMinSize" Grid.Row="1" Grid.Column="1" Text="15" Margin="8,0,0,8"/>
+
+                        <TextBlock Grid.Row="2" Grid.Column="0" Text="Đường kính ống Max" VerticalAlignment="Center" Margin="0,0,0,8"/>
+                        <TextBox x:Name="txtMaxSize" Grid.Row="2" Grid.Column="1" Text="1000" Margin="8,0,0,8"/>
+
+                        <TextBlock Grid.Row="3" Grid.Column="0" Text="Khoảng cách tag: ngang=Y, dọc/xéo=X" VerticalAlignment="Center"/>
+                        <TextBox x:Name="txtStepY" Grid.Row="3" Grid.Column="1" Text="400" Margin="8,0,0,0"/>
+                    </Grid>
+                </GroupBox>
+
+                <GroupBox Header="2. Phạm vi lấy ống" Style="{StaticResource CardGroupBox}">
+                    <StackPanel>
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="rbView" Content="Toàn bộ ống trong active view"/>
+                            <RadioButton x:Name="rbSelection" Content="Ống chọn trước / quét chọn" IsChecked="True"/>
+                        </StackPanel>
+                        <TextBlock Text="Nếu đã chọn ống trước khi mở lệnh, tool sẽ dùng trực tiếp các ống đó và không gọi lại PickObjects. Nếu chưa chọn trước, tool mới yêu cầu quét chọn. View Range vẫn được áp dụng cho cả hai cách."
+                                   Foreground="#627D98" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="3. Bộ lọc View Range" Style="{StaticResource CardGroupBox}">
+                    <StackPanel>
+                        <WrapPanel Margin="0,0,0,6">
+                            <RadioButton x:Name="rbVrNone" Content="Không lọc View Range" IsChecked="True"/>
+                            <RadioButton x:Name="rbVrActive" Content="Dùng View Range hiện hành"/>
+                            <RadioButton x:Name="rbVrManual" Content="Nhập View Range thủ công"/>
+                        </WrapPanel>
+
+                        <Border Background="#F0F4F8" CornerRadius="6" Padding="10" Margin="0,2,0,10">
+                            <TextBlock x:Name="txtVrStatus" Text="Đang đọc thông tin active view..." Foreground="#486581" TextWrapping="Wrap"/>
+                        </Border>
+
+                        <Grid Grid.IsSharedSizeScope="True">
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto"/>
+                                <RowDefinition Height="Auto"/>
+                            </Grid.RowDefinitions>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="220" SharedSizeGroup="VrLabel"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+
+                            <TextBlock Grid.Row="0" Grid.Column="0" Text="Bottom offset theo Level" VerticalAlignment="Center" Margin="0,0,0,8"/>
+                            <TextBox x:Name="txtVrBottom" Grid.Row="0" Grid.Column="1" Text="0" Margin="8,0,0,8"/>
+
+                            <TextBlock Grid.Row="1" Grid.Column="0" Text="Top offset theo Level" VerticalAlignment="Center"/>
+                            <TextBox x:Name="txtVrTop" Grid.Row="1" Grid.Column="1" Text="3000" Margin="8,0,0,0"/>
+                        </Grid>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="4. Điều kiện tag" Style="{StaticResource CardGroupBox}">
+                    <StackPanel>
+                        <WrapPanel>
+                            <RadioButton x:Name="rbAllPipes" Content="Tag toàn bộ ống / cập nhật tag cũ" IsChecked="True"/>
+                            <RadioButton x:Name="rbUntaggedOnly" Content="Chỉ tag ống chưa có tag"/>
+                            <RadioButton x:Name="rbTaggedAdditional" Content="Tag tiếp vào ống đã có tag"/>
+                        </WrapPanel>
+                        <TextBlock Text="Option thứ 3 chỉ xử lý ống đang có tag trong active view, giữ nguyên tag cũ và đặt thêm một tag mới."
+                                   Foreground="#627D98" TextWrapping="Wrap" Margin="0,2,0,0"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox Header="5. Chọn loại Pipe Tag" Style="{StaticResource CardGroupBox}">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Text="Tag cho ống ngang trên mặt bằng - gần song song trục X" Margin="0,0,0,5"/>
+                        <ComboBox x:Name="cbTagHorizontal" Grid.Row="1" Margin="0,0,0,12"/>
+
+                        <TextBlock Grid.Row="2" Text="Tag cho ống dọc Y hoặc ống xéo - tool sẽ cố gắng xoay theo hướng ống" Margin="0,0,0,5"/>
+                        <ComboBox x:Name="cbTagNonHorizontal" Grid.Row="3"/>
+                    </Grid>
+                </GroupBox>
+
+            </StackPanel>
+        </ScrollViewer>
+
+        <Border Grid.Row="2" Background="#EEF2F7" Padding="0,12,0,0">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <Button x:Name="btnCancel" Content="Đóng" Width="92" Background="#CBD2D9" Foreground="#102A43" Margin="0,0,10,0"/>
+                <Button x:Name="btnExecute" Content="Thực hiện lệnh" Width="150" Background="#0B72B9" Foreground="White"/>
+            </StackPanel>
+        </Border>
+    </Grid>
+</Window>

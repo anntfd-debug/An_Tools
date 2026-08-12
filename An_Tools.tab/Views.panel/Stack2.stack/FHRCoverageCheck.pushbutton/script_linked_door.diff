@@ -1,0 +1,373 @@
+--- /mnt/data/FireCabinetCoverage_script.py	2026-08-04 06:51:18.747927375 +0000
++++ /mnt/data/FireCabinetCoverage_script_linkdoor.py	2026-08-04 06:56:28.320584028 +0000
+@@ -32,6 +32,7 @@
+ DEFAULT_CLEARANCE_MM = 100.0
+ DEFAULT_AUTO_SCAN = False
+ DEFAULT_FORCE_SELECTED_DOORS = False
++DEFAULT_DOOR_SOURCE = 'link'
+ DEFAULT_CABINET_KEYWORDS = 'FHR; Fire Hose Reel; Hose Reel; Fire Cabinet; Tu Chua Chay'
+ 
+ # Walking obstacle height band, relative to the active view level.
+@@ -274,7 +275,7 @@
+         return False
+ 
+ 
+-class DoorSelectionFilter(ISelectionFilter):
++class HostDoorSelectionFilter(ISelectionFilter):
+     def AllowElement(self, element):
+         try:
+             category = element.Category
+@@ -288,6 +289,40 @@
+         return False
+ 
+ 
++class LinkedDoorSelectionFilter(ISelectionFilter):
++    # ObjectType.LinkedElement passes the RevitLinkInstance to AllowElement.
++    # Keep that instance for AllowReference, following the Revit API pattern.
++    def __init__(self):
++        self.current_link_instance = None
++
++    def AllowElement(self, element):
++        if isinstance(element, DB.RevitLinkInstance):
++            self.current_link_instance = element
++            return True
++        self.current_link_instance = None
++        return False
++
++    def AllowReference(self, reference, point):
++        try:
++            link_instance = self.current_link_instance
++            if link_instance is None:
++                link_instance = doc.GetElement(reference.ElementId)
++            if not isinstance(link_instance, DB.RevitLinkInstance):
++                return False
++            link_doc = link_instance.GetLinkDocument()
++            if link_doc is None:
++                return False
++            linked_id = reference.LinkedElementId
++            if linked_id is None or linked_id == DB.ElementId.InvalidElementId:
++                return False
++            linked_element = link_doc.GetElement(linked_id)
++            if linked_element is None or linked_element.Category is None:
++                return False
++            return linked_element.Category.Id == DB.ElementId(DB.BuiltInCategory.OST_Doors)
++        except Exception:
++            return False
++
++
+ # =============================================================================
+ # VALIDATE VIEW, PICK COMPARTMENT AND SHOW SETTINGS UI
+ # =============================================================================
+@@ -427,6 +462,12 @@
+             'force_selected_doors',
+             DEFAULT_FORCE_SELECTED_DOORS
+         )
++        self.door_source_cb.Items.Add('Host model')
++        self.door_source_cb.Items.Add('Revit Link')
++        saved_door_source = to_text(
++            config_get('door_source', DEFAULT_DOOR_SOURCE)
++        ).strip().lower()
++        self.door_source_cb.SelectedIndex = 0 if saved_door_source == 'host' else 1
+         self.keyword_tb.Text = to_text(config_get('cabinet_keywords', DEFAULT_CABINET_KEYWORDS))
+ 
+         saved_region_type_id = -1
+@@ -444,9 +485,12 @@
+ 
+         self.auto_scan_cb.Checked += self.auto_scan_changed
+         self.auto_scan_cb.Unchecked += self.auto_scan_changed
++        self.force_doors_cb.Checked += self.force_doors_changed
++        self.force_doors_cb.Unchecked += self.force_doors_changed
+         self.run_btn.Click += self.run_click
+         self.cancel_btn.Click += self.cancel_click
+         self.update_keyword_state()
++        self.update_door_source_state()
+ 
+     def update_keyword_state(self):
+         enabled = (self.auto_scan_cb.IsChecked == True)
+@@ -476,6 +520,15 @@
+     def auto_scan_changed(self, sender, args):
+         self.update_keyword_state()
+ 
++    def update_door_source_state(self):
++        try:
++            self.door_source_cb.IsEnabled = (self.force_doors_cb.IsChecked == True)
++        except Exception:
++            pass
++
++    def force_doors_changed(self, sender, args):
++        self.update_door_source_state()
++
+     def show_error(self, message):
+         self.error_text.Text = to_text(message)
+         from System.Windows import Visibility
+@@ -500,6 +553,7 @@
+             )
+             auto_scan_value = (self.auto_scan_cb.IsChecked == True)
+             force_selected_doors_value = (self.force_doors_cb.IsChecked == True)
++            door_source_value = 'host' if self.door_source_cb.SelectedIndex == 0 else 'link'
+             raw_keywords = to_text(self.keyword_tb.Text).strip()
+             parsed_keywords = split_keywords(raw_keywords)
+             if auto_scan_value and not parsed_keywords:
+@@ -515,6 +569,7 @@
+                 'clearance_mm': clearance_mm_value,
+                 'auto_scan': auto_scan_value,
+                 'force_selected_doors': force_selected_doors_value,
++                'door_source': door_source_value,
+                 'raw_keywords': raw_keywords,
+                 'keywords': parsed_keywords,
+                 'region_type': self.region_rows[selected_index][1],
+@@ -542,6 +597,7 @@
+ clearance_mm = ui_values['clearance_mm']
+ auto_scan_enabled = ui_values['auto_scan']
+ force_selected_doors = ui_values['force_selected_doors']
++door_source = ui_values['door_source']
+ cabinet_keywords_raw = ui_values['raw_keywords']
+ cabinet_keywords = ui_values['keywords']
+ selected_region_type = ui_values['region_type']
+@@ -553,6 +609,7 @@
+     config.clearance_mm = clearance_mm
+     config.auto_scan = auto_scan_enabled
+     config.force_selected_doors = force_selected_doors
++    config.door_source = door_source
+     config.cabinet_keywords = cabinet_keywords_raw
+     config.region_type_id = eid_int(selected_region_type.Id)
+     script.save_config()
+@@ -603,20 +660,28 @@
+         })
+         selected_host_cabinet_ids.add(eid_int(cabinet.Id))
+ 
+-# Optional gateway-door selection. This intentionally uses ObjectType.Element,
+-# so only doors in the current host model can be selected.
++# Optional gateway-door selection. The user can pick either host-model doors
++# or linked doors. Linked doors are stored by both RevitLinkInstance Id and
++# LinkedElementId so equal element ids in different links cannot collide.
+ selected_door_refs = []
+-selected_door_ids = set()
+-selected_door_id_order = []
+-selected_door_elements = {}
++selected_door_keys = set()
++selected_door_key_order = []
++selected_door_records = {}
+ 
+ if force_selected_doors:
+     try:
+-        selected_door_refs = uidoc.Selection.PickObjects(
+-            ObjectType.Element,
+-            DoorSelectionFilter(),
+-            'Select route-gateway doors in the host model, then click Finish.'
+-        )
++        if door_source == 'link':
++            selected_door_refs = uidoc.Selection.PickObjects(
++                ObjectType.LinkedElement,
++                LinkedDoorSelectionFilter(),
++                'Select route-gateway doors in Revit links, then click Finish.'
++            )
++        else:
++            selected_door_refs = uidoc.Selection.PickObjects(
++                ObjectType.Element,
++                HostDoorSelectionFilter(),
++                'Select route-gateway doors in the host model, then click Finish.'
++            )
+     except OperationCanceledException:
+         script.exit()
+ 
+@@ -624,18 +689,65 @@
+         forms.alert('No gateway door was selected.', exitscript=True)
+ 
+     for reference in selected_door_refs:
+-        door = doc.GetElement(reference.ElementId)
+-        if door is None:
+-            continue
+-        door_id = eid_int(door.Id)
+-        if door_id in selected_door_ids:
++        if door_source == 'link':
++            link_instance = doc.GetElement(reference.ElementId)
++            if not isinstance(link_instance, DB.RevitLinkInstance):
++                continue
++            link_doc = link_instance.GetLinkDocument()
++            if link_doc is None:
++                continue
++            linked_id = reference.LinkedElementId
++            if linked_id is None or linked_id == DB.ElementId.InvalidElementId:
++                continue
++            door = link_doc.GetElement(linked_id)
++            if door is None:
++                continue
++            link_id = eid_int(link_instance.Id)
++            door_id = eid_int(linked_id)
++            source_key = 'LINK_{0}'.format(link_id)
++            key = (source_key, door_id)
++            record = {
++                'key': key,
++                'element': door,
++                'door_id': door_id,
++                'is_host': False,
++                'source_key': source_key,
++                'source_label': to_text(link_instance.Name),
++                'link_instance': link_instance,
++                'link_instance_id': link_id,
++                'external_transform': link_instance.GetTotalTransform(),
++            }
++        else:
++            door = doc.GetElement(reference.ElementId)
++            if door is None:
++                continue
++            door_id = eid_int(door.Id)
++            source_key = 'HOST'
++            key = (source_key, door_id)
++            record = {
++                'key': key,
++                'element': door,
++                'door_id': door_id,
++                'is_host': True,
++                'source_key': source_key,
++                'source_label': 'Host',
++                'link_instance': None,
++                'link_instance_id': None,
++                'external_transform': None,
++            }
++
++        if key in selected_door_keys:
+             continue
+-        selected_door_ids.add(door_id)
+-        selected_door_id_order.append(door_id)
+-        selected_door_elements[door_id] = door
++        selected_door_keys.add(key)
++        selected_door_key_order.append(key)
++        selected_door_records[key] = record
+ 
+-    if not selected_door_id_order:
+-        forms.alert('No valid host-model door was selected.', exitscript=True)
++    if not selected_door_key_order:
++        source_text = 'Revit Link' if door_source == 'link' else 'host model'
++        forms.alert(
++            'No valid door was selected from {0}.'.format(source_text),
++            exitscript=True
++        )
+ 
+ # =============================================================================
+ # VIEW PLANE AND COMPARTMENT BOUNDARY
+@@ -2630,20 +2742,29 @@
+ final_seed_costs = dict(seed_costs)
+ 
+ if force_selected_doors:
+-    host_portals_by_door_id = {}
++    selected_portals_by_key = {}
+     for portal in door_portals:
+-        if portal.get('source_key') != 'HOST':
+-            continue
+-        insert_id = portal.get('insert_id')
+-        if insert_id in selected_door_ids and insert_id not in host_portals_by_door_id:
+-            host_portals_by_door_id[insert_id] = portal
+-
+-    for door_order, door_id in enumerate(selected_door_id_order):
+-        door = selected_door_elements.get(door_id)
++        portal_key = (
++            portal.get('source_key'),
++            portal.get('insert_id')
++        )
++        if portal_key in selected_door_keys and portal_key not in selected_portals_by_key:
++            selected_portals_by_key[portal_key] = portal
++
++    for door_order, door_key in enumerate(selected_door_key_order):
++        selected_record = selected_door_records.get(door_key) or {}
++        door = selected_record.get('element')
++        door_id = selected_record.get('door_id')
+         gateway_record = {
+             'number': door_order + 1,
++            'door_key': door_key,
+             'door_id': door_id,
+             'element': door,
++            'is_host': selected_record.get('is_host', False),
++            'source_key': selected_record.get('source_key'),
++            'source_label': selected_record.get('source_label') or '-',
++            'link_instance': selected_record.get('link_instance'),
++            'link_instance_id': selected_record.get('link_instance_id'),
+             'status': 'Not processed',
+             'seed_index': None,
+             'snap_distance': None,
+@@ -2653,7 +2774,7 @@
+         }
+         door_gateway_records.append(gateway_record)
+ 
+-        portal = host_portals_by_door_id.get(door_id)
++        portal = selected_portals_by_key.get(door_key)
+         if portal is None:
+             gateway_record['status'] = 'Failed: no valid door portal in compartment'
+             continue
+@@ -2685,7 +2806,8 @@
+     if not valid_gateway_records:
+         forms.alert(
+             'None of the selected doors could be connected to a valid doorway cell.\n'
+-            'Check whether the doors belong to walls crossing the selected compartment.',
++            'Check that the selected doors and their host walls are visible and cross the selected compartment.\n'
++            'For linked doors, confirm that Revit Link is selected as the door source.',
+             exitscript=True
+         )
+ 
+@@ -3139,6 +3261,8 @@
+     output.print_md('- Auto Scan keywords: **{0}**'.format(cabinet_keywords_raw))
+ output.print_md('- Forced selected-door gateways: **{0}**'.format('Enabled' if force_selected_doors else 'Disabled'))
+ if force_selected_doors:
++    output.print_md('- Selected door source: **{0}**'.format('Revit Link' if door_source == 'link' else 'Host model'))
++if force_selected_doors:
+     active_gateway_count = len([
+         record for record in door_gateway_records
+         if record.get('status') == 'Forced gateway active'
+@@ -3190,13 +3314,18 @@
+ if force_selected_doors:
+     output.print_md('### Selected door gateway list')
+     output.print_md(
+-        '| Door | Zoom | Status | Assigned cabinet | Cabinet to door path (m) | Door snap (mm) |'
++        '| Door | Zoom | Source | Link Instance | Door Element ID | Status | Assigned cabinet | Cabinet to door path (m) | Door snap (mm) |'
+     )
+-    output.print_md('|---:|:---:|---|---:|---:|---:|')
++    output.print_md('|---:|:---:|---|---:|---:|---|---:|---:|---:|')
+     for gateway_record in door_gateway_records:
+         door = gateway_record.get('element')
++        is_host_door = gateway_record.get('is_host', False)
+         try:
+-            door_zoom = output.linkify(door.Id, title='Zoom') if door is not None else '-'
++            if is_host_door and door is not None:
++                door_zoom = output.linkify(door.Id, title='Zoom')
++            else:
++                link_instance = gateway_record.get('link_instance')
++                door_zoom = output.linkify(link_instance.Id, title='Link') if link_instance is not None else '-'
+         except Exception:
+             door_zoom = '-'
+ 
+@@ -3207,10 +3336,21 @@
+         door_snap = gateway_record.get('snap_distance')
+         snap_text = '{0:.0f}'.format(ft_to_mm(door_snap)) if door_snap is not None else '-'
+ 
++        source_text = 'Host' if is_host_door else markdown_cell(
++            gateway_record.get('source_label') or 'Revit Link'
++        )
++        link_id_text = gateway_record.get('link_instance_id')
++        link_id_text = str(link_id_text) if link_id_text is not None else '-'
++        door_id_text = gateway_record.get('door_id')
++        door_id_text = str(door_id_text) if door_id_text is not None else '-'
++
+         output.print_md(
+-            '| {0} | {1} | {2} | {3} | {4} | {5} |'.format(
++            '| {0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} |'.format(
+                 gateway_record.get('number', '-'),
+                 door_zoom,
++                source_text,
++                link_id_text,
++                door_id_text,
+                 markdown_cell(gateway_record.get('status') or '-'),
+                 assigned_text,
+                 prefix_text,
+@@ -3218,8 +3358,9 @@
+             )
+         )
+     output.print_md(
+-        '> Each active door is assigned to the cabinet with the shortest real grid path. '
+-        'That cabinet is removed as a direct source, so its final coverage must pass through '
++        '> Each active host or linked door is assigned to the cabinet with the shortest real grid path. '
++        'Linked door geometry is transformed into host coordinates using the selected link instance. '
++        'The assigned cabinet is removed as a direct source, so its final coverage must pass through '
+         'one of its assigned selected doors.'
+     )
+ 

@@ -1,0 +1,306 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Place Groups By Linked Rooms"
+        Width="820"
+        Height="900"
+        MinWidth="740"
+        MinHeight="720"
+        ResizeMode="CanResizeWithGrip"
+        WindowStartupLocation="CenterOwner"
+        ShowInTaskbar="False">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,14">
+            <TextBlock Text="ĐẶT MODEL GROUP THEO ROOM TRONG REVIT LINK"
+                       FontSize="17"
+                       FontWeight="Bold"/>
+            <TextBlock x:Name="active_view_text"
+                       Margin="0,5,0,0"
+                       FontWeight="SemiBold"
+                       Foreground="#3F6387"/>
+            <TextBlock Margin="0,4,0,0"
+                       Foreground="#666666"
+                       TextWrapping="Wrap"
+                       Text="Room được lọc bằng một hoặc hai parameter bất kỳ. Khi dùng hai bộ lọc, điều kiện là AND. Group được đặt theo quan hệ vị trí và góc giữa Group mẫu với Door mẫu."/>
+        </StackPanel>
+
+        <ScrollViewer Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
+            <StackPanel>
+                <GroupBox Header="1. Revit Link và Group mẫu" Margin="0,0,0,12">
+                    <Grid Margin="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="190"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Grid.Column="0"
+                                   Margin="0,5,10,8"
+                                   Text="Các Revit Link đã chọn:"/>
+                        <ListBox x:Name="links_list"
+                                 Grid.Row="0" Grid.Column="1"
+                                 Height="72"
+                                 Margin="0,0,0,10"
+                                 IsHitTestVisible="False"
+                                 Focusable="False"/>
+
+                        <TextBlock Grid.Row="1" Grid.Column="0"
+                                   Margin="0,5,10,10"
+                                   Text="Model Group Type:"/>
+                        <ComboBox x:Name="group_combo"
+                                  Grid.Row="1" Grid.Column="1"
+                                  Margin="0,0,0,10"
+                                  MinHeight="28"/>
+
+                        <TextBlock Grid.Row="2" Grid.Column="0"
+                                   Margin="0,5,10,8"
+                                   Text="Group instance mẫu:"/>
+                        <ComboBox x:Name="sample_group_combo"
+                                  Grid.Row="2" Grid.Column="1"
+                                  Margin="0,0,0,6"
+                                  MinHeight="28"/>
+
+                        <TextBlock x:Name="sample_group_status"
+                                   Grid.Row="3" Grid.Column="1"
+                                   Foreground="#666666"
+                                   TextWrapping="Wrap"/>
+                    </Grid>
+                </GroupBox>
+
+                <GroupBox Header="2. Lọc Room bằng 2 parameter" Margin="0,0,0,12">
+                    <Grid Margin="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="85"/>
+                            <ColumnDefinition Width="260"/>
+                            <ColumnDefinition Width="105"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <CheckBox x:Name="filter_1_checkbox"
+                                  Grid.Row="0" Grid.Column="0"
+                                  Margin="0,5,10,10"
+                                  FontWeight="SemiBold"
+                                  Content="Filter 1"/>
+                        <ComboBox x:Name="parameter_1_combo"
+                                  Grid.Row="0" Grid.Column="1"
+                                  Margin="0,0,12,10"
+                                  MinHeight="28"/>
+                        <TextBlock Grid.Row="0" Grid.Column="2"
+                                   Margin="0,5,10,10"
+                                   Text="Contains:"/>
+                        <TextBox x:Name="contains_1_text"
+                                 Grid.Row="0" Grid.Column="3"
+                                 Margin="0,0,0,10"
+                                 MinHeight="28"
+                                 VerticalContentAlignment="Center"/>
+
+                        <CheckBox x:Name="filter_2_checkbox"
+                                  Grid.Row="1" Grid.Column="0"
+                                  Margin="0,5,10,10"
+                                  FontWeight="SemiBold"
+                                  Content="Filter 2"/>
+                        <ComboBox x:Name="parameter_2_combo"
+                                  Grid.Row="1" Grid.Column="1"
+                                  Margin="0,0,12,10"
+                                  MinHeight="28"/>
+                        <TextBlock Grid.Row="1" Grid.Column="2"
+                                   Margin="0,5,10,10"
+                                   Text="Contains:"/>
+                        <TextBox x:Name="contains_2_text"
+                                 Grid.Row="1" Grid.Column="3"
+                                 Margin="0,0,0,10"
+                                 MinHeight="28"
+                                 VerticalContentAlignment="Center"/>
+
+                        <TextBlock Grid.Row="2" Grid.ColumnSpan="4"
+                                   Margin="0,0,0,10"
+                                   Foreground="#777777"
+                                   TextWrapping="Wrap"
+                                   Text="Trong mỗi ô Contains, nhập nhiều nội dung bằng dấu ; (ví dụ: Office; Meeting; Store). Các nội dung trong cùng một ô dùng OR. Khi tick cả hai Filter, Room phải đồng thời thỏa Filter 1 và Filter 2 (AND)."/>
+
+                        <StackPanel Grid.Row="3" Grid.ColumnSpan="4"
+                                    Orientation="Horizontal">
+                            <Button x:Name="scan_button"
+                                    Width="145"
+                                    Height="30"
+                                    Content="Kiểm tra số Room"/>
+                            <TextBlock x:Name="match_count_text"
+                                       Margin="12,7,0,0"
+                                       Foreground="#555555"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Grid>
+                </GroupBox>
+
+                <GroupBox Header="3. Xác lập hướng và vị trí theo Door mẫu" Margin="0,0,0,12">
+                    <Border Margin="12"
+                            Padding="11"
+                            Background="#EEF5FC"
+                            BorderBrush="#83A9CC"
+                            BorderThickness="1"
+                            CornerRadius="3">
+                        <StackPanel>
+                            <TextBlock FontWeight="SemiBold"
+                                       Text="Trình tự khi bấm Bắt đầu:"/>
+                            <TextBlock Margin="0,6,0,0"
+                                       TextWrapping="Wrap"
+                                       Text="1) Tool zoom tới Group instance mẫu đã chọn ở mục 1.  2) Chọn Door trong Revit Link tương ứng với Group mẫu.  3) Tool ghi nhận khoảng lệch X/Y/Z và góc tương đối giữa Group mẫu với Door.  4) Quan hệ đó được áp dụng cho Door của từng Room đã lọc."/>
+                            <TextBlock Margin="0,7,0,0"
+                                       Foreground="#666666"
+                                       TextWrapping="Wrap"
+                                       Text="Với mỗi Room, tool ưu tiên Door có cùng Family/Type với Door mẫu. Nếu không có, tool dùng Door liên kết với Room và gần tâm Room nhất."/>
+                        </StackPanel>
+                    </Border>
+                </GroupBox>
+
+                <GroupBox Header="4. Hiệu chỉnh thêm và chống tạo trùng" Margin="0,0,0,12">
+                    <Grid Margin="12">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="245"/>
+                            <ColumnDefinition Width="125"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+
+                        <TextBlock Grid.Row="0" Grid.Column="0"
+                                   Margin="0,5,10,8"
+                                   Text="Hiệu chỉnh thêm theo trục X Door (± mm):"/>
+                        <TextBox x:Name="extra_offset_x_text"
+                                 Grid.Row="0" Grid.Column="1"
+                                 Margin="0,0,10,8"
+                                 MinHeight="27"
+                                 VerticalContentAlignment="Center"/>
+                        <TextBlock Grid.Row="0" Grid.Column="2"
+                                   Margin="0,5,0,8"
+                                   Foreground="#777777"
+                                   Text="Cộng thêm vào offset đã học từ mẫu"/>
+
+                        <TextBlock Grid.Row="1" Grid.Column="0"
+                                   Margin="0,5,10,8"
+                                   Text="Hiệu chỉnh thêm theo trục Y Door (± mm):"/>
+                        <TextBox x:Name="extra_offset_y_text"
+                                 Grid.Row="1" Grid.Column="1"
+                                 Margin="0,0,10,8"
+                                 MinHeight="27"
+                                 VerticalContentAlignment="Center"/>
+                        <TextBlock Grid.Row="1" Grid.Column="2"
+                                   Margin="0,5,0,8"
+                                   Foreground="#777777"
+                                   Text="Cộng thêm vào offset đã học từ mẫu"/>
+
+                        <TextBlock Grid.Row="2" Grid.Column="0"
+                                   Margin="0,5,10,8"
+                                   Text="Hiệu chỉnh thêm góc Group (độ):"/>
+                        <TextBox x:Name="extra_rotation_text"
+                                 Grid.Row="2" Grid.Column="1"
+                                 Margin="0,0,10,8"
+                                 MinHeight="27"
+                                 VerticalContentAlignment="Center"/>
+
+                        <CheckBox x:Name="skip_duplicate_checkbox"
+                                  Grid.Row="3" Grid.ColumnSpan="3"
+                                  Margin="0,3,0,8"
+                                  Content="Bỏ qua Group cùng Type đã có gần vị trí cần đặt"/>
+
+                        <TextBlock Grid.Row="4" Grid.Column="0"
+                                   Margin="24,5,10,0"
+                                   Text="Dung sai kiểm tra Group trùng (mm):"/>
+                        <TextBox x:Name="duplicate_tolerance_text"
+                                 Grid.Row="4" Grid.Column="1"
+                                 MinHeight="27"
+                                 VerticalContentAlignment="Center"/>
+                    </Grid>
+                </GroupBox>
+
+                <GroupBox Header="5. Chạy thử" Margin="0,0,0,8">
+                    <Border Margin="12"
+                            Padding="10"
+                            Background="#FFF5D9"
+                            BorderBrush="#E1B84A"
+                            BorderThickness="1"
+                            CornerRadius="3">
+                        <StackPanel>
+                            <CheckBox x:Name="test_one_checkbox"
+                                      FontWeight="SemiBold"
+                                      Content="Chỉ tạo Group cho 1 Room để kiểm tra"/>
+                            <Grid Margin="24,9,0,0">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="125"/>
+                                    <ColumnDefinition Width="80"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBlock x:Name="test_index_label"
+                                           Grid.Column="0"
+                                           Margin="0,5,8,0"
+                                           Text="Chọn Room thứ:"/>
+                                <TextBox x:Name="test_index_text"
+                                         Grid.Column="1"
+                                         MinHeight="27"
+                                         VerticalContentAlignment="Center"/>
+                                <TextBlock x:Name="test_index_hint"
+                                           Grid.Column="2"
+                                           Margin="10,5,0,0"
+                                           Foreground="#777777"
+                                           TextWrapping="Wrap"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+                </GroupBox>
+
+                <TextBlock Margin="2,7,2,0"
+                           Foreground="#666666"
+                           TextWrapping="Wrap"
+                           Text="Cancel trong lúc đặt Group sẽ rollback toàn bộ lần chạy. Door mẫu và Door đích phải nằm trong các Revit Link đã chọn."/>
+            </StackPanel>
+        </ScrollViewer>
+
+        <Grid Grid.Row="2" Margin="0,15,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="110"/>
+                <ColumnDefinition Width="120"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0"
+                       VerticalAlignment="Center"
+                       Foreground="#777777"
+                       TextWrapping="Wrap"
+                       Text="Báo cáo pyRevit sẽ liệt kê Room, Door và Group đã tạo."/>
+            <Button x:Name="cancel_button"
+                    Grid.Column="1"
+                    Margin="0,0,8,0"
+                    Height="35"
+                    Content="Đóng"
+                    IsCancel="True"/>
+            <Button x:Name="run_button"
+                    Grid.Column="2"
+                    Height="35"
+                    Content="Bắt đầu"
+                    IsDefault="True"
+                    FontWeight="SemiBold"/>
+        </Grid>
+    </Grid>
+</Window>

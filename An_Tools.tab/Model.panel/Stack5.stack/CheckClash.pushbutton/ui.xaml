@@ -1,0 +1,61 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Kiểm Tra Va Chạm Ống &amp; File Link" Height="750" Width="600"
+        WindowStartupLocation="CenterScreen">
+    <Grid Margin="15">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/> <RowDefinition Height="1.5*"/> <RowDefinition Height="Auto"/> <RowDefinition Height="Auto"/> <RowDefinition Height="Auto"/> <RowDefinition Height="Auto"/> <RowDefinition Height="2*"/>   <RowDefinition Height="Auto"/> </Grid.RowDefinitions>
+        
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="15"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        
+        <TextBlock Text="1. Chọn File Link (Giữ Shift/Ctrl):" FontWeight="Bold" Margin="0,0,0,5" FontSize="13" Grid.Row="0" Grid.Column="0"/>
+        <ListBox x:Name="lbLinks" Grid.Row="1" Grid.Column="0" SelectionMode="Extended" Margin="0,0,0,10">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <CheckBox Content="{Binding}" Focusable="False" IsChecked="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=IsSelected}"/>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <TextBlock Text="2. Chọn Category (Tùy chọn):" FontWeight="Bold" Margin="0,0,0,5" FontSize="13" Grid.Row="0" Grid.Column="2"/>
+        <ListBox x:Name="lbCategories" Grid.Row="1" Grid.Column="2" SelectionMode="Extended" Margin="0,0,0,10">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <CheckBox Content="{Binding}" Focusable="False" IsChecked="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=IsSelected}"/>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <Button x:Name="btnLoadFamilies" Content="Lọc &amp; Lưu danh sách Family" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="3" 
+                Height="32" Margin="0,0,0,15" Background="#FFE6E6E6" FontWeight="Bold" Click="btnLoadFamilies_Click"/>
+        
+        <TextBlock Text="3. Chọn các Family để kiểm tra (Giữ Shift/Ctrl):" FontWeight="Bold" Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,0,0,5" FontSize="13"/>
+                   
+        <TextBox x:Name="txtSearch" Grid.Row="4" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,0,0,8" Height="26" 
+                 VerticalContentAlignment="Center" TextChanged="txtSearch_TextChanged"
+                 ToolTip="Nhập tên family để tìm kiếm nhanh..."/>
+
+        <StackPanel Grid.Row="5" Grid.Column="0" Grid.ColumnSpan="3" Orientation="Horizontal" Margin="0,0,0,5">
+            <Button x:Name="btnDeleteSelected" Content="Xóa mục đã chọn khỏi bộ nhớ" Width="200" Height="28" 
+                    Margin="0,0,10,0" Background="#FFFFCCCC" Click="btnDeleteSelected_Click"/>
+            <Button x:Name="btnDeleteAll" Content="Xóa Toàn Bộ" Width="100" Height="28" 
+                    Background="#FFFF9999" Click="btnDeleteAll_Click"/>
+        </StackPanel>
+                 
+        <ListBox x:Name="lbFamilies" Grid.Row="6" Grid.Column="0" Grid.ColumnSpan="3" Margin="0,0,0,15" SelectionMode="Extended"
+                 SelectionChanged="lbFamilies_SelectionChanged">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <CheckBox Content="{Binding}" Focusable="False" IsChecked="{Binding RelativeSource={RelativeSource AncestorType=ListBoxItem}, Path=IsSelected}"/>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+        
+        <Button x:Name="btnRun" Content="Kiểm tra và Vẽ Detail Line" Grid.Row="7" Grid.Column="0" Grid.ColumnSpan="3" 
+                Height="40" FontSize="14" FontWeight="Bold" Background="#FF0078D7" Foreground="White" Click="btnRun_Click"/>
+    </Grid>
+</Window>
