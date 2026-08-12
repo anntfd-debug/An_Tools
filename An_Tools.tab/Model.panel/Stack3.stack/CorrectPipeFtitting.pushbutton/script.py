@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__ = "Correct Pipes & Fittings"
-__doc__ = "V5.6 Universal / Revit 2025-2026: 2 chế độ Fitting (Auto Routing hoặc chọn thủ công như V5.3) + giới hạn Min/Max Pipe Size."
+__doc__ = "V5.7 Universal / Revit 2025-2026: Dual Mode + Size Range + Full Pipe Fitting FamilySymbol Scan."
 
 import os
 import traceback
@@ -289,15 +289,51 @@ def get_system_type_name_by_id(system_type_id):
 
 
 def get_part_type(family_symbol):
-    """Return PartType integer for a Pipe Fitting FamilySymbol, if available."""
+    """Return DB.PartType integer for a loaded MEP FamilySymbol.
+
+    V5.7 is deliberately defensive here.  Most Pipe Fitting content exposes
+    FAMILY_CONTENT_PART_TYPE on the Family object, but project/custom content
+    can expose the built-in parameter on the symbol instead.  Reading both
+    prevents valid loaded fitting types from disappearing from the manual list.
+    """
     if not family_symbol:
         return None
+
+    owners = []
     try:
-        p = family_symbol.Family.get_Parameter(DB.BuiltInParameter.FAMILY_CONTENT_PART_TYPE)
-        if p:
-            return p.AsInteger()
+        owners.append(family_symbol)
     except Exception:
         pass
+    try:
+        fam = family_symbol.Family
+        if fam is not None:
+            owners.append(fam)
+    except Exception:
+        pass
+
+    for owner in owners:
+        try:
+            p = owner.get_Parameter(DB.BuiltInParameter.FAMILY_CONTENT_PART_TYPE)
+            if p:
+                try:
+                    return int(p.AsInteger())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # Last-resort localized-name lookup.  This is not used when the built-in
+    # parameter is available, but keeps unusual custom content visible.
+    for owner in owners:
+        try:
+            p = owner.LookupParameter(u"Part Type")
+            if p:
+                try:
+                    return int(p.AsInteger())
+                except Exception:
+                    pass
+        except Exception:
+            pass
     return None
 
 
@@ -319,6 +355,139 @@ def is_pipe(elem):
 
 def is_pipe_fitting(elem):
     return category_is(elem, DB.BuiltInCategory.OST_PipeFitting)
+
+
+def _category_matches_bic(category, built_in_category):
+    try:
+        return (category is not None and
+                element_id_value(category.Id) == enum_int64(built_in_category))
+    except Exception:
+        return False
+
+
+def _family_is_pipe_fitting_family(family):
+    """True when a Family is authored in the Pipe Fittings category."""
+    try:
+        return _category_matches_bic(family.FamilyCategory,
+                                     DB.BuiltInCategory.OST_PipeFitting)
+    except Exception:
+        return False
+
+
+def collect_all_pipe_fitting_symbols(instance_fittings=None, routing_symbol_ids=None):
+    """V5.7 robust project-wide scan for every loaded Pipe Fitting FamilySymbol.
+
+    A single OfCategory(OST_PipeFitting) collector is normally sufficient, but
+    some custom/project content can be missed when the symbol Category is not
+    exposed consistently.  We therefore merge five independent sources and
+    de-duplicate by 64-bit ElementId:
+      1) direct OST_PipeFitting element-type collector;
+      2) all FamilySymbol elements whose symbol Category is Pipe Fittings;
+      3) all FamilySymbol elements whose parent FamilyCategory is Pipe Fittings;
+      4) type IDs used by existing Pipe Fitting instances;
+      5) FamilySymbols referenced by PipeType Routing Preferences.
+
+    Returns (symbols, stats).
+    """
+    found = {}
+    sources_by_id = {}
+    stats = {
+        'direct_category': 0,
+        'symbol_category': 0,
+        'family_category': 0,
+        'instance_type': 0,
+        'routing_reference': 0,
+        'family_enumeration': 0,
+    }
+
+    def _add(symbol, source, force=False):
+        try:
+            if not isinstance(symbol, DB.FamilySymbol):
+                return False
+            valid_category = (category_is(symbol, DB.BuiltInCategory.OST_PipeFitting) or
+                              _family_is_pipe_fitting_family(symbol.Family))
+            if not valid_category and not force:
+                return False
+            sid = element_id_value(symbol.Id)
+            if sid is None:
+                return False
+            if sid not in found:
+                found[sid] = symbol
+            sources_by_id.setdefault(sid, set()).add(source)
+            stats[source] = stats.get(source, 0) + 1
+            return True
+        except Exception:
+            return False
+
+    # 1. Fast/direct category scan.
+    try:
+        direct = list(DB.FilteredElementCollector(doc)
+                      .OfCategory(DB.BuiltInCategory.OST_PipeFitting)
+                      .WhereElementIsElementType()
+                      .ToElements())
+        for symbol in direct:
+            _add(symbol, 'direct_category', force=True)
+    except Exception:
+        pass
+
+    # 2 + 3. Full FamilySymbol scan catches symbols whose own Category is null
+    # but whose parent FamilyCategory is correctly Pipe Fittings.
+    try:
+        all_symbols = list(DB.FilteredElementCollector(doc)
+                           .OfClass(DB.FamilySymbol)
+                           .WhereElementIsElementType()
+                           .ToElements())
+        for symbol in all_symbols:
+            try:
+                if category_is(symbol, DB.BuiltInCategory.OST_PipeFitting):
+                    _add(symbol, 'symbol_category', force=True)
+                elif _family_is_pipe_fitting_family(symbol.Family):
+                    _add(symbol, 'family_category', force=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3b. Enumerate all symbols from every Pipe Fitting Family explicitly.
+    try:
+        families = list(DB.FilteredElementCollector(doc)
+                        .OfClass(DB.Family)
+                        .ToElements())
+        for family in families:
+            if not _family_is_pipe_fitting_family(family):
+                continue
+            try:
+                for sid in family.GetFamilySymbolIds():
+                    symbol = doc.GetElement(sid)
+                    _add(symbol, 'family_enumeration', force=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 4. Any type actually used by a Pipe Fitting instance must be visible in
+    # manual mode, even if one of the collectors above behaves unexpectedly.
+    for fitting in list(instance_fittings or []):
+        try:
+            symbol = doc.GetElement(fitting.GetTypeId())
+            _add(symbol, 'instance_type', force=True)
+        except Exception:
+            pass
+
+    # 5. Routing Preferences are another authoritative reference to loaded MEP
+    # fitting content.  Only keep FamilySymbols that really belong to the Pipe
+    # Fittings category/family so Segments cannot leak into the manual list.
+    for raw_id in list(routing_symbol_ids or []):
+        try:
+            symbol = doc.GetElement(make_element_id(raw_id))
+            _add(symbol, 'routing_reference', force=False)
+        except Exception:
+            pass
+
+    symbols = list(found.values())
+    stats['unique_total'] = len(symbols)
+    stats['sources_by_id'] = sources_by_id
+    return symbols, stats
 
 
 def get_pipe_diameter_ft(pipe):
@@ -1729,7 +1898,7 @@ def part_type_enum_name(family_symbol):
     """Return the Revit PartType enum name without depending on UI language."""
     value = get_part_type(family_symbol)
     if value is None:
-        return u""
+        return u"Undefined"
     try:
         name = System.Enum.GetName(DB.PartType, value)
         if name:
@@ -1739,7 +1908,7 @@ def part_type_enum_name(family_symbol):
     return safe_text(value)
 
 
-# V5.6: PartType is no longer hard-coded to Tee/Elbow/Transition/Cross.
+# V5.7: PartType is no longer hard-coded to Tee/Elbow/Transition/Cross.
 # The actual roles are discovered from ALL FamilySymbol elements in the
 # OST_PipeFitting category that are loaded in the current project.  This makes
 # the tool future-safe for Revit 2025/2026 content such as Wye, LateralTee,
@@ -1764,11 +1933,12 @@ PIPE_FITTING_PARTTYPE_PREFERRED_ORDER = (
 def fitting_role_from_part_type_value(value):
     """Return the exact Revit DB.PartType enum name for any Pipe Fitting type.
 
-    V5.6 deliberately does not maintain a short allow-list.  The category
-    filter in setup_data() is what limits the UI to real Pipe Fitting symbols.
+    V5.7 deliberately does not maintain a short allow-list.  If unusual custom
+    content does not expose FAMILY_CONTENT_PART_TYPE, keep it visible under the
+    deterministic 'Undefined' role instead of silently dropping it from UI.
     """
     if value is None:
-        return u""
+        return u"Undefined"
     try:
         name = System.Enum.GetName(DB.PartType, value)
         if name:
@@ -1814,7 +1984,7 @@ def sort_pipe_fitting_roles(roles):
 
 
 # ============================================================
-# V5.6 - Automatic Routing Preferences resolver
+# V5.7 - Automatic Routing Preferences resolver
 # ============================================================
 
 ROUTING_FITTING_GROUP_NAMES = (
@@ -2096,7 +2266,7 @@ def resolve_routing_symbol_for_fitting(pipe_type, fitting):
     """Return (FamilySymbol, info dict) using selected PipeType Routing Preferences.
 
     Revit evaluates routing rules by group, size criterion, then priority/order.
-    V5.6 mirrors that behavior and returns the first valid rule that satisfies the
+    V5.7 mirrors that behavior and returns the first valid rule that satisfies the
     existing fitting's primary run size.
     """
     if pipe_type is None:
@@ -2163,7 +2333,7 @@ def resolve_routing_symbol_for_fitting(pipe_type, fitting):
 
 
 def routing_preferences_summary(pipe_type):
-    """Human-readable summary shown in the V5.6 UI."""
+    """Human-readable summary shown in the V5.7 UI."""
     if pipe_type is None:
         return u"Chưa chọn Pipe Type."
     lines = [u"Pipe Type: {}".format(get_real_name(pipe_type))]
@@ -4536,7 +4706,7 @@ class SkipWarningsPreprocessor(DB.IFailuresPreprocessor):
 
 
 # ============================================================
-# Main window - modal, preselection snapshot (V5.6 Universal / Revit 2025-2026)
+# Main window - modal, preselection snapshot (V5.7 Universal / Revit 2025-2026)
 # ============================================================
 
 
@@ -4544,7 +4714,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def __init__(self, xaml_file_name, preselected_ids):
         forms.WPFWindow.__init__(self, xaml_file_name)
         try:
-            self.Title = u"Correct Pipes & Fittings V5.6 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
+            self.Title = u"Correct Pipes & Fittings V5.7 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
         except Exception:
             pass
         # V4.9: size the dialog against the actual Windows work area.  The XAML
@@ -4567,7 +4737,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self.routing_ids_by_pipe_type_id = {}
         self.pipe_size_items = []
         self._updating_size_range = False
-        # V5.6: exactly one fitting-source mode is active at a time.
+        # V5.7: exactly one fitting-source mode is active at a time.
         # 'auto'   = resolve FamilySymbol from selected PipeType Routing Preferences.
         # 'manual' = user selects at most one FamilySymbol per PartType, like V5.3.
         self.fitting_selection_mode = 'auto'
@@ -4681,7 +4851,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             except Exception:
                 pass
         if log_change:
-            self.log(u"Chế độ Fitting V5.6: {}."
+            self.log(u"Chế độ Fitting V5.7: {}."
                      .format(u"CHỌN THỦ CÔNG như V5.3" if manual else u"AUTO ROUTING PREFERENCES"))
 
     def fitting_mode_click(self, sender, args):
@@ -4890,7 +5060,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return result
 
     def update_fittings_for_selected_pipe_type(self, clear_invalid=True):
-        """V5.6: always read Routing Preferences, but preserve manual choices.
+        """V5.7: always read Routing Preferences, but preserve manual choices.
 
         Auto mode uses the routing rules directly at runtime. Manual mode keeps
         the user's one-type-per-PartType selections intact when Pipe Type changes.
@@ -4992,7 +5162,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self._set_fitting_selection_mode('manual' if saved_mode == 'manual' else 'auto', False)
             self._update_pipe_size_range_status()
             self.update_fittings_for_selected_pipe_type(clear_invalid=False)
-            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.6.")
+            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.7.")
         except Exception as ex:
             self._loading_choices = False
             try:
@@ -5041,13 +5211,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
     def setup_data(self):
         self.log(u"Đang đọc dữ liệu trong model...")
-        self.log(u"V5.6 Universal | Revit {} | ElementId 64-bit Value mode.".format(
+        self.log(u"V5.7 Universal | Revit {} | ElementId 64-bit Value mode.".format(
             REVIT_VERSION if REVIT_VERSION else u"không xác định"))
         if REVIT_VERSION and REVIT_VERSION not in SUPPORTED_REVIT_VERSIONS:
-            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.6 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
+            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.7 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
         pipes, fittings = collect_pipes_and_fittings()
 
-        # V5.6: build Min/Max dropdowns from actual Pipe diameters present
+        # V5.7: build Min/Max dropdowns from actual Pipe diameters present
         # anywhere in the current model. No arbitrary standard-size list is used.
         model_pipe_sizes = collect_model_pipe_sizes(pipes)
         for size_ft in model_pipe_sizes:
@@ -5061,7 +5231,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.cmb_MinPipeSize.SelectedIndex = 0
             self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MaxPipeSize.Items.Count - 1
         self._update_pipe_size_range_status()
-        self.log(u"V5.6 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
+        self.log(u"V5.7 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
             len(model_pipe_sizes),
             format_pipe_size(model_pipe_sizes[0]) if model_pipe_sizes else u"?",
             format_pipe_size(model_pipe_sizes[-1]) if model_pipe_sizes else u"?"))
@@ -5137,13 +5307,20 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if self.cmb_PipeTypes.Items.Count > 0:
             self.cmb_PipeTypes.SelectedIndex = 0
 
-        # Pipe fitting family symbols.
-        fitting_symbols = list(DB.FilteredElementCollector(doc)\
-                               .OfCategory(DB.BuiltInCategory.OST_PipeFitting)\
-                               .WhereElementIsElementType()\
-                               .ToElements())
+        # V5.7: robust scan of ALL loaded Pipe Fitting FamilySymbols.  Do not
+        # rely on only one OfCategory collector because custom families can
+        # expose Category metadata inconsistently at symbol level.
+        all_routing_symbol_ids = set()
+        for _ids in self.routing_ids_by_pipe_type_id.values():
+            try:
+                all_routing_symbol_ids.update(list(_ids or []))
+            except Exception:
+                pass
+        fitting_symbols, fitting_scan_stats = collect_all_pipe_fitting_symbols(
+            instance_fittings=fittings,
+            routing_symbol_ids=all_routing_symbol_ids)
 
-        # V5.6: discover EVERY PartType that actually exists on loaded Pipe
+        # V5.7: discover EVERY PartType that actually exists on loaded Pipe
         # Fitting symbols.  This is safer than hard-coding an enum subset and
         # automatically includes custom/new Revit content in 2025/2026.
         discovered_roles = []
@@ -5189,12 +5366,26 @@ class ReplaceElementsWindow(forms.WPFWindow):
             len(self.fitting_type_items),
             len(NORMAL_FITTING_ROLES)
         ))
+        try:
+            missing_pt = len([x for x in self.fitting_type_items if getattr(x, 'PartType', None) is None])
+            self.log(u"V5.7 Full Fitting Scan: direct-category {} | symbol-category {} | family-category {} | family-enumeration {} | instance-type {} | routing-reference {} | UNIQUE {}."
+                     .format(fitting_scan_stats.get('direct_category', 0),
+                             fitting_scan_stats.get('symbol_category', 0),
+                             fitting_scan_stats.get('family_category', 0),
+                             fitting_scan_stats.get('family_enumeration', 0),
+                             fitting_scan_stats.get('instance_type', 0),
+                             fitting_scan_stats.get('routing_reference', 0),
+                             fitting_scan_stats.get('unique_total', len(self.fitting_type_items))))
+            if missing_pt:
+                self.log(u"CẢNH BÁO: {} fitting type không đọc được FAMILY_CONTENT_PART_TYPE; vẫn hiển thị dưới nhóm 'Undefined' thay vì bị ẩn.".format(missing_pt))
+        except Exception:
+            pass
         if NORMAL_FITTING_ROLES:
             self.log(u"PartType đã nhận diện: {}".format(
                 u", ".join([fitting_role_display_name(r) for r in NORMAL_FITTING_ROLES])))
 
     def choose_replacement_fitting_type(self, fitting, selected_items=None, selected_reducing_items=None):
-        """V5.6: resolve by either Auto Routing or V5.3-style manual selection."""
+        """V5.7: resolve by either Auto Routing or V5.3-style manual selection."""
         if self._is_manual_fitting_mode():
             old_symbol = get_symbol_from_instance(fitting)
             old_part_type = get_part_type(old_symbol)
@@ -5205,7 +5396,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             source_label = u"Fitting giảm" if variable_size else u"Fitting thường"
             if role not in allowed_roles:
                 raise Exception(
-                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.6"
+                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.7"
                     .format(part_type_enum_name(old_symbol)))
             candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
             same_role = []
@@ -5222,7 +5413,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 raise Exception(u"{} đang có {} type PartType '{}'; chỉ được chọn đúng 1"
                                 .format(source_label, len(same_role), fitting_role_display_name(role)))
             chosen = same_role[0]
-            self.log(u"Fitting {}: MANUAL V5.6 -> {} {} chọn '{}'.{}"
+            self.log(u"Fitting {}: MANUAL V5.7 -> {} {} chọn '{}'.{}"
                      .format(self.id_value(fitting.Id), source_label,
                              fitting_role_display_name(role), chosen.Name,
                              u" Profile giảm {}".format(size_text) if variable_size else u""))
@@ -5387,7 +5578,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return created, restored, skipped_identity
 
     def create_direct_single_port_fitting(self, desired_symbol, old_port_records, old_params, links):
-        """V5.6 exact-symbol replacement for one-port Pipe Fittings (Cap/EndCap/etc.)."""
+        """V5.7 exact-symbol replacement for one-port Pipe Fittings (Cap/EndCap/etc.)."""
         if len(old_port_records) != 1 or len(links) != 1:
             raise Exception(u"Direct single-port cần đúng 1 connector và 1 kết nối thật")
         old = old_port_records[0]
@@ -5479,7 +5670,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return created, restored, note
 
     def create_direct_linear_fitting(self, desired_symbol, old_port_records, old_params, links):
-        """V5.6 exact-symbol replacement for two-port collinear Pipe Fittings.
+        """V5.7 exact-symbol replacement for two-port collinear Pipe Fittings.
 
         This covers specialized straight fittings (Union, PipeFlange,
         PipeMechanicalCoupling and custom straight PartTypes) without asking
@@ -5860,7 +6051,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             create_note = u""
             direct_restored_pre = 0
 
-            # V5.6 IMPORTANT: cross-family replacement always places the EXACT
+            # V5.7 IMPORTANT: cross-family replacement always places the EXACT
             # user-selected FamilySymbol.  Routing Preferences are not allowed to
             # silently substitute another PartType/Family.  Dispatch by topology:
             #   1 port  -> single-port exact placement (Cap/EndCap/etc.)
@@ -5877,19 +6068,19 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     doc.Regenerate()
 
                 if total_port_count == 1:
-                    self.log(u"{}: V5.6 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
+                    self.log(u"{}: V5.7 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
                              .format(label, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_single_port_fitting(
                         desired_symbol, old_port_records, old_params, links)
                     create_mode = u"direct-single"
                 elif total_port_count == 2 and not port_axes_have_nonparallel_pair(old_port_records):
-                    self.log(u"{}: V5.6 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
+                    self.log(u"{}: V5.7 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
                              .format(label, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_linear_fitting(
                         desired_symbol, old_port_records, old_params, links)
                     create_mode = u"direct-linear"
                 else:
-                    self.log(u"{}: V5.6 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
+                    self.log(u"{}: V5.7 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
                              .format(label, total_port_count, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_aligned_fitting(
                         desired_symbol, old_port_records, old_params, links)
@@ -6281,7 +6472,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.log(u"Lỗi filter Fitting thường: {}".format(safe_text(ex)))
 
     def fitting_selection_changed(self, sender, args):
-        """V5.6: selecting a second type in the same normal role replaces the first."""
+        """V5.7: selecting a second type in the same normal role replaces the first."""
         if self._refreshing_fitting_list:
             return
         try:
@@ -6365,7 +6556,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.log(u"Lỗi filter Fitting giảm: {}".format(safe_text(ex)))
 
     def reducing_fitting_selection_changed(self, sender, args):
-        """V5.6: selecting a second reducing type in one role replaces the first."""
+        """V5.7: selecting a second reducing type in one role replaces the first."""
         if self._refreshing_reducing_fitting_list:
             return
         try:
@@ -6513,7 +6704,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         scope_name = u"các đối tượng đã chọn trước khi mở tool"
         self.log(u"Bắt đầu xử lý System Type: {}".format(system_name))
         self.log(u"Phạm vi xử lý: {}.".format(scope_name))
-        self.log(u"Giới hạn Pipe Size V5.6: {} <= Size <= {}.".format(
+        self.log(u"Giới hạn Pipe Size V5.7: {} <= Size <= {}.".format(
             format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
         pipes, fittings = collect_pipes_and_fittings(True, self.preselected_element_ids)
         if selected_only and not pipes and not fittings:
@@ -6523,7 +6714,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         system_pipes = [p for p in pipes if same_element_id(get_system_type_id(p), system_type_id)] if overwrite_pipes else []
         system_fittings = [f for f in fittings if same_element_id(get_system_type_id(f), system_type_id)] if overwrite_fittings else []
 
-        # V5.6: range is inclusive and uses the EXISTING size before any type
+        # V5.7: range is inclusive and uses the EXISTING size before any type
         # replacement.  A fitting is treated atomically: every physical port must
         # fit inside the selected range, otherwise the whole fitting is skipped.
         target_pipes = []
@@ -6572,7 +6763,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     self.log(line)
             return
 
-        # V5.6 manual mode must have exactly one selected FamilySymbol for every
+        # V5.7 manual mode must have exactly one selected FamilySymbol for every
         # PartType that will actually be processed in this range. Validate before
         # opening the main Transaction so the model cannot be changed partially.
         if overwrite_fittings and self._is_manual_fitting_mode() and target_fittings:
@@ -6733,7 +6924,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
 
 # ============================================================
-# Entry point - require preselection before opening UI (V5.6 Universal / Revit 2025-2026)
+# Entry point - require preselection before opening UI (V5.7 Universal / Revit 2025-2026)
 # ============================================================
 
 script_dir = os.path.dirname(__file__)
@@ -6794,5 +6985,5 @@ else:
             win.show_dialog()
         except Exception as ex:
             forms.alert(
-                u"Không thể mở UI V5.6 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
+                u"Không thể mở UI V5.7 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
                 title="Correct Pipes & Fittings")
