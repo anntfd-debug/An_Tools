@@ -18,35 +18,34 @@ echo.
 
 git branch -M main
 
-echo [1/4] Dang dong bo thay doi tu GitHub...
-git pull --rebase origin main
-if errorlevel 1 (
-    echo.
-    echo [ERROR] Pull/Rebase that bai.
-    echo Neu Git bao conflict, can xu ly conflict truoc khi push.
-    pause
-    exit /b 1
-)
-
-echo.
-echo [2/4] Dang them thay doi...
+echo [1/4] Dang kiem tra thay doi tren may...
 git add -A
 
 git diff --cached --quiet
-if %errorlevel%==0 (
+if errorlevel 1 (
     echo.
-    echo Khong co thay doi moi de commit.
-    echo Repo da duoc dong bo voi GitHub.
-    pause
-    exit /b 0
+    echo [2/4] Dang tao commit...
+    git commit -m "Auto update %date% %time%"
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Commit that bai.
+        pause
+        exit /b 1
+    )
+) else (
+    echo Khong co file moi can commit.
 )
 
 echo.
-echo [3/4] Dang tao commit...
-git commit -m "Auto update %date% %time%"
+echo [3/4] Dang dong bo voi GitHub...
+git pull --rebase origin main
 if errorlevel 1 (
     echo.
-    echo [ERROR] Commit that bai.
+    echo ============================================
+    echo [ERROR] Pull/Rebase that bai.
+    echo Co the Git dang gap conflict.
+    echo KHONG tiep tuc push de tranh mat code.
+    echo ============================================
     pause
     exit /b 1
 )
@@ -63,7 +62,7 @@ if errorlevel 1 (
 
 echo.
 echo ============================================
-echo   Da cap nhat GitHub thanh cong.
+echo   Da dong bo GitHub thanh cong.
 echo ============================================
 echo.
 pause
