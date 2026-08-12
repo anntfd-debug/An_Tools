@@ -1,29 +1,23 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Correct Pipes &amp; Fittings V5.2 Universal - Revit 2025/2026"
+        Title="Correct Pipes &amp; Fittings V5.6 Dual Mode - Revit 2025/2026"
         Height="900" Width="1180" MinHeight="620" MinWidth="820"
         WindowStartupLocation="CenterScreen" ResizeMode="CanResizeWithGrip">
     <Grid Margin="12">
         <Grid.RowDefinitions>
-            <RowDefinition Height="*" MinHeight="260"/>
+            <RowDefinition Height="*" MinHeight="280"/>
             <RowDefinition Height="6"/>
-            <RowDefinition Height="190" MinHeight="130"/>
+            <RowDefinition Height="210" MinHeight="130"/>
             <RowDefinition Height="10"/>
             <RowDefinition Height="Auto"/>
         </Grid.RowDefinitions>
 
-        <!--
-            V4.9: all settings live inside a ScrollViewer.  On a normal desktop
-            the window opens large enough to show the complete form; on a small
-            or high-DPI monitor only this upper area scrolls, while Log + Run
-            button always remain visible.
-        -->
         <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
             <StackPanel Margin="0,0,4,0">
                 <Border Background="#EEF6FF" BorderBrush="#B7D7F2" BorderThickness="1" Padding="10" Margin="0,0,0,9">
                     <StackPanel>
-                        <TextBlock Text="Thay Pipe và Fitting theo System Type" FontSize="16" FontWeight="Bold" Foreground="#0B4778"/>
-                        <TextBlock Text="V5.2 Universal / Revit 2025-2026: dùng chung một bộ script.py + ui.xaml. Chọn Pipe/Pipe Fitting trước → chạy lệnh → cài đặt → Thực hiện. System Type dùng PipingSystemType + ElementId 64-bit tương thích cả 2025/2026; kết quả chỉ ghi trong Log. Fitting khác kích thước dùng ô Fitting giảm bên phải." TextWrapping="Wrap" Margin="0,4,0,0"/>
+                        <TextBlock Text="Correct Pipes &amp; Fittings — Dual Mode" FontSize="17" FontWeight="Bold" Foreground="#0B4778"/>
+                        <TextBlock Text="V5.6 Universal / Revit 2025-2026: giữ Size Range của V5.5 và bổ sung 2 chế độ chọn Fitting. Chỉ một chế độ được tick tại một thời điểm: Auto Routing Preferences hoặc chọn Fitting thủ công như V5.3." TextWrapping="Wrap" Margin="0,4,0,0"/>
                     </StackPanel>
                 </Border>
 
@@ -41,30 +35,81 @@
                         <ColumnDefinition Width="1*"/>
                     </Grid.ColumnDefinitions>
                     <StackPanel Grid.Column="0">
-                        <TextBlock Text="1. Chọn System Type đang tồn tại:" FontWeight="Bold" Margin="0,0,0,5"/>
+                        <TextBlock Text="1. System Type cần xử lý:" FontWeight="Bold" Margin="0,0,0,5"/>
                         <ComboBox x:Name="cmb_Systems" Height="30"/>
                     </StackPanel>
                     <StackPanel Grid.Column="2">
-                        <TextBlock Text="2. Chọn Pipe Type mới để thay thế:" FontWeight="Bold" Margin="0,0,0,5"/>
+                        <TextBlock Text="2. Pipe Type mới:" FontWeight="Bold" Margin="0,0,0,5"/>
                         <ComboBox x:Name="cmb_PipeTypes" Height="30" SelectionChanged="pipe_type_selection_changed"/>
                     </StackPanel>
                 </Grid>
 
-                <TextBlock Text="3. Chỉ định duy nhất 1 type cho từng nhóm Fitting:" FontWeight="Bold" Margin="0,0,0,5"/>
+                <GroupBox Header="3. Giới hạn Pipe Size được xử lý" FontWeight="Bold" Margin="0,0,0,10">
+                    <Grid Margin="8">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                        </Grid.RowDefinitions>
+                        <Grid Grid.Row="0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="1*"/>
+                                <ColumnDefinition Width="14"/>
+                                <ColumnDefinition Width="1*"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0">
+                                <TextBlock Text="Min Pipe Size:" FontWeight="Bold" Margin="0,0,0,5"/>
+                                <ComboBox x:Name="cmb_MinPipeSize" Height="30" SelectionChanged="min_pipe_size_selection_changed"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="2">
+                                <TextBlock Text="Max Pipe Size:" FontWeight="Bold" Margin="0,0,0,5"/>
+                                <ComboBox x:Name="cmb_MaxPipeSize" Height="30" SelectionChanged="max_pipe_size_selection_changed"/>
+                            </StackPanel>
+                        </Grid>
+                        <TextBlock Grid.Row="1" x:Name="txt_PipeSizeRangeStatus" Text="Đang đọc các Pipe size trong model..."
+                                   Margin="0,7,0,0" TextWrapping="Wrap" FontWeight="Normal"/>
+                    </Grid>
+                </GroupBox>
 
-                <Grid Height="270" Margin="0,0,0,9">
+                <GroupBox Header="4. Chế độ chọn Fitting — chỉ được tick 1 trong 2" FontWeight="Bold" Margin="0,0,0,10">
+                    <StackPanel Margin="8">
+                        <WrapPanel>
+                            <CheckBox x:Name="chk_ModeAutoRouting" IsChecked="True" Click="fitting_mode_click"
+                                      Content="Option 1 — Auto Routing Preferences (như V5.5)" FontWeight="Bold" Margin="0,0,28,5"/>
+                            <CheckBox x:Name="chk_ModeManualFittings" IsChecked="False" Click="fitting_mode_click"
+                                      Content="Option 2 — Chọn Fitting thủ công (như V5.3)" FontWeight="Bold" Foreground="#8A5200" Margin="0,0,0,5"/>
+                        </WrapPanel>
+                        <TextBlock x:Name="txt_FittingModeStatus" Text="CHẾ ĐỘ 1 — Auto Routing: FamilySymbol được lấy tự động từ Routing Preferences của Pipe Type mới."
+                                   Margin="0,5,0,0" TextWrapping="Wrap" Foreground="#555555" FontWeight="Normal"/>
+                    </StackPanel>
+                </GroupBox>
+
+                <GroupBox x:Name="panel_AutoRouting" Header="Option 1 — Routing Preferences tự động của Pipe Type mới"
+                          FontWeight="Bold" Margin="0,0,0,10" Visibility="Visible">
+                    <Grid Margin="8">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="170"/>
+                        </Grid.RowDefinitions>
+                        <TextBlock Grid.Row="0" Text="Tool đọc rule theo thứ tự Routing Preferences. Với mỗi fitting, nhóm và Primary Size được xác định tự động; người dùng không cần chọn FamilySymbol." TextWrapping="Wrap" FontWeight="Normal" Foreground="#555555" Margin="0,0,0,6"/>
+                        <TextBox Grid.Row="1" x:Name="txt_RoutingSummary" IsReadOnly="True" FontFamily="Consolas" FontSize="12"
+                                 TextWrapping="NoWrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                                 HorizontalScrollBarVisibility="Auto" Background="#FAFAFA"/>
+                    </Grid>
+                </GroupBox>
+
+                <Grid x:Name="panel_ManualFittings" Visibility="Collapsed" Height="330" Margin="0,0,0,10">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="1*"/>
                         <ColumnDefinition Width="12"/>
                         <ColumnDefinition Width="1*"/>
                     </Grid.ColumnDefinitions>
 
-                    <GroupBox Grid.Column="0" Header="Fitting thường — tối đa 1 type / PartType: Tee, Elbow, Transition, Cross" FontWeight="Bold">
+                    <GroupBox Grid.Column="0" Header="Option 2 — Fitting thường: tối đa 1 type / PartType" FontWeight="Bold">
                         <Grid Margin="8">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="*" MinHeight="120"/>
+                                <RowDefinition Height="*" MinHeight="140"/>
                             </Grid.RowDefinitions>
                             <DockPanel Grid.Row="0" Margin="0,0,0,6">
                                 <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="Normal"/>
@@ -72,19 +117,19 @@
                                 <Button x:Name="btn_ClearSelectedFittings" Content="Bỏ chọn" Width="66" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="clear_selected_fittings_click"/>
                                 <TextBox x:Name="txt_FilterFittings" Height="24" TextChanged="filter_fittings_text_changed"/>
                             </DockPanel>
-                            <TextBlock Grid.Row="1" x:Name="txt_FittingCount" FontWeight="Normal" Text="Mỗi nhóm tối đa 1 type — Tee 0/1 | Elbow 0/1 | Transition 0/1 | Cross 0/1" Foreground="#6A6A6A" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Row="1" x:Name="txt_FittingCount" FontWeight="Normal" Text="Đang đọc Pipe Fitting..." Foreground="#6A6A6A" Margin="0,0,0,6" TextWrapping="Wrap"/>
                             <ListBox Grid.Row="2" x:Name="lst_FittingTypes" FontWeight="Normal" SelectionMode="Multiple"
                                      SelectionChanged="fitting_selection_changed"
                                      ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
                         </Grid>
                     </GroupBox>
 
-                    <GroupBox Grid.Column="2" Header="Fitting giảm — tối đa 1 type / PartType: Tee, Elbow, Transition" FontWeight="Bold" BorderBrush="#D18A00">
+                    <GroupBox Grid.Column="2" Header="Option 2 — Fitting giảm: tối đa 1 type / PartType" FontWeight="Bold" BorderBrush="#D18A00">
                         <Grid Margin="8">
                             <Grid.RowDefinitions>
                                 <RowDefinition Height="Auto"/>
                                 <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="*" MinHeight="120"/>
+                                <RowDefinition Height="*" MinHeight="140"/>
                             </Grid.RowDefinitions>
                             <DockPanel Grid.Row="0" Margin="0,0,0,6">
                                 <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="0,0,8,0" FontWeight="Normal"/>
@@ -92,7 +137,7 @@
                                 <Button x:Name="btn_ClearSelectedReducingFittings" Content="Bỏ chọn" Width="66" Height="24" DockPanel.Dock="Right" Margin="6,0,0,0" Click="clear_selected_reducing_fittings_click"/>
                                 <TextBox x:Name="txt_FilterReducingFittings" Height="24" TextChanged="filter_reducing_fittings_text_changed"/>
                             </DockPanel>
-                            <TextBlock Grid.Row="1" x:Name="txt_ReducingFittingCount" FontWeight="Normal" Text="Mỗi nhóm tối đa 1 type — Tee 0/1 | Elbow 0/1 | Transition 0/1" Foreground="#9A4D00" Margin="0,0,0,6" TextWrapping="Wrap"/>
+                            <TextBlock Grid.Row="1" x:Name="txt_ReducingFittingCount" FontWeight="Normal" Text="Đang đọc Pipe Fitting giảm..." Foreground="#9A4D00" Margin="0,0,0,6" TextWrapping="Wrap"/>
                             <ListBox Grid.Row="2" x:Name="lst_ReducingFittingTypes" FontWeight="Normal" SelectionMode="Multiple"
                                      SelectionChanged="reducing_fitting_selection_changed"
                                      ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto"/>
@@ -100,20 +145,21 @@
                     </GroupBox>
                 </Grid>
 
-                <Border Background="#FFF8E8" BorderBrush="#E1B65A" BorderThickness="1" Padding="8" Margin="0,0,0,8">
-                    <TextBlock TextWrapping="Wrap">
-                        <Run Text="Quy tắc V5.2: " FontWeight="Bold"/>
-                        <Run Text="mỗi PartType chỉ giữ 1 type. Nếu chọn Tee thứ hai, Tee đã chọn trước sẽ tự bỏ; Elbow/Transition/Cross không bị ảnh hưởng. Fitting thường chỉ hiển thị Tee/Elbow/Transition/Cross trong Routing Preferences. Fitting giảm chỉ hiển thị Tee/Elbow/Transition đã load và dùng khi connector cũ có kích thước không bằng nhau."/>
-                    </TextBlock>
+                <Border Background="#FFF8E8" BorderBrush="#E1B65A" BorderThickness="1" Padding="9" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock FontWeight="Bold" Foreground="#8A5200" Text="Quy tắc V5.6:"/>
+                        <TextBlock TextWrapping="Wrap" Margin="0,4,0,0"
+                                   Text="• Option 1: chạy như V5.5 — Pipe Type mới quyết định fitting qua Routing Preferences.&#x0a;• Option 2: chạy như V5.3 — người dùng chỉ định đúng FamilySymbol; mỗi PartType tối đa 1 type. Fitting có connector khác size tự dùng danh sách Fitting giảm.&#x0a;• Cả hai Option đều dùng chung Min/Max Pipe Size, centerline alignment, auto-size, reconnect và rollback từng fitting.&#x0a;• Hai checkbox Option được khóa logic kiểu radio: click Option này sẽ tự bỏ tick Option kia; không thể để cả hai cùng bật."/>
+                    </StackPanel>
                 </Border>
 
                 <StackPanel Margin="0,0,0,2">
                     <WrapPanel Orientation="Horizontal">
                         <CheckBox x:Name="chk_ReplacePipes" Content="Thay Pipe" IsChecked="True" Margin="0,0,22,5"/>
-                        <CheckBox x:Name="chk_ReplaceFittings" Content="Thay Fitting" IsChecked="True" Margin="0,0,22,5"/>
+                        <CheckBox x:Name="chk_ReplaceFittings" Content="Thay Fitting" IsChecked="True" FontWeight="Bold" Margin="0,0,22,5"/>
                         <CheckBox x:Name="chk_ForceReconnectFittings" Content="Fallback: ngắt/nối lại fitting bị lỗi" IsChecked="True" FontWeight="Bold" Foreground="#9A4D00" Margin="0,0,22,5"/>
                     </WrapPanel>
-                    <TextBlock Text="Sau khi batch commit, UI vẫn mở để xem/copy Log. Nút Thực hiện sẽ bị khóa vì preselection của cửa sổ này đã hoàn tất. Đóng UI, chọn đối tượng mới rồi chạy tool lại cho batch tiếp theo." Foreground="#6A6A6A" TextWrapping="Wrap"/>
+                    <TextBlock Text="Không hiện popup kết quả nhỏ sau khi chạy. Thành công / bỏ qua / lỗi được ghi đầy đủ trong Log." Foreground="#6A6A6A" TextWrapping="Wrap"/>
                 </StackPanel>
             </StackPanel>
         </ScrollViewer>
@@ -122,12 +168,12 @@
                       ShowsPreview="True" ResizeDirection="Rows" ResizeBehavior="PreviousAndNext"
                       ToolTip="Kéo lên/xuống để thay đổi chiều cao vùng cài đặt và log"/>
 
-        <GroupBox Grid.Row="2" Header="Log kết quả — thành công / bỏ qua / lỗi" FontWeight="Bold">
+        <GroupBox Grid.Row="2" Header="Log kết quả — Mode / Size Range / thành công / bỏ qua / lỗi" FontWeight="Bold">
             <TextBox x:Name="txt_Log" Margin="8" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap" AcceptsReturn="True"
                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" IsReadOnly="True" FontWeight="Normal"/>
         </GroupBox>
 
-        <Button Grid.Row="4" x:Name="btn_Replace" Content="Thực hiện thay thế các đối tượng đã chọn" Height="42"
+        <Button Grid.Row="4" x:Name="btn_Replace" Content="Thực hiện — Auto Routing + Size Range" Height="44"
                 FontWeight="Bold" FontSize="14" Background="#007ACC" Foreground="White" Click="replace_click"/>
     </Grid>
 </Window>

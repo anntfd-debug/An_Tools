@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__ = "Correct Pipes & Fittings"
-__doc__ = "V5.2 Universal / Revit 2025-2026: mỗi nhóm fitting chỉ cho chọn đúng một type (Tee/Elbow/Transition/Cross; fitting giảm: Tee/Elbow/Transition)."
+__doc__ = "V5.6 Universal / Revit 2025-2026: 2 chế độ Fitting (Auto Routing hoặc chọn thủ công như V5.3) + giới hạn Min/Max Pipe Size."
 
 import os
 import traceback
@@ -319,6 +319,117 @@ def is_pipe(elem):
 
 def is_pipe_fitting(elem):
     return category_is(elem, DB.BuiltInCategory.OST_PipeFitting)
+
+
+def get_pipe_diameter_ft(pipe):
+    """Return the actual instance pipe diameter in Revit internal units (feet)."""
+    if pipe is None or not is_pipe(pipe):
+        return None
+    try:
+        p = pipe.get_Parameter(DB.BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
+        if p and p.StorageType == DB.StorageType.Double:
+            value = float(p.AsDouble())
+            if value > 0.0:
+                return value
+    except Exception:
+        pass
+    try:
+        value = float(pipe.Diameter)
+        if value > 0.0:
+            return value
+    except Exception:
+        pass
+    return None
+
+
+def pipe_size_mm(size_ft):
+    try:
+        return float(size_ft) * 304.8
+    except Exception:
+        return None
+
+
+def format_pipe_size(size_ft):
+    """Readable DN/diameter label. Values come from actual pipe instances."""
+    mm = pipe_size_mm(size_ft)
+    if mm is None:
+        return u"?"
+    nearest = round(mm)
+    if abs(mm - nearest) <= 1.0e-6:
+        return u"DN{:.0f} mm".format(nearest)
+    text = u"{:.3f}".format(mm).rstrip(u"0").rstrip(u".")
+    return u"DN{} mm".format(text)
+
+
+def collect_model_pipe_sizes(pipes=None):
+    """Return sorted unique diameters that actually occur on Pipe instances in model."""
+    if pipes is None:
+        try:
+            pipes = list(DB.FilteredElementCollector(doc)\
+                         .OfClass(DB.Plumbing.Pipe)\
+                         .WhereElementIsNotElementType()\
+                         .ToElements())
+        except Exception:
+            pipes = []
+    values = []
+    # Key in millimetres avoids duplicate float noise while preserving model sizes.
+    seen = set()
+    for pipe in pipes:
+        value = get_pipe_diameter_ft(pipe)
+        if value is None or value <= 0.0:
+            continue
+        try:
+            key = round(float(value) * 304.8, 6)
+        except Exception:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(float(value))
+    values.sort()
+    return values
+
+
+def pipe_size_in_range(pipe, min_size_ft, max_size_ft, tol=1.0e-7):
+    value = get_pipe_diameter_ft(pipe)
+    if value is None:
+        return False
+    return value >= (float(min_size_ft) - tol) and value <= (float(max_size_ft) + tol)
+
+
+def fitting_port_diameters_ft(fitting):
+    """Return diameters represented by all physical round ports of a fitting.
+
+    This is intentionally based on every port, not only one 'primary' port. A
+    reducing Tee crossing the selected size boundary is therefore skipped as a
+    whole, preventing partial changes to a mixed-size junction.
+    """
+    result = []
+    try:
+        connectors = physical_connectors(fitting)
+    except Exception:
+        connectors = get_connectors(fitting)
+    for conn in connectors:
+        sig = connector_size_signature(conn)
+        try:
+            if sig and safe_text(sig[0]).lower() == u"round" and len(sig) >= 2:
+                # connector_size_signature stores Radius for round connectors.
+                diameter = float(sig[1]) * 2.0
+                if diameter > 0.0:
+                    result.append(diameter)
+        except Exception:
+            pass
+    return result
+
+
+def fitting_size_in_range(fitting, min_size_ft, max_size_ft, tol=1.0e-7):
+    """A fitting is eligible only when ALL physical pipe-port sizes are in range."""
+    sizes = fitting_port_diameters_ft(fitting)
+    if not sizes:
+        return False, []
+    ok = all((value >= float(min_size_ft) - tol and
+              value <= float(max_size_ft) + tol) for value in sizes)
+    return ok, sizes
 
 
 # Tolerance used by the forced reconnect fallback.
@@ -1628,32 +1739,467 @@ def part_type_enum_name(family_symbol):
     return safe_text(value)
 
 
-# V5.2: the UI intentionally supports exactly one selected FamilySymbol for
-# each configured PartType.  This prevents two Tee types (or two Elbow types)
-# from being selected at the same time and makes replacement deterministic.
-NORMAL_FITTING_ROLES = (u"Tee", u"Elbow", u"Transition", u"Cross")
-REDUCING_FITTING_ROLES = (u"Tee", u"Elbow", u"Transition")
+# V5.6: PartType is no longer hard-coded to Tee/Elbow/Transition/Cross.
+# The actual roles are discovered from ALL FamilySymbol elements in the
+# OST_PipeFitting category that are loaded in the current project.  This makes
+# the tool future-safe for Revit 2025/2026 content such as Wye, LateralTee,
+# Union, Cap, Offset, MultiPort, PipeFlange, PipeMechanicalCoupling, etc.
+# These tuples are populated during setup_data() before the fitting lists are
+# rendered.  Every role still allows at most ONE selected type.
+NORMAL_FITTING_ROLES = tuple()
+REDUCING_FITTING_ROLES = tuple()
+
+# Preferred UI order for common pipe-fitting PartTypes.  Unknown/new PartTypes
+# are appended automatically, so this list is only a display preference and
+# never a functional allow-list.
+PIPE_FITTING_PARTTYPE_PREFERRED_ORDER = (
+    u"Elbow", u"Tee", u"Wye", u"LateralTee", u"Transition", u"Cross",
+    u"LateralCross", u"Union", u"PipeMechanicalCoupling", u"PipeFlange",
+    u"Cap", u"EndCap", u"Offset", u"TapPerpendicular", u"TapAdjustable",
+    u"SpudPerpendicular", u"SpudAdjustable", u"Pants", u"MultiPort",
+    u"ValveNormal", u"ValveBreaksInto", u"Normal", u"Undefined"
+)
 
 
 def fitting_role_from_part_type_value(value):
-    """Map a Revit DB.PartType integer to one of the V5.2 UI roles."""
+    """Return the exact Revit DB.PartType enum name for any Pipe Fitting type.
+
+    V5.6 deliberately does not maintain a short allow-list.  The category
+    filter in setup_data() is what limits the UI to real Pipe Fitting symbols.
+    """
     if value is None:
         return u""
     try:
         name = System.Enum.GetName(DB.PartType, value)
-        name = safe_text(name) if name else safe_text(value)
+        if name:
+            return safe_text(name)
     except Exception:
-        name = safe_text(value)
-    key = name.strip().lower()
-    if key == u"tee":
-        return u"Tee"
-    if key == u"elbow":
-        return u"Elbow"
-    if key == u"transition":
-        return u"Transition"
-    if key == u"cross":
-        return u"Cross"
-    return u""
+        pass
+    # A numeric fallback keeps malformed/custom content visible instead of
+    # silently discarding it.  It can still be matched deterministically.
+    try:
+        return u"PartType_{}".format(int(value))
+    except Exception:
+        return safe_text(value)
+
+
+def _split_camel_case(text):
+    """Human-readable enum label without depending on Revit UI language."""
+    try:
+        import re
+        value = safe_text(text)
+        value = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', value)
+        value = re.sub(r'(?<=[A-Z])(?=[A-Z][a-z])', ' ', value)
+        return value
+    except Exception:
+        return safe_text(text)
+
+
+def fitting_role_display_name(role):
+    return _split_camel_case(role) if role else u"PartType không xác định"
+
+
+def sort_pipe_fitting_roles(roles):
+    """Stable order: common pipe roles first, then every discovered role."""
+    unique = []
+    seen = set()
+    for role in list(roles or []):
+        role = safe_text(role)
+        if role and role not in seen:
+            seen.add(role)
+            unique.append(role)
+    rank = dict((name, idx) for idx, name in enumerate(PIPE_FITTING_PARTTYPE_PREFERRED_ORDER))
+    return tuple(sorted(unique, key=lambda r: (rank.get(r, 10000), fitting_role_display_name(r).lower())))
+
+
+
+# ============================================================
+# V5.6 - Automatic Routing Preferences resolver
+# ============================================================
+
+ROUTING_FITTING_GROUP_NAMES = (
+    u"Elbows", u"Junctions", u"Crosses", u"Transitions",
+    u"Unions", u"MechanicalJoints", u"Caps"
+)
+
+ROUTING_GROUP_DISPLAY = {
+    u"Segments": u"Segments",
+    u"Elbows": u"Elbow",
+    u"Junctions": u"Junction",
+    u"Crosses": u"Cross",
+    u"Transitions": u"Transition",
+    u"Unions": u"Union",
+    u"MechanicalJoints": u"Mechanical Joint",
+    u"Caps": u"Cap",
+}
+
+
+def _routing_group_enum(group_name):
+    try:
+        return getattr(DB.RoutingPreferenceRuleGroupType, safe_text(group_name))
+    except Exception:
+        return None
+
+
+def _connector_nominal_diameter_ft(conn):
+    """Round pipe nominal diameter in Revit internal feet."""
+    try:
+        sig = connector_size_signature(conn)
+        if sig and sig[0] == u"round" and len(sig) >= 2:
+            return float(sig[1]) * 2.0
+    except Exception:
+        pass
+    return None
+
+
+def _connector_axis(conn):
+    try:
+        return conn.CoordinateSystem.BasisZ.Normalize()
+    except Exception:
+        return None
+
+
+def routing_primary_size_ft(fitting):
+    """Best approximation of Revit Primary Size for a pipe fitting rule.
+
+    For Tee/Wye/Cross the main run is the most-collinear connector pair, so its
+    diameter drives the Routing Preference size range.  For one/two-port parts
+    use the largest live diameter.  This also behaves predictably for reducing
+    fittings, whose branch/secondary size may differ from the run.
+    """
+    conns = list(physical_connectors(fitting) or [])
+    sized = []
+    for c in conns:
+        d = _connector_nominal_diameter_ft(c)
+        if d is not None and d > 0:
+            sized.append((c, d))
+    if not sized:
+        return None
+    if len(sized) <= 2:
+        return max([x[1] for x in sized])
+
+    best_pair = None
+    best_dot = -1.0
+    for i in range(len(sized)):
+        ai = _connector_axis(sized[i][0])
+        if ai is None:
+            continue
+        for j in range(i + 1, len(sized)):
+            aj = _connector_axis(sized[j][0])
+            if aj is None:
+                continue
+            try:
+                score = abs(float(ai.DotProduct(aj)))
+            except Exception:
+                continue
+            if score > best_dot:
+                best_dot = score
+                best_pair = (sized[i][1], sized[j][1])
+    if best_pair is not None:
+        return max(best_pair)
+    return max([x[1] for x in sized])
+
+
+def routing_group_name_for_fitting(fitting):
+    """Map an existing Pipe Fitting to the RoutingPreference group of a PipeType."""
+    symbol = get_symbol_from_instance(fitting)
+    ptn = part_type_enum_name(symbol).lower().replace(u" ", u"")
+
+    # Explicit PartType semantics first.  This preserves a reducing elbow as an
+    # Elbow instead of misclassifying it as a Transition just because sizes differ.
+    if u"cross" in ptn:
+        return u"Crosses"
+    if u"transition" in ptn or u"reducer" in ptn:
+        return u"Transitions"
+    if u"elbow" in ptn or u"bend" in ptn:
+        return u"Elbows"
+    if u"union" in ptn:
+        return u"Unions"
+    if (u"mechanicaljoint" in ptn or u"mechanicalcoupling" in ptn or
+            u"pipeflange" in ptn or u"flange" in ptn or u"coupling" in ptn):
+        return u"MechanicalJoints"
+    if u"cap" in ptn:
+        return u"Caps"
+    if (u"tee" in ptn or u"wye" in ptn or u"lateral" in ptn or
+            u"junction" in ptn or u"tap" in ptn or u"spud" in ptn or
+            u"pants" in ptn or u"multiport" in ptn):
+        return u"Junctions"
+
+    # Geometry fallback for custom/Undefined content.
+    conns = list(physical_connectors(fitting) or [])
+    count = len(conns)
+    if count == 1:
+        return u"Caps"
+    if count == 3:
+        return u"Junctions"
+    if count == 4:
+        return u"Crosses"
+    if count == 2:
+        a0 = _connector_axis(conns[0])
+        a1 = _connector_axis(conns[1])
+        dot_abs = None
+        if a0 is not None and a1 is not None:
+            try:
+                dot_abs = abs(float(a0.DotProduct(a1)))
+            except Exception:
+                pass
+        # Collinear two-port unequal-size fitting is normally a transition;
+        # equal-size collinear fitting is normally a union/coupling.
+        if dot_abs is not None and dot_abs > 0.985:
+            if fitting_has_variable_port_sizes(fitting):
+                return u"Transitions"
+            return u"Unions"
+        return u"Elbows"
+    return None
+
+
+def _routing_rule_criteria(rule):
+    result = []
+    count = None
+    try:
+        count = int(rule.GetNumberOfCriteria())
+    except Exception:
+        try:
+            count = int(rule.NumberOfCriteria)
+        except Exception:
+            count = None
+    if count is None:
+        return result
+    for i in range(max(0, count)):
+        try:
+            result.append(rule.GetCriterion(i))
+        except Exception:
+            pass
+    return result
+
+
+def _float_property(obj, names):
+    for name in names:
+        try:
+            value = getattr(obj, name)
+            if callable(value):
+                value = value()
+            return float(value)
+        except Exception:
+            pass
+    return None
+
+
+def _primary_size_bounds(criterion):
+    """Read PrimarySizeCriterion range without binding to one Revit minor API."""
+    if criterion is None:
+        return (None, None, False)
+    try:
+        type_name = safe_text(criterion.GetType().Name).lower()
+    except Exception:
+        type_name = safe_text(type(criterion)).lower()
+    if u"primarysize" not in type_name and u"sizecriterion" not in type_name:
+        return (None, None, False)
+    min_size = _float_property(criterion, (
+        'MinimumSize', 'MinSize', 'Minimum', 'MinimumDiameter'))
+    max_size = _float_property(criterion, (
+        'MaximumSize', 'MaxSize', 'Maximum', 'MaximumDiameter'))
+    return (min_size, max_size, True)
+
+
+def routing_rule_matches_size(rule, primary_size_ft, tol=1.0e-9):
+    """Evaluate PrimarySizeCriterion. Rules are tested in manager order."""
+    criteria = _routing_rule_criteria(rule)
+    if not criteria:
+        return True
+    for criterion in criteria:
+        min_size, max_size, recognized = _primary_size_bounds(criterion)
+        if not recognized:
+            # Current Pipe routing rules use PrimarySizeCriterion. Unknown future
+            # criteria are left to rule priority instead of rejecting valid content.
+            continue
+        if primary_size_ft is None:
+            continue
+        if min_size is not None and min_size > 0.0 and primary_size_ft < min_size - tol:
+            return False
+        if max_size is not None and max_size > 0.0 and primary_size_ft > max_size + tol:
+            return False
+        if min_size is not None and max_size is not None and min_size > max_size + tol:
+            return False
+    return True
+
+
+def routing_rule_range_text(rule):
+    criteria = _routing_rule_criteria(rule)
+    ranges = []
+    for criterion in criteria:
+        mn, mx, recognized = _primary_size_bounds(criterion)
+        if not recognized:
+            continue
+        try:
+            mn_text = u"{:.1f}".format(float(mn) * 304.8) if mn is not None and mn > 0 else u"All"
+        except Exception:
+            mn_text = u"?"
+        try:
+            mx_text = u"{:.1f}".format(float(mx) * 304.8) if mx is not None and mx > 0 else u"All"
+        except Exception:
+            mx_text = u"?"
+        ranges.append(u"{}–{} mm".format(mn_text, mx_text))
+    return u", ".join(ranges) if ranges else u"All sizes"
+
+
+def _routing_rule_part(rule):
+    try:
+        part_id = rule.MEPPartId
+    except Exception:
+        return None
+    try:
+        if not is_valid_element_id(part_id):
+            return None
+    except Exception:
+        pass
+    try:
+        return doc.GetElement(part_id)
+    except Exception:
+        return None
+
+
+def _routing_rule_family_symbol(rule, fitting=None):
+    part = _routing_rule_part(rule)
+    if isinstance(part, DB.FamilySymbol):
+        return part
+    if isinstance(part, DB.Family):
+        wanted_role = u""
+        try:
+            wanted_role = fitting_role_from_symbol(get_symbol_from_instance(fitting))
+        except Exception:
+            pass
+        candidates = []
+        try:
+            for sid in part.GetFamilySymbolIds():
+                sym = doc.GetElement(sid)
+                if isinstance(sym, DB.FamilySymbol) and category_is(sym, DB.BuiltInCategory.OST_PipeFitting):
+                    candidates.append(sym)
+        except Exception:
+            pass
+        if wanted_role:
+            same = [s for s in candidates if fitting_role_from_symbol(s) == wanted_role]
+            if same:
+                return sorted(same, key=lambda s: get_real_name(s).lower())[0]
+        if candidates:
+            return sorted(candidates, key=lambda s: get_real_name(s).lower())[0]
+    try:
+        if part is not None and category_is(part, DB.BuiltInCategory.OST_PipeFitting):
+            if isinstance(part, DB.ElementType):
+                return part
+    except Exception:
+        pass
+    return None
+
+
+def resolve_routing_symbol_for_fitting(pipe_type, fitting):
+    """Return (FamilySymbol, info dict) using selected PipeType Routing Preferences.
+
+    Revit evaluates routing rules by group, size criterion, then priority/order.
+    V5.6 mirrors that behavior and returns the first valid rule that satisfies the
+    existing fitting's primary run size.
+    """
+    if pipe_type is None:
+        raise Exception(u"Không có Pipe Type mới để đọc Routing Preferences")
+    group_name = routing_group_name_for_fitting(fitting)
+    if not group_name:
+        raise Exception(u"Không xác định được Routing Preference group cho PartType '{}' ({} cổng)"
+                        .format(part_type_enum_name(get_symbol_from_instance(fitting)),
+                                len(physical_connectors(fitting))))
+    group = _routing_group_enum(group_name)
+    if group is None:
+        raise Exception(u"Revit API không có RoutingPreference group '{}'".format(group_name))
+    try:
+        manager = pipe_type.RoutingPreferenceManager
+        count = int(manager.GetNumberOfRules(group))
+    except Exception as ex:
+        raise Exception(u"Không đọc được Routing Preferences nhóm {}: {}"
+                        .format(group_name, safe_text(ex)))
+    if count <= 0:
+        raise Exception(u"Pipe Type '{}' chưa cấu hình Routing Preferences nhóm {}"
+                        .format(get_real_name(pipe_type), ROUTING_GROUP_DISPLAY.get(group_name, group_name)))
+
+    primary_size = routing_primary_size_ft(fitting)
+    checked = []
+    for index in range(count):
+        try:
+            rule = manager.GetRule(group, index)
+        except Exception as ex:
+            checked.append(u"#{} không đọc được rule: {}".format(index + 1, safe_text(ex)))
+            continue
+        part = _routing_rule_part(rule)
+        part_name = get_real_name(part) if part is not None else u"<None>"
+        range_text = routing_rule_range_text(rule)
+        if not routing_rule_matches_size(rule, primary_size):
+            checked.append(u"#{} '{}' [{}] không khớp size".format(index + 1, part_name, range_text))
+            continue
+        symbol = _routing_rule_family_symbol(rule, fitting)
+        if symbol is None:
+            checked.append(u"#{} '{}' [{}] không phải Pipe Fitting FamilySymbol hợp lệ"
+                           .format(index + 1, part_name, range_text))
+            continue
+        info = {
+            'group_name': group_name,
+            'group_display': ROUTING_GROUP_DISPLAY.get(group_name, group_name),
+            'rule_index': index,
+            'rule_number': index + 1,
+            'range_text': range_text,
+            'primary_size_ft': primary_size,
+            'symbol': symbol,
+            'checked': checked,
+        }
+        return symbol, info
+
+    primary_text = u"?"
+    if primary_size is not None:
+        try:
+            primary_text = u"{:.1f} mm".format(primary_size * 304.8)
+        except Exception:
+            pass
+    detail = u" | ".join(checked[:8])
+    raise Exception(u"Không có rule {} phù hợp Primary Size {} trong Pipe Type '{}'. {}"
+                    .format(ROUTING_GROUP_DISPLAY.get(group_name, group_name), primary_text,
+                            get_real_name(pipe_type), detail))
+
+
+def routing_preferences_summary(pipe_type):
+    """Human-readable summary shown in the V5.6 UI."""
+    if pipe_type is None:
+        return u"Chưa chọn Pipe Type."
+    lines = [u"Pipe Type: {}".format(get_real_name(pipe_type))]
+    try:
+        manager = pipe_type.RoutingPreferenceManager
+    except Exception as ex:
+        return u"Không đọc được Routing Preferences: {}".format(safe_text(ex))
+    group_names = (u"Segments",) + ROUTING_FITTING_GROUP_NAMES
+    total_rules = 0
+    for group_name in group_names:
+        group = _routing_group_enum(group_name)
+        if group is None:
+            continue
+        try:
+            count = int(manager.GetNumberOfRules(group))
+        except Exception:
+            count = 0
+        total_rules += count
+        label = ROUTING_GROUP_DISPLAY.get(group_name, group_name)
+        if count <= 0:
+            lines.append(u"{}: chưa cấu hình".format(label))
+            continue
+        parts = []
+        for i in range(count):
+            try:
+                rule = manager.GetRule(group, i)
+                part = _routing_rule_part(rule)
+                parts.append(u"#{} {} [{}]".format(
+                    i + 1, get_real_name(part) if part is not None else u"<None>",
+                    routing_rule_range_text(rule)))
+            except Exception as ex:
+                parts.append(u"#{} <lỗi: {}>".format(i + 1, safe_text(ex)))
+        lines.append(u"{}: {}".format(label, u"; ".join(parts)))
+    lines.append(u"Tổng rule đọc được: {}. Fitting sẽ tự lấy rule đầu tiên thỏa Primary Size."
+                 .format(total_rules))
+    return u"\n".join(lines)
 
 
 def fitting_role_from_symbol(symbol):
@@ -3990,7 +4536,7 @@ class SkipWarningsPreprocessor(DB.IFailuresPreprocessor):
 
 
 # ============================================================
-# Main window - modal, preselection snapshot (V5.2 Universal / Revit 2025-2026)
+# Main window - modal, preselection snapshot (V5.6 Universal / Revit 2025-2026)
 # ============================================================
 
 
@@ -3998,7 +4544,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def __init__(self, xaml_file_name, preselected_ids):
         forms.WPFWindow.__init__(self, xaml_file_name)
         try:
-            self.Title = u"Correct Pipes & Fittings V5.2 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
+            self.Title = u"Correct Pipes & Fittings V5.6 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
         except Exception:
             pass
         # V4.9: size the dialog against the actual Windows work area.  The XAML
@@ -4019,6 +4565,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self.system_items = []
         self.routing_fitting_type_ids = None
         self.routing_ids_by_pipe_type_id = {}
+        self.pipe_size_items = []
+        self._updating_size_range = False
+        # V5.6: exactly one fitting-source mode is active at a time.
+        # 'auto'   = resolve FamilySymbol from selected PipeType Routing Preferences.
+        # 'manual' = user selects at most one FamilySymbol per PartType, like V5.3.
+        self.fitting_selection_mode = 'auto'
+        self._updating_fitting_mode = False
 
         # V4.8: freeze the Revit selection at command start. The modal UI never
         # reads UIDocument.Selection again, so accidental selection changes cannot
@@ -4075,6 +4628,74 @@ class ReplaceElementsWindow(forms.WPFWindow):
         except Exception:
             # XAML dimensions remain as a safe fallback.
             pass
+
+    def _is_manual_fitting_mode(self):
+        return safe_text(getattr(self, 'fitting_selection_mode', 'auto')).lower() == 'manual'
+
+    def _set_fitting_selection_mode(self, mode, log_change=False):
+        """Enforce exactly one of the two fitting-source checkboxes."""
+        mode = 'manual' if safe_text(mode).lower() == 'manual' else 'auto'
+        self.fitting_selection_mode = mode
+        try:
+            self._updating_fitting_mode = True
+            self.chk_ModeAutoRouting.IsChecked = (mode == 'auto')
+            self.chk_ModeManualFittings.IsChecked = (mode == 'manual')
+        except Exception:
+            pass
+        finally:
+            self._updating_fitting_mode = False
+        self._update_fitting_mode_ui(log_change)
+
+    def _update_fitting_mode_ui(self, log_change=False):
+        manual = self._is_manual_fitting_mode()
+        try:
+            self.panel_AutoRouting.Visibility = (System.Windows.Visibility.Collapsed
+                                                 if manual else System.Windows.Visibility.Visible)
+        except Exception:
+            pass
+        try:
+            self.panel_ManualFittings.Visibility = (System.Windows.Visibility.Visible
+                                                    if manual else System.Windows.Visibility.Collapsed)
+        except Exception:
+            pass
+        try:
+            self.txt_FittingModeStatus.Text = (
+                u"CHẾ ĐỘ 2 — Chọn Fitting thủ công: mỗi PartType tối đa 1 type; fitting giảm dùng danh sách riêng."
+                if manual else
+                u"CHẾ ĐỘ 1 — Auto Routing: FamilySymbol được lấy tự động từ Routing Preferences của Pipe Type mới.")
+        except Exception:
+            pass
+        try:
+            self.btn_Replace.Content = (u"Thực hiện — Fitting thủ công + Size Range"
+                                        if manual else
+                                        u"Thực hiện — Auto Routing + Size Range")
+        except Exception:
+            pass
+        # Refresh the manual lists whenever they become visible. Routing symbols
+        # remain sorted first for convenience, but manual selection can use any
+        # loaded Pipe Fitting FamilySymbol of the same PartType.
+        if manual:
+            try:
+                self.refresh_fitting_list(self.txt_FilterFittings.Text)
+                self.refresh_reducing_fitting_list(self.txt_FilterReducingFittings.Text)
+            except Exception:
+                pass
+        if log_change:
+            self.log(u"Chế độ Fitting V5.6: {}."
+                     .format(u"CHỌN THỦ CÔNG như V5.3" if manual else u"AUTO ROUTING PREFERENCES"))
+
+    def fitting_mode_click(self, sender, args):
+        """Checkbox UI with radio-button semantics: exactly one option stays ticked."""
+        if self._updating_fitting_mode or self._loading_choices:
+            return
+        try:
+            sender_name = safe_text(getattr(sender, 'Name', u''))
+            if sender_name == 'chk_ModeManualFittings':
+                self._set_fitting_selection_mode('manual', True)
+            else:
+                self._set_fitting_selection_mode('auto', True)
+        except Exception as ex:
+            self.log(u"Không thể đổi chế độ Fitting: {}".format(safe_text(ex)))
 
     def _prefer_unique_preselected_system(self):
         """If the preselection has exactly one System Type, select it automatically."""
@@ -4141,6 +4762,87 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 pass
         return False
 
+    def _select_combo_by_float_value(self, combo, saved_value, tolerance=1.0e-7):
+        try:
+            wanted = float(saved_value)
+        except Exception:
+            return False
+        best_index = -1
+        best_delta = None
+        for index in range(combo.Items.Count):
+            try:
+                delta = abs(float(combo.Items[index].Value) - wanted)
+                if delta <= tolerance:
+                    combo.SelectedIndex = index
+                    return True
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    best_index = index
+            except Exception:
+                pass
+        # Do NOT silently snap to another model size. Saved range may belong to
+        # another model; fall back to full current-model range instead.
+        return False
+
+    def _current_pipe_size_range(self):
+        min_item = self.cmb_MinPipeSize.SelectedItem
+        max_item = self.cmb_MaxPipeSize.SelectedItem
+        if min_item is None or max_item is None:
+            return None, None
+        try:
+            return float(min_item.Value), float(max_item.Value)
+        except Exception:
+            return None, None
+
+    def _update_pipe_size_range_status(self):
+        try:
+            min_size, max_size = self._current_pipe_size_range()
+            if min_size is None or max_size is None:
+                self.txt_PipeSizeRangeStatus.Text = u"Model chưa có Pipe size hợp lệ để tạo range."
+                self.txt_PipeSizeRangeStatus.Foreground = System.Windows.Media.Brushes.DarkRed
+                return
+            if min_size > max_size:
+                self.txt_PipeSizeRangeStatus.Text = u"Range không hợp lệ: Min lớn hơn Max."
+                self.txt_PipeSizeRangeStatus.Foreground = System.Windows.Media.Brushes.DarkRed
+                return
+            self.txt_PipeSizeRangeStatus.Text = (
+                u"Sẽ xử lý Pipe từ {} đến {} (bao gồm hai đầu range). "
+                u"Fitting chỉ được xử lý khi TẤT CẢ port size của fitting đều nằm trong range. "
+                u"Danh sách size được lấy từ Pipe đang tồn tại trong model."
+                .format(format_pipe_size(min_size), format_pipe_size(max_size)))
+            self.txt_PipeSizeRangeStatus.Foreground = System.Windows.Media.Brushes.DarkGreen
+        except Exception:
+            pass
+
+    def min_pipe_size_selection_changed(self, sender, args):
+        if self._loading_choices or self._updating_size_range:
+            return
+        try:
+            min_size, max_size = self._current_pipe_size_range()
+            if min_size is not None and max_size is not None and min_size > max_size:
+                self._updating_size_range = True
+                # Traditional range behaviour: moving Min above Max also moves
+                # Max to the same existing model size.
+                self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MinPipeSize.SelectedIndex
+                self._updating_size_range = False
+            self._update_pipe_size_range_status()
+        except Exception:
+            self._updating_size_range = False
+
+    def max_pipe_size_selection_changed(self, sender, args):
+        if self._loading_choices or self._updating_size_range:
+            return
+        try:
+            min_size, max_size = self._current_pipe_size_range()
+            if min_size is not None and max_size is not None and max_size < min_size:
+                self._updating_size_range = True
+                # Moving Max below Min also moves Min to that size.
+                self.cmb_MinPipeSize.SelectedIndex = self.cmb_MaxPipeSize.SelectedIndex
+                self._updating_size_range = False
+            self._update_pipe_size_range_status()
+        except Exception:
+            self._updating_size_range = False
+
     def get_routing_fitting_type_ids(self, pipe_type):
         """Return fitting symbol IDs referenced by the selected PipeType routing preferences."""
         if not pipe_type:
@@ -4188,31 +4890,41 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return result
 
     def update_fittings_for_selected_pipe_type(self, clear_invalid=True):
-        # Routing IDs are cached during setup_data so UI filtering is fast and
-        # deterministic while the modal window is open.
+        """V5.6: always read Routing Preferences, but preserve manual choices.
+
+        Auto mode uses the routing rules directly at runtime. Manual mode keeps
+        the user's one-type-per-PartType selections intact when Pipe Type changes.
+        """
         selected = self.cmb_PipeTypes.SelectedItem
         key = self.id_value(selected.Value) if selected else None
         cached = self.routing_ids_by_pipe_type_id.get(key, None)
-        self.routing_fitting_type_ids = set(cached) if cached is not None else None
+        self.routing_fitting_type_ids = set(cached) if cached is not None else set()
 
-        if clear_invalid and self.routing_fitting_type_ids is not None:
-            self.selected_fitting_type_ids.intersection_update(self.routing_fitting_type_ids)
+        pipe_type = doc.GetElement(selected.Value) if selected else None
         try:
-            self._normalize_selected_ids(
-                self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=True)
-        except Exception:
-            pass
+            self.txt_RoutingSummary.Text = routing_preferences_summary(pipe_type)
+        except Exception as ex:
+            try:
+                self.txt_RoutingSummary.Text = u"Không thể hiển thị Routing Preferences: {}".format(safe_text(ex))
+            except Exception:
+                pass
 
-        self.refresh_fitting_list(self.txt_FilterFittings.Text)
+        # Manual selections are intentionally NOT overwritten with routing IDs.
+        # Refresh only affects presentation/order and preserves selected ID sets.
         try:
+            self.refresh_fitting_list(self.txt_FilterFittings.Text)
             self.refresh_reducing_fitting_list(self.txt_FilterReducingFittings.Text)
         except Exception:
             pass
-        count = len(self.routing_fitting_type_ids or [])
+
+        count = len(self.routing_fitting_type_ids)
         if selected:
-            self.log(u"Pipe Type '{}': tìm thấy {} fitting type trong Routing Preferences.".format(
-                selected.Name, count
-            ))
+            if self._is_manual_fitting_mode():
+                self.log(u"Pipe Type '{}': đọc {} fitting type từ Routing Preferences để tham khảo; chế độ hiện tại dùng Fitting chọn thủ công."
+                         .format(selected.Name, count))
+            else:
+                self.log(u"Pipe Type '{}': tự động đọc {} fitting type từ Routing Preferences; không cần chọn Fitting thủ công."
+                         .format(selected.Name, count))
 
     def pipe_type_selection_changed(self, sender, args):
         if self._loading_choices:
@@ -4229,19 +4941,24 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self._select_combo_by_id(self.cmb_Systems, self._config_get(config, 'last_system_type_id'))
             self._select_combo_by_id(self.cmb_PipeTypes, self._config_get(config, 'last_pipe_type_id'))
 
+            # Preserve V5.3-style manual fitting choices even when Auto mode is active.
             self.selected_fitting_type_ids.clear()
             for value in safe_text(self._config_get(config, 'last_fitting_type_ids', u'')).split(','):
                 try:
                     self.selected_fitting_type_ids.add(int(value.strip()))
                 except Exception:
                     pass
-
             self.selected_reducing_fitting_type_ids.clear()
             for value in safe_text(self._config_get(config, 'last_reducing_fitting_type_ids', u'')).split(','):
                 try:
                     self.selected_reducing_fitting_type_ids.add(int(value.strip()))
                 except Exception:
                     pass
+            try:
+                self._normalize_selected_ids(self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=False)
+                self._normalize_selected_ids(self.selected_reducing_fitting_type_ids, REDUCING_FITTING_ROLES, require_routing=False)
+            except Exception:
+                pass
 
             self.chk_ReplacePipes.IsChecked = bool(self._config_get(config, 'replace_pipes', True))
             self.chk_ReplaceFittings.IsChecked = bool(self._config_get(config, 'replace_fittings', True))
@@ -4250,26 +4967,39 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     self._config_get(config, 'force_reconnect_fittings', True))
             except Exception:
                 pass
-            filter_text = safe_text(self._config_get(config, 'fitting_filter_text', u''))
-            self.txt_FilterFittings.Text = filter_text
+
+            # Restore manual-list filters.
             try:
-                reducing_filter_text = safe_text(self._config_get(config, 'reducing_fitting_filter_text', u''))
-                self.txt_FilterReducingFittings.Text = reducing_filter_text
+                self.txt_FilterFittings.Text = safe_text(self._config_get(config, 'fitting_filter_text', u''))
+                self.txt_FilterReducingFittings.Text = safe_text(
+                    self._config_get(config, 'reducing_fitting_filter_text', u''))
             except Exception:
                 pass
+
+            # Restore Min/Max only when those exact sizes still exist in model.
             try:
-                self._normalize_selected_ids(
-                    self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=False)
-                self._normalize_selected_ids(
-                    self.selected_reducing_fitting_type_ids, REDUCING_FITTING_ROLES, require_routing=False)
+                saved_min = self._config_get(config, 'min_pipe_size_ft', None)
+                saved_max = self._config_get(config, 'max_pipe_size_ft', None)
+                if saved_min is not None:
+                    self._select_combo_by_float_value(self.cmb_MinPipeSize, saved_min)
+                if saved_max is not None:
+                    self._select_combo_by_float_value(self.cmb_MaxPipeSize, saved_max)
             except Exception:
                 pass
+
+            saved_mode = safe_text(self._config_get(config, 'fitting_selection_mode', u'auto')).lower()
             self._loading_choices = False
-            self.update_fittings_for_selected_pipe_type(clear_invalid=True)
-            self.log(u"Đã khôi phục lựa chọn từ lần chạy trước (V5.2 tự giới hạn 1 type mỗi PartType).")
+            self._set_fitting_selection_mode('manual' if saved_mode == 'manual' else 'auto', False)
+            self._update_pipe_size_range_status()
+            self.update_fittings_for_selected_pipe_type(clear_invalid=False)
+            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.6.")
         except Exception as ex:
             self._loading_choices = False
-            self.update_fittings_for_selected_pipe_type(clear_invalid=True)
+            try:
+                self._set_fitting_selection_mode('auto', False)
+                self.update_fittings_for_selected_pipe_type(clear_invalid=False)
+            except Exception:
+                pass
             self.log(u"Không thể khôi phục lựa chọn trước: {}".format(safe_text(ex)))
 
     def save_last_choices(self, selected_system, selected_pipe_type, selected_fitting_items,
@@ -4279,19 +5009,30 @@ class ReplaceElementsWindow(forms.WPFWindow):
             config = script.get_config()
             config.last_system_type_id = self.id_value(selected_system.Value)
             config.last_pipe_type_id = self.id_value(selected_pipe_type.Value) if selected_pipe_type else -1
+            # Always persist the manual choices, even if this run uses Auto Routing,
+            # so switching back to manual mode restores the user's V5.3-style setup.
             config.last_fitting_type_ids = u','.join([
-                safe_text(self.id_value(item.Value)) for item in selected_fitting_items
+                safe_text(self.id_value(item.Value)) for item in list(selected_fitting_items or [])
             ])
             config.last_reducing_fitting_type_ids = u','.join([
-                safe_text(self.id_value(item.Value)) for item in selected_reducing_fitting_items
+                safe_text(self.id_value(item.Value)) for item in list(selected_reducing_fitting_items or [])
             ])
+            config.fitting_selection_mode = safe_text(self.fitting_selection_mode)
             config.replace_pipes = bool(overwrite_pipes)
             config.replace_fittings = bool(overwrite_fittings)
             config.selected_only = bool(selected_only)
             config.force_reconnect_fittings = bool(force_reconnect_fittings)
-            config.fitting_filter_text = safe_text(self.txt_FilterFittings.Text)
             try:
+                config.fitting_filter_text = safe_text(self.txt_FilterFittings.Text)
                 config.reducing_fitting_filter_text = safe_text(self.txt_FilterReducingFittings.Text)
+            except Exception:
+                pass
+            try:
+                min_size, max_size = self._current_pipe_size_range()
+                if min_size is not None:
+                    config.min_pipe_size_ft = float(min_size)
+                if max_size is not None:
+                    config.max_pipe_size_ft = float(max_size)
             except Exception:
                 pass
             script.save_config()
@@ -4300,11 +5041,30 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
     def setup_data(self):
         self.log(u"Đang đọc dữ liệu trong model...")
-        self.log(u"V5.2 Universal | Revit {} | ElementId 64-bit Value mode.".format(
+        self.log(u"V5.6 Universal | Revit {} | ElementId 64-bit Value mode.".format(
             REVIT_VERSION if REVIT_VERSION else u"không xác định"))
         if REVIT_VERSION and REVIT_VERSION not in SUPPORTED_REVIT_VERSIONS:
-            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.2 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
+            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.6 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
         pipes, fittings = collect_pipes_and_fittings()
+
+        # V5.6: build Min/Max dropdowns from actual Pipe diameters present
+        # anywhere in the current model. No arbitrary standard-size list is used.
+        model_pipe_sizes = collect_model_pipe_sizes(pipes)
+        for size_ft in model_pipe_sizes:
+            item = CmbItem(format_pipe_size(size_ft), float(size_ft))
+            self.pipe_size_items.append(item)
+            self.cmb_MinPipeSize.Items.Add(item)
+            self.cmb_MaxPipeSize.Items.Add(item)
+        self.cmb_MinPipeSize.DisplayMemberPath = "Name"
+        self.cmb_MaxPipeSize.DisplayMemberPath = "Name"
+        if self.cmb_MinPipeSize.Items.Count > 0:
+            self.cmb_MinPipeSize.SelectedIndex = 0
+            self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MaxPipeSize.Items.Count - 1
+        self._update_pipe_size_range_status()
+        self.log(u"V5.6 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
+            len(model_pipe_sizes),
+            format_pipe_size(model_pipe_sizes[0]) if model_pipe_sizes else u"?",
+            format_pipe_size(model_pipe_sizes[-1]) if model_pipe_sizes else u"?"))
 
         # Revit 2025/2026: ElementId is 64-bit. Never depend on IntegerValue here.
         # First detect PipingSystemType from actual Pipe/Fitting instances.
@@ -4383,13 +5143,32 @@ class ReplaceElementsWindow(forms.WPFWindow):
                                .WhereElementIsElementType()\
                                .ToElements())
 
+        # V5.6: discover EVERY PartType that actually exists on loaded Pipe
+        # Fitting symbols.  This is safer than hard-coding an enum subset and
+        # automatically includes custom/new Revit content in 2025/2026.
+        discovered_roles = []
+        for _fs in fitting_symbols:
+            try:
+                _role = fitting_role_from_part_type_value(get_part_type(_fs))
+                if _role:
+                    discovered_roles.append(_role)
+            except Exception:
+                pass
+        global NORMAL_FITTING_ROLES, REDUCING_FITTING_ROLES
+        NORMAL_FITTING_ROLES = sort_pipe_fitting_roles(discovered_roles)
+        # Variable-size detection happens on the OLD instance at runtime, so any
+        # multi-port PartType may legitimately need a reducing symbol.  Keep the
+        # reducing list complete as well; one-port types will simply never be
+        # requested as reducing because they cannot have unequal port sizes.
+        REDUCING_FITTING_ROLES = tuple(NORMAL_FITTING_ROLES)
+
         def fitting_sort_key(fs):
             return (get_real_family_name(fs).lower(), get_real_name(fs).lower())
 
         for fs in sorted(fitting_symbols, key=fitting_sort_key):
             part_type = get_part_type(fs)
             role = fitting_role_from_part_type_value(part_type)
-            role_text = role if role else part_type_enum_name(fs)
+            role_text = fitting_role_display_name(role if role else part_type_enum_name(fs))
             label = u"[{}] {} : {}".format(
                 role_text or u"Khác", get_real_family_name(fs), get_real_name(fs))
             item = CmbItem(label, fs.Id)
@@ -4404,55 +5183,69 @@ class ReplaceElementsWindow(forms.WPFWindow):
         except Exception as ex:
             self.log(u"Không thể khởi tạo ô Fitting giảm: {}".format(safe_text(ex)))
 
-        self.log(u"Tìm thấy {} system type, {} pipe type, {} fitting type.".format(
+        self.log(u"Tìm thấy {} system type, {} pipe type, {} fitting type, {} PartType Pipe Fitting.".format(
             self.cmb_Systems.Items.Count,
             self.cmb_PipeTypes.Items.Count,
-            len(self.fitting_type_items)
+            len(self.fitting_type_items),
+            len(NORMAL_FITTING_ROLES)
         ))
+        if NORMAL_FITTING_ROLES:
+            self.log(u"PartType đã nhận diện: {}".format(
+                u", ".join([fitting_role_display_name(r) for r in NORMAL_FITTING_ROLES])))
 
-    def choose_replacement_fitting_type(self, fitting, selected_items, selected_reducing_items):
-        """V5.2: choose exactly one configured symbol for the fitting PartType.
+    def choose_replacement_fitting_type(self, fitting, selected_items=None, selected_reducing_items=None):
+        """V5.6: resolve by either Auto Routing or V5.3-style manual selection."""
+        if self._is_manual_fitting_mode():
+            old_symbol = get_symbol_from_instance(fitting)
+            old_part_type = get_part_type(old_symbol)
+            role = fitting_role_from_part_type_value(old_part_type)
+            variable_size = fitting_has_variable_port_sizes(fitting)
+            size_text = fitting_size_profile_text(fitting)
+            allowed_roles = REDUCING_FITTING_ROLES if variable_size else NORMAL_FITTING_ROLES
+            source_label = u"Fitting giảm" if variable_size else u"Fitting thường"
+            if role not in allowed_roles:
+                raise Exception(
+                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.6"
+                    .format(part_type_enum_name(old_symbol)))
+            candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
+            same_role = []
+            for item in candidates:
+                try:
+                    if getattr(item, 'Role', u'') == role:
+                        same_role.append(item)
+                except Exception:
+                    pass
+            if len(same_role) == 0:
+                raise Exception(u"{} chưa chọn type PartType '{}'"
+                                .format(source_label, fitting_role_display_name(role)))
+            if len(same_role) > 1:
+                raise Exception(u"{} đang có {} type PartType '{}'; chỉ được chọn đúng 1"
+                                .format(source_label, len(same_role), fitting_role_display_name(role)))
+            chosen = same_role[0]
+            self.log(u"Fitting {}: MANUAL V5.6 -> {} {} chọn '{}'.{}"
+                     .format(self.id_value(fitting.Id), source_label,
+                             fitting_role_display_name(role), chosen.Name,
+                             u" Profile giảm {}".format(size_text) if variable_size else u""))
+            return chosen.Value
 
-        Normal fittings support Tee / Elbow / Transition / Cross.
-        Reducing fittings support Tee / Elbow / Transition.  There is never a
-        fallback to the first item of another PartType; doing so could recreate
-        a Tee as an Elbow or use the wrong reducing family.
-        """
-        old_symbol = get_symbol_from_instance(fitting)
-        old_part_type = get_part_type(old_symbol)
-        role = fitting_role_from_part_type_value(old_part_type)
-        variable_size = fitting_has_variable_port_sizes(fitting)
-        size_text = fitting_size_profile_text(fitting)
-
-        allowed_roles = REDUCING_FITTING_ROLES if variable_size else NORMAL_FITTING_ROLES
-        source_label = u"Fitting giảm" if variable_size else u"Fitting thường"
-        if role not in allowed_roles:
-            raise Exception(
-                u"PartType '{}' không nằm trong nhóm được cấu hình ở {} V5.2"
-                .format(part_type_enum_name(old_symbol), source_label))
-
-        candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
-        same_role = []
-        for item in candidates:
-            try:
-                if getattr(item, 'Role', u'') == role:
-                    same_role.append(item)
-            except Exception:
-                pass
-
-        if len(same_role) == 0:
-            raise Exception(u"{} chưa chọn type '{}'".format(source_label, role))
-        if len(same_role) > 1:
-            raise Exception(
-                u"{} đang có {} type '{}' được chọn; V5.2 chỉ cho phép đúng 1 type mỗi nhóm"
-                .format(source_label, len(same_role), role))
-
-        chosen = same_role[0]
-        if variable_size:
-            self.log(u"Fitting {}: size đầu nối KHÔNG BẰNG NHAU {} -> dùng {} {}: '{}'"
-                     .format(self.id_value(fitting.Id), size_text, source_label, role, chosen.Name))
-        return chosen.Value
-
+        selected_pipe = self.cmb_PipeTypes.SelectedItem
+        if not selected_pipe:
+            raise Exception(u"Chưa chọn Pipe Type mới")
+        pipe_type = doc.GetElement(selected_pipe.Value)
+        symbol, info = resolve_routing_symbol_for_fitting(pipe_type, fitting)
+        primary = info.get('primary_size_ft')
+        try:
+            primary_text = u"{:.1f} mm".format(float(primary) * 304.8) if primary is not None else u"?"
+        except Exception:
+            primary_text = u"?"
+        self.log(u"Fitting {}: AUTO ROUTING -> {} rule #{} [{}], Primary Size {}, chọn '{} : {}'."
+                 .format(self.id_value(fitting.Id), info.get('group_display', u"?"),
+                         info.get('rule_number', u"?"), info.get('range_text', u"?"),
+                         primary_text, get_real_family_name(symbol), get_real_name(symbol)))
+        if fitting_has_variable_port_sizes(fitting):
+            self.log(u"Fitting {}: profile giảm {} -> FamilySymbol lấy từ Routing Preferences; auto-size khôi phục từng connector."
+                     .format(self.id_value(fitting.Id), fitting_size_profile_text(fitting)))
+        return symbol.Id
 
     def create_replacement_fitting_from_partners(self, old_symbol, partner_connectors,
                                                  expected_port_count=None):
@@ -4536,6 +5329,246 @@ class ReplaceElementsWindow(forms.WPFWindow):
         raise Exception(u"Không xác định được cách recreate fitting PartType '{}' topology {} cổng với {} connector"
                         .format(part_type_enum_name(old_symbol), topology_count, count))
 
+    def _place_exact_fitting_symbol(self, desired_symbol, place_point, old_params):
+        """Place exactly the selected FamilySymbol and safely restore instance data."""
+        try:
+            if not desired_symbol.IsActive:
+                desired_symbol.Activate()
+                doc.Regenerate()
+        except Exception:
+            pass
+
+        created = None
+        placement_errors = []
+        try:
+            created = doc.Create.NewFamilyInstance(
+                place_point, desired_symbol, DB.Structure.StructuralType.NonStructural)
+        except Exception as ex:
+            placement_errors.append(safe_text(ex))
+
+        if created is None:
+            try:
+                lvl_id = nearest_level_id(place_point.Z)
+                lvl = doc.GetElement(lvl_id) if lvl_id else None
+                if lvl is not None:
+                    created = doc.Create.NewFamilyInstance(
+                        place_point, desired_symbol, lvl,
+                        DB.Structure.StructuralType.NonStructural)
+            except Exception as ex:
+                placement_errors.append(safe_text(ex))
+
+        if created is None:
+            raise Exception(u"Không thể đặt FamilySymbol trực tiếp: {}"
+                            .format(u" | ".join(placement_errors)))
+
+        created_id = created.Id
+        doc.Regenerate()
+        created = doc.GetElement(created_id)
+        if created is None:
+            raise Exception(u"Fitting mới không còn tồn tại sau placement")
+        if created.GetTypeId() != desired_symbol.Id:
+            actual = doc.GetElement(created.GetTypeId())
+            raise Exception(
+                u"NewFamilyInstance tự tạo type '{}' thay vì type yêu cầu '{}'; không gọi ChangeTypeId"
+                .format(get_real_name(actual), get_real_name(desired_symbol)))
+
+        skipped_identity = []
+        restored = restore_instance_parameters(
+            created, old_params, safe_cross_family=True, diagnostics=skipped_identity)
+        doc.Regenerate()
+        created = doc.GetElement(created_id)
+        if created is None:
+            raise Exception(u"Fitting mới không còn tồn tại sau restore parameter")
+        if created.GetTypeId() != desired_symbol.Id:
+            actual = doc.GetElement(created.GetTypeId())
+            raise Exception(
+                u"Safe restore làm đổi type '{}' khỏi type yêu cầu '{}'"
+                .format(get_real_name(actual), get_real_name(desired_symbol)))
+        return created, restored, skipped_identity
+
+    def create_direct_single_port_fitting(self, desired_symbol, old_port_records, old_params, links):
+        """V5.6 exact-symbol replacement for one-port Pipe Fittings (Cap/EndCap/etc.)."""
+        if len(old_port_records) != 1 or len(links) != 1:
+            raise Exception(u"Direct single-port cần đúng 1 connector và 1 kết nối thật")
+        old = old_port_records[0]
+        link = links[0]
+        partner = find_partner_connector(link)
+        if partner is None:
+            raise Exception(u"Không tìm được connector pipe đối tác cho fitting 1 cổng")
+        target_point = copy_xyz(partner.Origin)
+        if target_point is None:
+            target_point = copy_xyz(old.get('origin'))
+        if target_point is None:
+            raise Exception(u"Không xác định được điểm đặt fitting 1 cổng")
+
+        created, restored, skipped_identity = self._place_exact_fitting_symbol(
+            desired_symbol, target_point, old_params)
+        created_id = created.Id
+
+        size_ok, size_note = try_match_direct_fitting_size(created_id, old_port_records)
+        doc.Regenerate()
+        created = doc.GetElement(created_id)
+        ports = physical_connectors(created) if created is not None else []
+        if len(ports) != 1:
+            raise Exception(u"Fitting 1 cổng mới có {} connector vật lý".format(len(ports)))
+        fc = ports[0]
+        if not size_ok and not size_signatures_match(connector_size_signature(fc), old.get('size')):
+            raise Exception(u"Direct single-port: size connector không khớp sau auto-size | {}".format(size_note))
+
+        # A cap has only one axis, so roll around the pipe axis is irrelevant for
+        # a round pipe connector.  Align the connector BasisZ to face the live
+        # partner connector, then move origins together.
+        source_axis = connector_axis(fc)
+        partner_axis = connector_axis(partner)
+        target_axis = partner_axis.Multiply(-1.0) if partner_axis is not None else _safe_unit(old.get('axis'))
+        axis, angle = _rotation_axis_angle(source_axis, target_axis)
+        pivot = copy_xyz(fc.Origin)
+        if axis is not None and abs(angle) > 1.0e-10:
+            line = DB.Line.CreateBound(pivot, pivot + axis)
+            DB.ElementTransformUtils.RotateElement(doc, created_id, line, angle)
+            doc.Regenerate()
+
+        created = doc.GetElement(created_id)
+        ports = physical_connectors(created) if created is not None else []
+        if len(ports) != 1:
+            raise Exception(u"Không reacquire được connector fitting 1 cổng sau rotate")
+        fc = ports[0]
+        partner = find_partner_connector(link)
+        if partner is None:
+            raise Exception(u"Không reacquire được connector pipe sau rotate fitting 1 cổng")
+        move = partner.Origin - fc.Origin
+        if move.GetLength() > 1.0e-10:
+            DB.ElementTransformUtils.MoveElement(doc, created_id, move)
+            doc.Regenerate()
+
+        created = doc.GetElement(created_id)
+        ports = physical_connectors(created) if created is not None else []
+        if len(ports) != 1:
+            raise Exception(u"Không reacquire được connector fitting 1 cổng sau move")
+        fc = ports[0]
+        partner = find_partner_connector(link)
+        if partner is None:
+            raise Exception(u"Không reacquire được connector pipe trước ConnectTo")
+        if xyz_distance(fc.Origin, partner.Origin) > RECONNECT_TOLERANCE_FT:
+            raise Exception(u"Direct single-port: connector còn hở {:.6f} ft"
+                            .format(xyz_distance(fc.Origin, partner.Origin)))
+        if not connector_sizes_match(fc, partner):
+            raise Exception(u"Direct single-port: size connector không khớp pipe ID {}"
+                            .format(element_id_value(link['partner_owner_id'])))
+
+        if not connectors_are_connected(fc, partner):
+            fitting_target = copy_xyz(fc.Origin)
+            partner_target = copy_xyz(partner.Origin)
+            key = connector_identity_key(fc)
+            fax = copy_xyz(connector_axis(fc))
+            ok1, err1 = _try_connect_pair_once(
+                created_id, fitting_target, old, link['partner_owner_id'],
+                partner_target, fitting_first=True, fitting_key=key, fitting_axis=fax)
+            if not ok1:
+                ok2, err2 = _try_connect_pair_once(
+                    created_id, fitting_target, old, link['partner_owner_id'],
+                    partner_target, fitting_first=False, fitting_key=key, fitting_axis=fax)
+                if not ok2:
+                    raise Exception(u"Direct single-port ConnectTo thất bại: {} | {}"
+                                    .format(err1, err2))
+
+        created = doc.GetElement(created_id)
+        note = (u"direct-single-port; exact FamilySymbol '{}'; auto-size {}; nối 1/1; "
+                u"bỏ qua {} parameter identity/ElementId"
+                .format(get_real_name(desired_symbol), size_note, len(skipped_identity)))
+        return created, restored, note
+
+    def create_direct_linear_fitting(self, desired_symbol, old_port_records, old_params, links):
+        """V5.6 exact-symbol replacement for two-port collinear Pipe Fittings.
+
+        This covers specialized straight fittings (Union, PipeFlange,
+        PipeMechanicalCoupling and custom straight PartTypes) without asking
+        Routing Preferences to substitute another Family.
+        """
+        if len(old_port_records) != 2:
+            raise Exception(u"Direct-linear cần đúng 2 connector")
+        target_points, target_axes, target_sources = target_geometry_for_old_ports(old_port_records, links)
+        if len(target_points) != 2 or target_points[0] is None or target_points[1] is None:
+            raise Exception(u"Direct-linear không đọc được 2 điểm connector mục tiêu")
+        target_center = xyz_centroid(target_points)
+        if target_center is None:
+            raise Exception(u"Direct-linear không xác định được tâm mục tiêu")
+
+        created, restored, skipped_identity = self._place_exact_fitting_symbol(
+            desired_symbol, target_center, old_params)
+        created_id = created.Id
+        size_ok, size_note = try_match_direct_fitting_size(created_id, old_port_records)
+        doc.Regenerate()
+        created = doc.GetElement(created_id)
+        new_ports = physical_connectors(created) if created is not None else []
+        if len(new_ports) != 2:
+            raise Exception(u"Direct-linear: fitting mới có {} connector, cần 2".format(len(new_ports)))
+
+        # Choose the end mapping primarily by domain/shape/size.  Unequal-size
+        # reducers are therefore oriented to the correct pipe end automatically.
+        best_perm = None
+        best_score = None
+        for perm in ((0, 1), (1, 0)):
+            score = 0.0
+            for oi in range(2):
+                penalty, compatible, sok = _port_compatibility_penalty(new_ports[perm[oi]], old_port_records[oi])
+                score += penalty
+                if not compatible:
+                    score += 1.0e9
+                if not sok:
+                    score += 1.0e7
+            if best_score is None or score < best_score:
+                best_score = score
+                best_perm = perm
+        if best_perm is None:
+            raise Exception(u"Direct-linear: không map được 2 đầu connector")
+
+        p0 = copy_xyz(new_ports[best_perm[0]].Origin)
+        p1 = copy_xyz(new_ports[best_perm[1]].Origin)
+        source_center = xyz_centroid([p0, p1])
+        source_line = _safe_unit(p1 - p0)
+        target_line = _safe_unit(target_points[1] - target_points[0])
+        if source_center is None or source_line is None or target_line is None:
+            raise Exception(u"Direct-linear: không dựng được trục source/target")
+
+        axis, angle = _rotation_axis_angle(source_line, target_line)
+        if axis is not None and abs(angle) > 1.0e-10:
+            line = DB.Line.CreateBound(source_center, source_center + axis)
+            DB.ElementTransformUtils.RotateElement(doc, created_id, line, angle)
+            doc.Regenerate()
+        move = target_center - source_center
+        if move.GetLength() > 1.0e-10:
+            DB.ElementTransformUtils.MoveElement(doc, created_id, move)
+            doc.Regenerate()
+
+        created = doc.GetElement(created_id)
+        current_ports = physical_connectors(created) if created is not None else []
+        assignment = best_axis_line_assignment(current_ports, old_port_records, target_axes, target_points)
+        if assignment is None:
+            raise Exception(u"Direct-linear: không map được connector sau transform")
+        if not assignment.get('compatible', False):
+            raise Exception(u"Direct-linear: domain/shape không tương thích; {}"
+                            .format(axis_center_alignment_description(assignment)))
+        if not assignment.get('size_ok', False):
+            raise Exception(u"Direct-linear: size connector không khớp sau auto-size; {} | {}"
+                            .format(axis_center_alignment_description(assignment), size_note))
+        if assignment.get('max_line_offset', 1.0e30) > CENTERLINE_TOLERANCE_FT:
+            raise Exception(u"Direct-linear: connector mới lệch centerline; {}"
+                            .format(axis_center_alignment_description(assignment)))
+        if assignment.get('side_mismatches', 0) > 0:
+            raise Exception(u"Direct-linear: hai đầu fitting bị đảo phía; {}"
+                            .format(axis_center_alignment_description(assignment)))
+
+        connected, adjusted, max_adjust = connect_axis_aligned_fitting(
+            created, old_port_records, links, target_axes, assignment)
+        doc.Regenerate()
+        created = doc.GetElement(created_id)
+        note = (u"direct-linear; exact FamilySymbol '{}'; {}; trim/extend {} đầu ống "
+                u"(max {:.6f} ft); nối {}/{}; bỏ qua {} parameter identity/ElementId"
+                .format(get_real_name(desired_symbol), size_note, adjusted, max_adjust,
+                        connected, len(links), len(skipped_identity)))
+        return created, restored, note
+
     def create_direct_aligned_fitting(self, desired_symbol, old_port_records, old_params, links):
         """V4.8 exact-symbol placement by connector axes + virtual junction center.
 
@@ -4558,7 +5591,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             old_port_records, links)
         if not axes_have_nonparallel_pair(target_axes_pre):
             raise Exception(u"Direct-align V4.8: CENTERLINE pipe không có ít nhất một cặp không song song")
-        self.log(u"V5.2/Universal PIPE-center: {}".format(
+        self.log(u"V5.5/Universal PIPE-center: {}".format(
             target_pipe_geometry_description(old_port_records, links)))
         place_point = virtual_junction_center(target_points_pre, target_axes_pre)
         if place_point is None:
@@ -4827,27 +5860,40 @@ class ReplaceElementsWindow(forms.WPFWindow):
             create_note = u""
             direct_restored_pre = 0
 
-            # V4.8 IMPORTANT:
-            # For a cross-family fitting with non-parallel connector axes, do not rely on routing APIs.
-            # Place the exact selected FamilySymbol, align connector axes and the
-            # virtual junction center, then trim/extend only disconnected pipe ends.
-            use_direct_axis = (
-                total_port_count >= 3 or
-                (total_port_count == 2 and port_axes_have_nonparallel_pair(old_port_records))
-            )
-            if use_direct_axis:
-                self.log(u"{}: V5.2/Universal topology {} cổng có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
-                         .format(label, total_port_count, get_real_name(desired_symbol)))
-                # Temporary topology pipes are not needed for exact direct placement;
-                # remove any stubs created earlier before placing the exact family.
+            # V5.6 IMPORTANT: cross-family replacement always places the EXACT
+            # user-selected FamilySymbol.  Routing Preferences are not allowed to
+            # silently substitute another PartType/Family.  Dispatch by topology:
+            #   1 port  -> single-port exact placement (Cap/EndCap/etc.)
+            #   2 ports collinear -> direct-linear (Union/Flange/Coupling/etc.)
+            #   2 ports angled / 3+ ports -> existing axis-center solver
+            # This is what makes the expanded PartType UI actionable rather than
+            # only cosmetic.
+            use_direct_exact = total_port_count >= 1
+            if use_direct_exact:
                 if temp_records:
                     remove_temp_stubs(temp_records, None)
                     temp_records = []
                     temp_partner_connectors = []
                     doc.Regenerate()
-                created, direct_restored_pre, create_note = self.create_direct_aligned_fitting(
-                    desired_symbol, old_port_records, old_params, links)
-                create_mode = u"direct-align"
+
+                if total_port_count == 1:
+                    self.log(u"{}: V5.6 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
+                             .format(label, get_real_name(desired_symbol)))
+                    created, direct_restored_pre, create_note = self.create_direct_single_port_fitting(
+                        desired_symbol, old_port_records, old_params, links)
+                    create_mode = u"direct-single"
+                elif total_port_count == 2 and not port_axes_have_nonparallel_pair(old_port_records):
+                    self.log(u"{}: V5.6 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
+                             .format(label, get_real_name(desired_symbol)))
+                    created, direct_restored_pre, create_note = self.create_direct_linear_fitting(
+                        desired_symbol, old_port_records, old_params, links)
+                    create_mode = u"direct-linear"
+                else:
+                    self.log(u"{}: V5.6 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
+                             .format(label, total_port_count, get_real_name(desired_symbol)))
+                    created, direct_restored_pre, create_note = self.create_direct_aligned_fitting(
+                        desired_symbol, old_port_records, old_params, links)
+                    create_mode = u"direct-align"
             else:
                 created = self.create_replacement_fitting_from_partners(
                     old_symbol, all_partner_connectors, total_port_count)
@@ -4867,8 +5913,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
             selected_ids.update(self.selected_reducing_fitting_type_ids)
 
             if created_type_id != new_type_id:
-                if create_mode == u"direct-align":
-                    raise Exception(u"Direct-align tạo sai type '{}' thay vì type đã chọn '{}'"
+                if create_mode.startswith(u"direct"):
+                    raise Exception(u"Direct placement tạo sai type '{}' thay vì type đã chọn '{}'"
                                     .format(get_real_name(created_symbol), get_real_name(desired_symbol)))
                 if same_family_for_type_ids(created_type_id, new_type_id):
                     created.ChangeTypeId(new_type_id)
@@ -4883,7 +5929,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                         u"không dùng ChangeTypeId khác Family để tránh lỗi Revit"
                         .format(get_real_name(created_symbol)))
 
-            if create_mode == u"direct-align":
+            if create_mode.startswith(u"direct"):
                 # Already restored safely inside direct placement. Do not repeat the
                 # broad V3.4/V3.5 restore, which could write the old Family/Type ElementId.
                 restored = direct_restored_pre
@@ -5076,7 +6122,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if allow_force_reconnect and is_pipe_fitting(elem):
             try:
                 if not same_family_for_type_ids(elem.GetTypeId(), new_type_id):
-                    self.log(u"{}: V5.2/Universal phát hiện khác Family -> KHÔNG ChangeTypeId; chuyển sang recreate/direct-align.".format(label))
+                    self.log(u"{}: V5.5/Universal phát hiện khác Family -> KHÔNG ChangeTypeId; chuyển sang recreate/direct-align.".format(label))
                     return self.change_fitting_family_by_recreate(elem_id, new_type_id, label)
             except Exception as ex:
                 return False, u"{} | Không kiểm tra được Family cũ/mới: {}".format(label, safe_text(ex))
@@ -5154,7 +6200,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 selected_ids.add(chosen_by_role[role])
 
     def _selection_summary(self, selected_ids, roles):
-        parts = []
+        """Compact summary for a potentially large set of Pipe Fitting PartTypes."""
+        selected_roles = []
         for role in roles:
             found = False
             for item in self.fitting_type_items:
@@ -5164,14 +6211,25 @@ class ReplaceElementsWindow(forms.WPFWindow):
                         break
                 except Exception:
                     pass
-            parts.append(u"{} {}/1".format(role, 1 if found else 0))
-        return u" | ".join(parts)
+            if found:
+                selected_roles.append(fitting_role_display_name(role))
+        if selected_roles:
+            preview = u", ".join(selected_roles[:8])
+            if len(selected_roles) > 8:
+                preview += u", +{} nhóm".format(len(selected_roles) - 8)
+            return u"đã chọn {}/{} PartType: {}".format(len(selected_roles), len(roles), preview)
+        return u"đã chọn 0/{} PartType".format(len(roles))
 
     def refresh_fitting_list(self, filter_text=None):
-        """Normal list: Routing Preferences + only Tee/Elbow/Transition/Cross."""
+        """Normal list: every loaded OST_PipeFitting PartType, one type per PartType.
+
+        Symbols referenced by the selected PipeType Routing Preferences are
+        sorted first, but non-routing symbols remain selectable for exact-symbol
+        replacement of specialized/custom fittings.
+        """
         try:
             self._normalize_selected_ids(
-                self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=True)
+                self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=False)
             self._refreshing_fitting_list = True
             self.lst_FittingTypes.Items.Clear()
 
@@ -5182,11 +6240,22 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     item_id = self.id_value(item.Value)
                     if self._item_role(item) not in NORMAL_FITTING_ROLES:
                         continue
-                    if self.routing_fitting_type_ids is not None and item_id not in self.routing_fitting_type_ids:
-                        continue
                     available_items.append(item)
                 except Exception:
                     pass
+
+            role_rank = dict((r, i) for i, r in enumerate(NORMAL_FITTING_ROLES))
+            def _normal_item_sort_key(item):
+                try:
+                    iid = self.id_value(item.Value)
+                    in_routing = (self.routing_fitting_type_ids is not None and
+                                  iid in self.routing_fitting_type_ids)
+                    return (0 if in_routing else 1,
+                            role_rank.get(self._item_role(item), 99999),
+                            safe_text(item.Name).lower())
+                except Exception:
+                    return (1, 99999, safe_text(getattr(item, 'Name', u'')).lower())
+            available_items = sorted(available_items, key=_normal_item_sort_key)
 
             visible_count = 0
             for item in available_items:
@@ -5212,7 +6281,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.log(u"Lỗi filter Fitting thường: {}".format(safe_text(ex)))
 
     def fitting_selection_changed(self, sender, args):
-        """V5.2: selecting a second type in the same normal role replaces the first."""
+        """V5.6: selecting a second type in the same normal role replaces the first."""
         if self._refreshing_fitting_list:
             return
         try:
@@ -5230,12 +6299,10 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
     def get_selected_fitting_items(self):
         self._normalize_selected_ids(
-            self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=True)
+            self.selected_fitting_type_ids, NORMAL_FITTING_ROLES, require_routing=False)
         return [item for item in self.fitting_type_items
                 if self.id_value(item.Value) in self.selected_fitting_type_ids
-                and self._item_role(item) in NORMAL_FITTING_ROLES
-                and (self.routing_fitting_type_ids is None
-                     or self.id_value(item.Value) in self.routing_fitting_type_ids)]
+                and self._item_role(item) in NORMAL_FITTING_ROLES]
 
     def filter_fittings_text_changed(self, sender, args):
         try:
@@ -5259,7 +6326,12 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.log(u"Không thể bỏ chọn Fitting thường: {}".format(safe_text(ex)))
 
     def refresh_reducing_fitting_list(self, filter_text=None):
-        """Reducing list: all loaded symbols, but only Tee/Elbow/Transition."""
+        """Reducing list: every loaded OST_PipeFitting PartType.
+
+        The old instance decides whether the reducing list is needed by checking
+        its live connector-size profile; one-port PartTypes are never classified
+        as reducing because they cannot have unequal port sizes.
+        """
         try:
             self._normalize_selected_ids(
                 self.selected_reducing_fitting_type_ids, REDUCING_FITTING_ROLES, require_routing=False)
@@ -5293,7 +6365,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.log(u"Lỗi filter Fitting giảm: {}".format(safe_text(ex)))
 
     def reducing_fitting_selection_changed(self, sender, args):
-        """V5.2: selecting a second reducing type in one role replaces the first."""
+        """V5.6: selecting a second reducing type in one role replaces the first."""
         if self._refreshing_reducing_fitting_list:
             return
         try:
@@ -5375,24 +6447,23 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 pass
 
         if unsupported:
-            return False, (u"Selection có fitting ngoài 7 nhóm V5.2 hỗ trợ: {}. "
-                           u"Fitting thường chỉ hỗ trợ Tee/Elbow/Transition/Cross; "
-                           u"Fitting giảm chỉ hỗ trợ Tee/Elbow/Transition."
+            return False, (u"Selection có fitting với PartType không có FamilySymbol tương ứng "
+                           u"được load trong project: {}. Hãy load/chọn một type cùng PartType."
                            .format(u"; ".join(unsupported[:8])))
 
         problems = []
         for role in NORMAL_FITTING_ROLES:
             count = len(normal_by_role.get(role, []))
             if count > 1:
-                problems.append(u"Fitting thường {} đang chọn {} type (chỉ được 1)".format(role, count))
+                problems.append(u"Fitting thường {} đang chọn {} type (chỉ được 1)".format(fitting_role_display_name(role), count))
             if role in needed_normal and count != 1:
-                problems.append(u"Fitting thường {} cần đúng 1 type, hiện có {}".format(role, count))
+                problems.append(u"Fitting thường {} cần đúng 1 type, hiện có {}".format(fitting_role_display_name(role), count))
         for role in REDUCING_FITTING_ROLES:
             count = len(reducing_by_role.get(role, []))
             if count > 1:
-                problems.append(u"Fitting giảm {} đang chọn {} type (chỉ được 1)".format(role, count))
+                problems.append(u"Fitting giảm {} đang chọn {} type (chỉ được 1)".format(fitting_role_display_name(role), count))
             if role in needed_reducing and count != 1:
-                problems.append(u"Fitting giảm {} cần đúng 1 type, hiện có {}".format(role, count))
+                problems.append(u"Fitting giảm {} cần đúng 1 type, hiện có {}".format(fitting_role_display_name(role), count))
 
         if problems:
             return False, u"; ".join(problems)
@@ -5422,8 +6493,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if not selected_pipe_type:
             forms.alert(u"Vui lòng chọn Pipe Type mới.", title="Thiếu dữ liệu")
             return
-        if overwrite_fittings and not selected_fitting_items and not selected_reducing_fitting_items:
-            forms.alert(u"Vui lòng chọn type cần dùng trong các nhóm Fitting thường/Fitting giảm. Mỗi nhóm PartType chỉ được chọn 1 type.", title="Thiếu dữ liệu")
+
+        min_pipe_size_ft, max_pipe_size_ft = self._current_pipe_size_range()
+        if min_pipe_size_ft is None or max_pipe_size_ft is None:
+            forms.alert(u"Model không có Pipe size hợp lệ để xác định Min/Max.", title="Thiếu Pipe Size")
+            return
+        if min_pipe_size_ft > max_pipe_size_ft:
+            forms.alert(u"Pipe Size Min không được lớn hơn Pipe Size Max.", title="Range không hợp lệ")
             return
 
         system_type_id = selected_system.Value
@@ -5437,34 +6513,87 @@ class ReplaceElementsWindow(forms.WPFWindow):
         scope_name = u"các đối tượng đã chọn trước khi mở tool"
         self.log(u"Bắt đầu xử lý System Type: {}".format(system_name))
         self.log(u"Phạm vi xử lý: {}.".format(scope_name))
+        self.log(u"Giới hạn Pipe Size V5.6: {} <= Size <= {}.".format(
+            format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
         pipes, fittings = collect_pipes_and_fittings(True, self.preselected_element_ids)
         if selected_only and not pipes and not fittings:
             forms.alert(u"Các đối tượng đã chọn trước khi mở tool không còn hợp lệ. Hãy đóng tool, chọn lại Pipe/Fitting rồi chạy lệnh lại.", title="Không có đối tượng hợp lệ")
             return
 
-        target_pipes = [p for p in pipes if same_element_id(get_system_type_id(p), system_type_id)] if overwrite_pipes else []
-        target_fittings = [f for f in fittings if same_element_id(get_system_type_id(f), system_type_id)] if overwrite_fittings else []
+        system_pipes = [p for p in pipes if same_element_id(get_system_type_id(p), system_type_id)] if overwrite_pipes else []
+        system_fittings = [f for f in fittings if same_element_id(get_system_type_id(f), system_type_id)] if overwrite_fittings else []
+
+        # V5.6: range is inclusive and uses the EXISTING size before any type
+        # replacement.  A fitting is treated atomically: every physical port must
+        # fit inside the selected range, otherwise the whole fitting is skipped.
+        target_pipes = []
+        range_skipped_lines = []
+        for p in system_pipes:
+            try:
+                pipe_id_value = self.id_value(p.Id)
+                diameter = get_pipe_diameter_ft(p)
+                if diameter is not None and pipe_size_in_range(
+                        p, min_pipe_size_ft, max_pipe_size_ft):
+                    target_pipes.append(p)
+                else:
+                    range_skipped_lines.append(
+                        u"Pipe ID {}: Bỏ qua do Size {} nằm ngoài range {} -> {}"
+                        .format(pipe_id_value, format_pipe_size(diameter),
+                                format_pipe_size(min_pipe_size_ft),
+                                format_pipe_size(max_pipe_size_ft)))
+            except Exception as ex:
+                range_skipped_lines.append(
+                    u"Pipe: Bỏ qua do không đọc được Size để kiểm tra range: {}".format(safe_text(ex)))
+
+        target_fittings = []
+        for f in system_fittings:
+            try:
+                fitting_id_value = self.id_value(f.Id)
+                in_range, port_sizes = fitting_size_in_range(
+                    f, min_pipe_size_ft, max_pipe_size_ft)
+                if in_range:
+                    target_fittings.append(f)
+                else:
+                    profile = u", ".join([format_pipe_size(x) for x in port_sizes]) if port_sizes else u"không đọc được"
+                    range_skipped_lines.append(
+                        u"Fitting ID {}: Bỏ qua do port size [{}] không nằm hoàn toàn trong range {} -> {}"
+                        .format(fitting_id_value, profile,
+                                format_pipe_size(min_pipe_size_ft),
+                                format_pipe_size(max_pipe_size_ft)))
+            except Exception as ex:
+                range_skipped_lines.append(
+                    u"Fitting: Bỏ qua do không đọc được port size để kiểm tra range: {}".format(safe_text(ex)))
+
         if not target_pipes and not target_fittings:
-            forms.alert(u"Không tìm thấy Pipe/Fitting phù hợp với System Type và phạm vi đã chọn.", title="Không có phần tử")
+            self.log(u"Không có Pipe/Fitting nào trong System Type đã chọn nằm trong Pipe Size range hiện tại.")
+            if range_skipped_lines:
+                self.log(u"--- BỎ QUA DO SIZE RANGE ({}) ---".format(len(range_skipped_lines)))
+                for line in range_skipped_lines:
+                    self.log(line)
             return
 
-        if overwrite_fittings:
-            # V5.2: every supported PartType has exactly one deterministic UI
-            # slot. Validate all required normal/reducing roles before opening
-            # the destructive transaction.
-            fit_ok, fit_msg = self._validate_fitting_type_selection(
+        # V5.6 manual mode must have exactly one selected FamilySymbol for every
+        # PartType that will actually be processed in this range. Validate before
+        # opening the main Transaction so the model cannot be changed partially.
+        if overwrite_fittings and self._is_manual_fitting_mode() and target_fittings:
+            valid_manual, manual_problem = self._validate_fitting_type_selection(
                 target_fittings, selected_fitting_items, selected_reducing_fitting_items)
-            if not fit_ok:
-                forms.alert(fit_msg, title="Kiểm tra Fitting Type")
-                self.log(fit_msg)
+            if not valid_manual:
+                self.log(u"CHẾ ĐỘ THỦ CÔNG - thiếu/không hợp lệ Fitting Type: {}".format(manual_problem))
+                forms.alert(
+                    u"Chế độ Chọn Fitting thủ công chưa đủ type cho batch hiện tại:\n\n{}".format(manual_problem),
+                    title="Thiếu Fitting Type")
                 return
 
-        changed, skipped, failed = 0, 0, []
+        self.log(u"Chế độ Fitting: {}.".format(
+            u"CHỌN THỦ CÔNG như V5.3" if self._is_manual_fitting_mode() else u"AUTO ROUTING PREFERENCES"))
+
+        changed, skipped, failed = 0, len(range_skipped_lines), []
         forced_reconnected = 0
         # V4.9: keep a complete audit trail in the on-screen log.  No final
         # result popup is shown after a committed batch.
         success_lines = []
-        skipped_lines = []
+        skipped_lines = list(range_skipped_lines)
         tx = DB.Transaction(doc, u"Replace Pipes and Fittings - Skip Failed")
         try:
             tx.Start()
@@ -5548,6 +6677,10 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self.log(u"============================================================")
         self.log(u"KẾT QUẢ XỬ LÝ - System Type: {}".format(system_name))
         self.log(u"Phạm vi: {}".format(scope_name))
+        self.log(u"Chế độ Fitting: {}".format(
+            u"CHỌN THỦ CÔNG như V5.3" if self._is_manual_fitting_mode() else u"AUTO ROUTING PREFERENCES"))
+        self.log(u"Pipe Size range: {} -> {} (inclusive)".format(
+            format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
         self.log(u"Thành công: {} | Fallback/recreate: {} | Bỏ qua không lỗi: {} | Bỏ qua do lỗi: {} | Tổng không thay đổi: {}".format(
             changed, forced_reconnected, len(skipped_lines), len(failed), skipped))
 
@@ -5600,7 +6733,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
 
 # ============================================================
-# Entry point - require preselection before opening UI (V5.2 Universal / Revit 2025-2026)
+# Entry point - require preselection before opening UI (V5.6 Universal / Revit 2025-2026)
 # ============================================================
 
 script_dir = os.path.dirname(__file__)
@@ -5661,5 +6794,5 @@ else:
             win.show_dialog()
         except Exception as ex:
             forms.alert(
-                u"Không thể mở UI V5.2 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
+                u"Không thể mở UI V5.6 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
                 title="Correct Pipes & Fittings")
