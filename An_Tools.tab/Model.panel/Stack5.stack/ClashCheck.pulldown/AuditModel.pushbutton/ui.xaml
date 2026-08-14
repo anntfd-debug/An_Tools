@@ -1,0 +1,154 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Linked Clash Checker V2.6"
+        Width="740" Height="920"
+        MinWidth="700" MinHeight="760"
+        WindowStartupLocation="CenterScreen"
+        ResizeMode="CanResize">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="18">
+
+            <Border BorderBrush="#4472C4" BorderThickness="2" CornerRadius="6"
+                    Background="#DDEBF7" Padding="10" Margin="0,0,0,12">
+                <StackPanel>
+                    <TextBlock Text="V2.6 - GROUPED CLASH + LINKED ZOOM"
+                               FontSize="20" FontWeight="Bold" Foreground="#203864"/>
+                    <TextBlock Text="Scope phải hiển thị: Entire Model / Active View. Inspection Mode nằm ngay bên dưới."
+                               Margin="0,3,0,0" FontWeight="SemiBold" TextWrapping="Wrap"/>
+                </StackPanel>
+            </Border>
+
+            <StackPanel Margin="0,0,0,12">
+                <TextBlock Text="MEP HOST  ×  LINKED MODEL"
+                           FontSize="18" FontWeight="Bold"/>
+                <TextBlock Text="Clash Check hoặc Inspection Mode để chọn / zoom một nhóm đối tượng."
+                           Margin="0,4,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+
+            <!-- EXPLICIT INSPECTION MODE -->
+            <Border BorderBrush="#C65911" BorderThickness="2" CornerRadius="6"
+                    Padding="12" Margin="0,0,0,12" Background="#FFF4EA">
+                <StackPanel>
+                    <TextBlock Text="INSPECTION MODE - SELECT / ZOOM"
+                               FontSize="17" FontWeight="Bold" Foreground="#9E480E"/>
+                    <TextBlock x:Name="tb_ui_version"
+                               Text="UI V2.6 - Grouped Clash + Linked Zoom ready"
+                               Margin="0,2,0,8" FontWeight="SemiBold" Foreground="#9E480E"/>
+
+                    <CheckBox x:Name="cb_inspection_mode"
+                              Content="Bật Inspection Mode (không chạy clash)"
+                              FontSize="14" FontWeight="Bold" Margin="0,3,0,8"/>
+
+                    <StackPanel x:Name="sp_inspection_options" Margin="22,0,0,0" Visibility="Collapsed">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Grid.Column="0" Text="Đối tượng cần chọn:" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                            <ComboBox x:Name="cb_inspection_category" Grid.Column="1" Width="330"
+                                      HorizontalAlignment="Left" Margin="10,0,0,0">
+                                <ComboBoxItem Content="Pipe" Tag="pipe"/>
+                                <ComboBoxItem Content="Pipe Accessories" Tag="accessory"/>
+                                <ComboBoxItem Content="Pipe Fittings" Tag="fitting"/>
+                                <ComboBoxItem Content="Room" Tag="room"/>
+                                <ComboBoxItem Content="Structural Framing" Tag="beam"/>
+                                <ComboBoxItem Content="Structural Column" Tag="column"/>
+                                <ComboBoxItem Content="Fire Rated Wall" Tag="firewall"/>
+                            </ComboBox>
+                        </Grid>
+                        <TextBlock Margin="0,8,0,0" Foreground="#666666" TextWrapping="Wrap"
+                                   Text="Khi bật Inspection Mode, RUN CHECK đổi thành SELECT / ZOOM. Tool chỉ tìm, chọn và zoom loại đối tượng ở danh sách trên; không thực hiện clash check."/>
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+
+            <GroupBox Header="1. PHẠM VI" Margin="0,0,0,10">
+                <StackPanel Margin="10">
+                    <RadioButton x:Name="rb_scope_model" GroupName="scope"
+                                 Content="Entire Model - quét toàn bộ model" Margin="0,2,0,4"/>
+                    <RadioButton x:Name="rb_scope_view" GroupName="scope"
+                                 Content="Active View - chỉ phạm vi view hiện hành" Margin="0,2,0,4"/>
+                    <TextBlock x:Name="tb_active_view" Margin="18,3,0,0"
+                               Foreground="Gray" TextWrapping="Wrap"/>
+                </StackPanel>
+            </GroupBox>
+
+            <GroupBox Header="2. ĐỐI TƯỢNG MEP TRONG HOST - CLASH MODE" Margin="0,0,0,10">
+                <StackPanel Margin="10">
+                    <CheckBox x:Name="cb_host_all" Content="Chọn tất cả MEP" FontWeight="Bold" Margin="0,0,0,7"/>
+                    <CheckBox x:Name="cb_pipe" Content="Pipe" Margin="14,2,0,2"/>
+                    <CheckBox x:Name="cb_accessory" Content="Pipe Accessories" Margin="14,2,0,2"/>
+                    <CheckBox x:Name="cb_fitting" Content="Pipe Fittings" Margin="14,2,0,2"/>
+                </StackPanel>
+            </GroupBox>
+
+            <GroupBox Header="3. ĐỐI TƯỢNG TRONG LINK - CLASH MODE" Margin="0,0,0,10">
+                <StackPanel Margin="10">
+                    <CheckBox x:Name="cb_target_all" Content="Chọn tất cả Linked Targets" FontWeight="Bold" Margin="0,0,0,7"/>
+                    <CheckBox x:Name="cb_room" Content="Room Name" Margin="14,2,0,2"/>
+                    <CheckBox x:Name="cb_beam" Content="Structural Framing (Beam / Brace)" Margin="14,2,0,2"/>
+                    <CheckBox x:Name="cb_column" Content="Structural Column" Margin="14,2,0,2"/>
+                    <CheckBox x:Name="cb_firewall" Content="Fire Rated Wall" Margin="14,2,0,2"/>
+
+                    <TextBlock Text="Room Name keywords:" Margin="14,12,0,3" FontWeight="SemiBold"/>
+                    <TextBox x:Name="tb_keywords" Margin="14,0,0,0" MinHeight="58"
+                             AcceptsReturn="True" TextWrapping="Wrap"
+                             VerticalScrollBarVisibility="Auto"/>
+                    <TextBlock Margin="14,4,0,0" Foreground="Gray" TextWrapping="Wrap"
+                               Text="Nhiều từ khóa: ngăn cách bằng dấu phẩy, dấu chấm phẩy, | hoặc xuống dòng. Có fuzzy matching."/>
+                </StackPanel>
+            </GroupBox>
+
+            <GroupBox Header="4. GIẢ LẬP NỚI CAO ROOM - CLASH MODE" Margin="0,0,0,10">
+                <StackPanel Margin="10">
+                    <CheckBox x:Name="cb_extend_room"
+                              Content="Nới Room check-volume lên phía trên (chỉ tính toán, KHÔNG sửa Room thật)"
+                              FontWeight="Bold"/>
+                    <RadioButton x:Name="rb_manual" GroupName="roomExt" Margin="16,9,0,0"
+                                 Content="Manual - nới thêm theo offset (mm)"/>
+                    <RadioButton x:Name="rb_auto" GroupName="roomExt" Margin="16,6,0,0"
+                                 Content="Auto - tới đáy Floor gần nhất phía trên trong cùng Architecture Link"/>
+                    <StackPanel Orientation="Horizontal" Margin="32,9,0,0">
+                        <TextBlock Text="Offset / Auto fallback (mm):" VerticalAlignment="Center"/>
+                        <TextBox x:Name="tb_offset_mm" Width="90" Margin="10,0,0,0"/>
+                    </StackPanel>
+                    <TextBlock Margin="16,7,0,0" Foreground="Gray" TextWrapping="Wrap"
+                               Text="Auto dùng đáy bounding box của Floor gần nhất phía trên có vùng XY chồng với Room. Nếu không tìm thấy Floor, tool dùng offset fallback."/>
+                </StackPanel>
+            </GroupBox>
+
+            <GroupBox Header="5. ZOOM LINKED TARGET SAU CLASH" Margin="0,0,0,10">
+                <StackPanel Margin="10">
+                    <CheckBox x:Name="cb_zoom_linked_after_clash"
+                              Content="Sau RUN CHECK: Select + Zoom các Room / Beam / Column / Fire Wall thực sự có clash"
+                              FontWeight="Bold"/>
+                    <TextBlock Margin="16,6,0,0" Foreground="Gray" TextWrapping="Wrap"
+                               Text="Chỉ áp dụng Clash Mode. Tool dùng linked Reference để select đối tượng trong Revit Link và zoom bounding box đã transform về host. Nếu tắt, output host vẫn clickable như trước."/>
+                </StackPanel>
+            </GroupBox>
+
+            <GroupBox Header="LINK ĐANG DÙNG" Margin="0,0,0,12">
+                <StackPanel Margin="10">
+                    <TextBlock Text="Architecture / Room + Fire Wall:" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="tb_arch_links" Margin="12,2,0,6" TextWrapping="Wrap"/>
+                    <TextBlock Text="Structure:" FontWeight="SemiBold"/>
+                    <TextBlock x:Name="tb_struct_links" Margin="12,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
+            </GroupBox>
+
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" VerticalAlignment="Center" Foreground="Gray"
+                           Text="Read-only - không tạo Transaction."/>
+                <Button x:Name="btn_cancel" Grid.Column="1" Content="Cancel" Width="90" Height="34" Margin="8,0,0,0"/>
+                <Button x:Name="btn_run" Grid.Column="2" Content="RUN CHECK" Width="145" Height="34" Margin="8,0,0,0" FontWeight="Bold"/>
+            </Grid>
+
+        </StackPanel>
+    </ScrollViewer>
+</Window>

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__ = "Correct Pipes & Fittings"
-__doc__ = "V5.7 Universal / Revit 2025-2026: Dual Mode + Size Range + Full Pipe Fitting FamilySymbol Scan."
+__doc__ = "V5.8.3 Universal / Revit 2025-2026: Transition uses native Revit ChangeTypeId without rotate/recreate; Option 2 uses only fitting types already loaded in the project."
 
 import os
 import traceback
@@ -291,7 +291,7 @@ def get_system_type_name_by_id(system_type_id):
 def get_part_type(family_symbol):
     """Return DB.PartType integer for a loaded MEP FamilySymbol.
 
-    V5.7 is deliberately defensive here.  Most Pipe Fitting content exposes
+    V5.8 is deliberately defensive here.  Most Pipe Fitting content exposes
     FAMILY_CONTENT_PART_TYPE on the Family object, but project/custom content
     can expose the built-in parameter on the symbol instead.  Reading both
     prevents valid loaded fitting types from disappearing from the manual list.
@@ -375,7 +375,7 @@ def _family_is_pipe_fitting_family(family):
 
 
 def collect_all_pipe_fitting_symbols(instance_fittings=None, routing_symbol_ids=None):
-    """V5.7 robust project-wide scan for every loaded Pipe Fitting FamilySymbol.
+    """V5.8 robust project-wide scan for every loaded Pipe Fitting FamilySymbol.
 
     A single OfCategory(OST_PipeFitting) collector is normally sufficient, but
     some custom/project content can be missed when the symbol Category is not
@@ -398,6 +398,7 @@ def collect_all_pipe_fitting_symbols(instance_fittings=None, routing_symbol_ids=
         'instance_type': 0,
         'routing_reference': 0,
         'family_enumeration': 0,
+        'all_element_types': 0,
     }
 
     def _add(symbol, source, force=False):
@@ -460,6 +461,25 @@ def collect_all_pipe_fitting_symbols(instance_fittings=None, routing_symbol_ids=
                 for sid in family.GetFamilySymbolIds():
                     symbol = doc.GetElement(sid)
                     _add(symbol, 'family_enumeration', force=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 3c. Last-resort scan across every ElementType. This is intentionally
+    # broader than OfClass(FamilySymbol) and is only accepted when the element
+    # resolves to a FamilySymbol whose own Category OR parent FamilyCategory is
+    # Pipe Fittings. It helps with unusual/custom content metadata.
+    try:
+        all_element_types = list(DB.FilteredElementCollector(doc)
+                                 .WhereElementIsElementType()
+                                 .ToElements())
+        for et in all_element_types:
+            try:
+                if isinstance(et, DB.FamilySymbol):
+                    if (category_is(et, DB.BuiltInCategory.OST_PipeFitting) or
+                            _family_is_pipe_fitting_family(et.Family)):
+                        _add(et, 'all_element_types', force=True)
             except Exception:
                 pass
     except Exception:
@@ -1908,7 +1928,7 @@ def part_type_enum_name(family_symbol):
     return safe_text(value)
 
 
-# V5.7: PartType is no longer hard-coded to Tee/Elbow/Transition/Cross.
+# V5.8: PartType is no longer hard-coded to Tee/Elbow/Transition/Cross.
 # The actual roles are discovered from ALL FamilySymbol elements in the
 # OST_PipeFitting category that are loaded in the current project.  This makes
 # the tool future-safe for Revit 2025/2026 content such as Wye, LateralTee,
@@ -1933,7 +1953,7 @@ PIPE_FITTING_PARTTYPE_PREFERRED_ORDER = (
 def fitting_role_from_part_type_value(value):
     """Return the exact Revit DB.PartType enum name for any Pipe Fitting type.
 
-    V5.7 deliberately does not maintain a short allow-list.  If unusual custom
+    V5.8 deliberately does not maintain a short allow-list.  If unusual custom
     content does not expose FAMILY_CONTENT_PART_TYPE, keep it visible under the
     deterministic 'Undefined' role instead of silently dropping it from UI.
     """
@@ -1984,7 +2004,7 @@ def sort_pipe_fitting_roles(roles):
 
 
 # ============================================================
-# V5.7 - Automatic Routing Preferences resolver
+# V5.8 - Automatic Routing Preferences resolver
 # ============================================================
 
 ROUTING_FITTING_GROUP_NAMES = (
@@ -2266,7 +2286,7 @@ def resolve_routing_symbol_for_fitting(pipe_type, fitting):
     """Return (FamilySymbol, info dict) using selected PipeType Routing Preferences.
 
     Revit evaluates routing rules by group, size criterion, then priority/order.
-    V5.7 mirrors that behavior and returns the first valid rule that satisfies the
+    V5.8 mirrors that behavior and returns the first valid rule that satisfies the
     existing fitting's primary run size.
     """
     if pipe_type is None:
@@ -2333,7 +2353,7 @@ def resolve_routing_symbol_for_fitting(pipe_type, fitting):
 
 
 def routing_preferences_summary(pipe_type):
-    """Human-readable summary shown in the V5.7 UI."""
+    """Human-readable summary shown in the V5.8 UI."""
     if pipe_type is None:
         return u"Chưa chọn Pipe Type."
     lines = [u"Pipe Type: {}".format(get_real_name(pipe_type))]
@@ -3476,12 +3496,15 @@ def try_match_direct_fitting_size(created_id, old_records):
     raw_candidates = _collect_size_driver_candidates(current, max_items=10)
 
     if not raw_candidates:
+        type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+        if type_ok:
+            return True, type_note
         current = doc.GetElement(created_id)
         current_sizes = [connector_size_signature(c) for c in physical_connectors(current)]
         return False, (u"không tìm được instance parameter Diameter/Radius/Size có thể ghi; "
-                       u"target radius {:.6f} ft; size hiện tại {}; double params [{}]"
+                       u"target radius {:.6f} ft; size hiện tại {}; double params [{}] | {}"
                        .format(target_radius, safe_text(current_sizes),
-                               writable_double_parameter_diagnostics(current)))
+                               writable_double_parameter_diagnostics(current), type_note))
 
     # Probe each parameter/value independently. The score is useful even when a
     # single parameter does not solve all ports; on a Tee it often reveals e.g.
@@ -3558,10 +3581,13 @@ def try_match_direct_fitting_size(created_id, old_records):
     for r in probes:
         probe_text.append(u"{}->{}/{} @ {:.6f}".format(
             r.get('name', u'?'), r.get('matched', 0), r.get('total', 0), r.get('value', 0.0)))
-    return False, (u"auto-size V4.8 không giải được đồng thời tất cả connector; "
-                   u"target radius {:.6f} ft; size hiện tại {}; probe [{}]; double params [{}]"
+    type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+    if type_ok:
+        return True, type_note
+    return False, (u"auto-size V5.8.3 không giải được đồng thời tất cả connector bằng instance parameter; "
+                   u"target radius {:.6f} ft; size hiện tại {}; probe [{}]; double params [{}] | {}"
                    .format(target_radius, safe_text(current_sizes), u"; ".join(probe_text),
-                           writable_double_parameter_diagnostics(current)))
+                           writable_double_parameter_diagnostics(current), type_note))
 
 
 
@@ -3620,6 +3646,279 @@ def _radius_multiset_matches(actual_radii, target_radii):
     matched, total = _count_radius_multiset_matches(actual_radii, target_radii)
     return bool(total > 0 and actual_radii is not None and
                 len(actual_radii) == len(target_radii) and matched == total)
+
+
+
+def _fitting_size_profile_label(target_radii):
+    """Compact deterministic label such as DN25x40 for generated types."""
+    vals = []
+    for r in sorted([float(x) for x in list(target_radii or [])]):
+        mm = r * 2.0 * 304.8
+        if abs(mm - round(mm)) <= 0.02:
+            text = u"{}".format(int(round(mm)))
+        else:
+            text = u"{:.1f}".format(mm).replace(u'.', u'_')
+        if text not in vals:
+            vals.append(text)
+    return u"DN" + u"x".join(vals) if vals else u"SIZE"
+
+
+def _safe_generated_type_name(base_name, target_radii, created_id_value):
+    """Build a legal unique ElementType name for a temporary/generated size type."""
+    bad = u'{}[]|;<>?`~'
+    base = safe_text(base_name) or u'Fitting'
+    for ch in bad:
+        base = base.replace(ch, u'_')
+    base = base.strip()
+    if len(base) > 80:
+        base = base[:80]
+    return u"{}__AnTools_{}_{}".format(
+        base, _fitting_size_profile_label(target_radii), safe_text(created_id_value))
+
+
+def _same_family_symbols(symbol):
+    result = []
+    if symbol is None:
+        return result
+    try:
+        fam = symbol.Family
+        ids = list(fam.GetFamilySymbolIds()) if fam else []
+    except Exception:
+        ids = []
+    for eid in ids:
+        try:
+            fs = doc.GetElement(eid)
+            if isinstance(fs, DB.FamilySymbol):
+                result.append(fs)
+        except Exception:
+            pass
+    result.sort(key=lambda x: get_real_name(x).lower())
+    return result
+
+
+def _assign_instance_symbol_same_family(elem, symbol):
+    """Assign a FamilySymbol from the same Family without cross-family ChangeTypeId."""
+    if elem is None or symbol is None:
+        raise Exception(u'Thiếu instance hoặc FamilySymbol')
+    try:
+        if not symbol.IsActive:
+            symbol.Activate()
+            doc.Regenerate()
+    except Exception:
+        pass
+    try:
+        elem.Symbol = symbol
+        return
+    except Exception:
+        pass
+    # Same-family ChangeTypeId is safe and avoids the cross-family MEP warning.
+    elem.ChangeTypeId(symbol.Id)
+
+
+def _trial_existing_family_symbol_profile(created_id, symbol, target_radii, commit_if_match=False):
+    st = DB.SubTransaction(doc)
+    started = False
+    try:
+        st.Start()
+        started = True
+        elem = doc.GetElement(created_id)
+        if elem is None:
+            st.RollBack()
+            return False, None, u'fitting mới không tồn tại'
+        _assign_instance_symbol_same_family(elem, symbol)
+        doc.Regenerate()
+        elem = doc.GetElement(created_id)
+        actual = _round_port_radii(elem)
+        ok = _radius_multiset_matches(actual, target_radii)
+        if ok and commit_if_match:
+            st.Commit()
+        else:
+            st.RollBack()
+        return ok, actual, u''
+    except Exception as ex:
+        if started:
+            try:
+                st.RollBack()
+            except Exception:
+                pass
+        return False, None, safe_text(ex)
+
+
+def _trial_duplicate_symbol_profile(created_id, assignments, target_radii, duplicate_name,
+                                    commit_if_match=False):
+    """Duplicate the selected type, change TYPE parameters, then test connector sizes.
+
+    Failed trials are rolled back completely.  A successful trial commits the
+    duplicate type, so existing instances of the user's original type are never resized.
+    """
+    st = DB.SubTransaction(doc)
+    started = False
+    try:
+        st.Start()
+        started = True
+        elem = doc.GetElement(created_id)
+        if elem is None:
+            st.RollBack()
+            return False, None, 0, u'fitting mới không tồn tại', None
+        base_symbol = get_symbol_from_instance(elem)
+        if base_symbol is None or not isinstance(base_symbol, DB.FamilySymbol):
+            st.RollBack()
+            return False, None, 0, u'không đọc được FamilySymbol hiện tại', None
+
+        dup = base_symbol.Duplicate(duplicate_name)
+        try:
+            dup_symbol = dup if isinstance(dup, DB.FamilySymbol) else doc.GetElement(dup.Id)
+        except Exception:
+            dup_symbol = None
+        if dup_symbol is None or not isinstance(dup_symbol, DB.FamilySymbol):
+            st.RollBack()
+            return False, None, 0, u'Duplicate không trả về FamilySymbol', None
+
+        set_count = 0
+        for pid_value, pname, value in assignments:
+            p = _find_writable_double_parameter(dup_symbol, pid_value, pname)
+            if p is None:
+                continue
+            try:
+                p.Set(float(value))
+                set_count += 1
+            except Exception:
+                pass
+        if set_count != len(assignments):
+            st.RollBack()
+            return False, None, set_count, u'không set đủ TYPE parameter trong nhóm', None
+
+        try:
+            if not dup_symbol.IsActive:
+                dup_symbol.Activate()
+        except Exception:
+            pass
+        doc.Regenerate()
+        elem = doc.GetElement(created_id)
+        _assign_instance_symbol_same_family(elem, dup_symbol)
+        doc.Regenerate()
+        elem = doc.GetElement(created_id)
+        actual = _round_port_radii(elem)
+        ok = _radius_multiset_matches(actual, target_radii)
+        if ok and commit_if_match:
+            st.Commit()
+            return True, actual, set_count, u'', dup_symbol.Id
+        st.RollBack()
+        return False, actual, set_count, u'', None
+    except Exception as ex:
+        if started:
+            try:
+                st.RollBack()
+            except Exception:
+                pass
+        return False, None, 0, safe_text(ex), None
+
+
+def try_match_direct_fitting_size_by_type(created_id, old_records, max_trials=180):
+    """V5.8.3 fallback for content whose connector sizes are TYPE-driven.
+
+    Strategy:
+      1) try every already-loaded sibling FamilySymbol in the SAME Family;
+      2) if none matches, duplicate the selected type and trial only safe writable
+         size-like DOUBLE TYPE parameters;
+      3) commit only a matching duplicated type. Existing instances are untouched.
+    """
+    target_radii = _round_target_radii(old_records)
+    if target_radii is None or not target_radii:
+        return False, u'type-size fallback chỉ hỗ trợ connector tròn'
+    elem = doc.GetElement(created_id)
+    if elem is None:
+        return False, u'fitting mới không tồn tại'
+    base_symbol = get_symbol_from_instance(elem)
+    if base_symbol is None or not isinstance(base_symbol, DB.FamilySymbol):
+        return False, u'không đọc được FamilySymbol để thử type-size fallback'
+
+    # Prefer a size-specific type that is already loaded in the selected Family.
+    existing_notes = []
+    for fs in _same_family_symbols(base_symbol):
+        try:
+            if fs.Id == base_symbol.Id:
+                continue
+        except Exception:
+            pass
+        ok, actual, err = _trial_existing_family_symbol_profile(
+            created_id, fs, target_radii, commit_if_match=False)
+        if ok:
+            ok2, actual2, err2 = _trial_existing_family_symbol_profile(
+                created_id, fs, target_radii, commit_if_match=True)
+            if ok2:
+                return True, (u"V5.8.3 type-size: dùng type đã load cùng Family '{}'; "
+                              u"connector profile {}"
+                              .format(get_real_name(fs), safe_text(actual2)))
+        if err:
+            existing_notes.append(u"{}: {}".format(get_real_name(fs), err))
+
+    type_candidates = _collect_size_driver_candidates(base_symbol, max_items=8)
+    if not type_candidates:
+        return False, (u"V5.8.3 type-size: không có type cùng Family khớp profile và không tìm được "
+                       u"TYPE parameter Diameter/DN/Radius/Size có thể ghi; target radii {}; "
+                       u"type double params [{}]"
+                       .format(safe_text(sorted(target_radii)),
+                               writable_double_parameter_diagnostics(base_symbol, max_items=20)))
+
+    distinct_targets = []
+    for r in sorted(target_radii, reverse=True):
+        if not any(abs(float(r) - float(x)) <= SIZE_TOLERANCE_FT for x in distinct_targets):
+            distinct_targets.append(float(r))
+
+    # Values each type parameter may plausibly expect (diameter first, radius second).
+    candidate_rows = []
+    for pid_value, pname, priority in type_candidates:
+        vals = []
+        for tr in distinct_targets:
+            for v in _size_value_candidates(pname, tr):
+                if not any(abs(float(v) - float(x)) <= 1.0e-9 for x in vals):
+                    vals.append(float(v))
+        candidate_rows.append((pid_value, pname, priority, vals))
+
+    created_value = element_id_value(created_id)
+    base_name = get_real_name(base_symbol)
+    profile_name = _safe_generated_type_name(base_name, target_radii, created_value)
+    trial_count = 0
+    probe = []
+    max_group = min(4, len(candidate_rows))
+
+    for group_size in range(1, max_group + 1):
+        for group in itertools.combinations(candidate_rows, group_size):
+            value_lists = [g[3] for g in group]
+            if any(not vals for vals in value_lists):
+                continue
+            for values in itertools.product(*value_lists):
+                trial_count += 1
+                if trial_count > max_trials:
+                    break
+                assignments = [(group[i][0], group[i][1], values[i]) for i in range(group_size)]
+                # Failed trials roll back, therefore the same candidate name can be reused.
+                trial_name = profile_name
+                ok, actual, set_count, err, new_type_id = _trial_duplicate_symbol_profile(
+                    created_id, assignments, target_radii, trial_name, commit_if_match=True)
+                probe.append((assignments, actual, err))
+                if ok:
+                    names = u", ".join([u"{}={:.6f}".format(a[1], a[2]) for a in assignments])
+                    return True, (u"V5.8.3 TYPE auto-size: duplicate '{}' -> '{}'; [{}] ft; "
+                                  u"connector profile {} đúng. Type gốc không bị sửa."
+                                  .format(base_name, trial_name, names, safe_text(actual)))
+            if trial_count > max_trials:
+                break
+        if trial_count > max_trials:
+            break
+
+    probe_text = []
+    for assignments, actual, err in probe[:16]:
+        names = u",".join([u"{}={:.4f}".format(a[1], a[2]) for a in assignments])
+        probe_text.append(u"[{}]->{}{}".format(names, safe_text(actual),
+                                                  (u" ERR=" + safe_text(err)) if err else u""))
+    return False, (u"V5.8.3 TYPE auto-size không giải được profile; target radii {}; "
+                   u"TYPE size-driver [{}]; thử {} tổ hợp; probe [{}]; type double params [{}]"
+                   .format(safe_text(sorted(target_radii)),
+                           u", ".join([safe_text(x[1]) for x in type_candidates]),
+                           trial_count, u"; ".join(probe_text),
+                           writable_double_parameter_diagnostics(base_symbol, max_items=20)))
 
 
 def _trial_size_parameter_profile(created_id, assignments, target_radii,
@@ -3697,10 +3996,13 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
     raw_candidates = _collect_size_driver_candidates(current, max_items=10)
 
     if not raw_candidates:
+        type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+        if type_ok:
+            return True, type_note
         return False, (u"fitting giảm không có instance parameter Diameter/Radius/Size có thể ghi; "
-                       u"target radii {}; hiện tại {}; double params [{}]"
+                       u"target radii {}; hiện tại {}; double params [{}] | {}"
                        .format(safe_text(sorted(target_radii)), safe_text(actual),
-                               writable_double_parameter_diagnostics(current)))
+                               writable_double_parameter_diagnostics(current), type_note))
 
     # Unique target radii, largest first (run size is commonly the larger one).
     distinct_targets = []
@@ -3839,12 +4141,15 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
             safe_text(r.get('after')),
             (u" ERR=" + safe_text(r.get('error'))) if r.get('error') else u"")
         for r in probe_rows])
-    return False, (u"auto-size V4.8 fitting giảm không giải được profile đa cỡ; "
+    type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+    if type_ok:
+        return True, type_note
+    return False, (u"auto-size V5.8.3 fitting giảm không giải được instance profile đa cỡ; "
                    u"target radii {}; hiện tại {}; size-driver [{}]; thử {} tổ hợp; "
-                   u"probe [{}]; double params [{}]"
+                   u"probe [{}]; double params [{}] | {}"
                    .format(safe_text(sorted(target_radii)), safe_text(actual),
                            u", ".join(candidate_names), trial_count, probe_text,
-                           writable_double_parameter_diagnostics(current)))
+                           writable_double_parameter_diagnostics(current), type_note))
 
 
 def _parameter_is_angle_like(param):
@@ -4706,7 +5011,7 @@ class SkipWarningsPreprocessor(DB.IFailuresPreprocessor):
 
 
 # ============================================================
-# Main window - modal, preselection snapshot (V5.7 Universal / Revit 2025-2026)
+# Main window - modal, preselection snapshot (V5.8 Universal / Revit 2025-2026)
 # ============================================================
 
 
@@ -4714,7 +5019,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def __init__(self, xaml_file_name, preselected_ids):
         forms.WPFWindow.__init__(self, xaml_file_name)
         try:
-            self.Title = u"Correct Pipes & Fittings V5.7 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
+            self.Title = u"Correct Pipes & Fittings V5.8.3 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
         except Exception:
             pass
         # V4.9: size the dialog against the actual Windows work area.  The XAML
@@ -4737,7 +5042,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self.routing_ids_by_pipe_type_id = {}
         self.pipe_size_items = []
         self._updating_size_range = False
-        # V5.7: exactly one fitting-source mode is active at a time.
+        # V5.8: exactly one fitting-source mode is active at a time.
         # 'auto'   = resolve FamilySymbol from selected PipeType Routing Preferences.
         # 'manual' = user selects at most one FamilySymbol per PartType, like V5.3.
         self.fitting_selection_mode = 'auto'
@@ -4851,7 +5156,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             except Exception:
                 pass
         if log_change:
-            self.log(u"Chế độ Fitting V5.7: {}."
+            self.log(u"Chế độ Fitting V5.8.3: {}."
                      .format(u"CHỌN THỦ CÔNG như V5.3" if manual else u"AUTO ROUTING PREFERENCES"))
 
     def fitting_mode_click(self, sender, args):
@@ -5060,7 +5365,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return result
 
     def update_fittings_for_selected_pipe_type(self, clear_invalid=True):
-        """V5.7: always read Routing Preferences, but preserve manual choices.
+        """V5.8: always read Routing Preferences, but preserve manual choices.
 
         Auto mode uses the routing rules directly at runtime. Manual mode keeps
         the user's one-type-per-PartType selections intact when Pipe Type changes.
@@ -5162,7 +5467,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self._set_fitting_selection_mode('manual' if saved_mode == 'manual' else 'auto', False)
             self._update_pipe_size_range_status()
             self.update_fittings_for_selected_pipe_type(clear_invalid=False)
-            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.7.")
+            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.8.3.")
         except Exception as ex:
             self._loading_choices = False
             try:
@@ -5209,15 +5514,146 @@ class ReplaceElementsWindow(forms.WPFWindow):
         except Exception as ex:
             self.log(u"Không thể lưu lựa chọn: {}".format(safe_text(ex)))
 
+    def _rebuild_fitting_catalog(self, reason=None, log_stats=True):
+        """V5.8 re-scan all currently LOADED Pipe Fitting FamilySymbols.
+
+        This is used both at startup and after the user loads supplemental .RFA
+        files.  The manual selection lists are rebuilt immediately without
+        closing the modal UI.
+        """
+        before_ids = set()
+        before_names = {}
+        for item in list(self.fitting_type_items or []):
+            try:
+                iid = self.id_value(item.Value)
+                if iid is not None:
+                    before_ids.add(iid)
+                    before_names[iid] = safe_text(item.Name)
+            except Exception:
+                pass
+
+        try:
+            _pipes, fittings = collect_pipes_and_fittings()
+        except Exception:
+            fittings = []
+
+        all_routing_symbol_ids = set()
+        for _ids in self.routing_ids_by_pipe_type_id.values():
+            try:
+                all_routing_symbol_ids.update(list(_ids or []))
+            except Exception:
+                pass
+
+        fitting_symbols, fitting_scan_stats = collect_all_pipe_fitting_symbols(
+            instance_fittings=fittings,
+            routing_symbol_ids=all_routing_symbol_ids)
+
+        discovered_roles = []
+        for fs in fitting_symbols:
+            try:
+                discovered_roles.append(
+                    fitting_role_from_part_type_value(get_part_type(fs)))
+            except Exception:
+                discovered_roles.append(u"Undefined")
+
+        global NORMAL_FITTING_ROLES, REDUCING_FITTING_ROLES
+        NORMAL_FITTING_ROLES = sort_pipe_fitting_roles(discovered_roles)
+        REDUCING_FITTING_ROLES = tuple(NORMAL_FITTING_ROLES)
+
+        def fitting_sort_key(fs):
+            return (fitting_role_display_name(
+                        fitting_role_from_part_type_value(get_part_type(fs))).lower(),
+                    get_real_family_name(fs).lower(),
+                    get_real_name(fs).lower())
+
+        new_items = []
+        after_ids = set()
+        for fs in sorted(fitting_symbols, key=fitting_sort_key):
+            try:
+                part_type = get_part_type(fs)
+                role = fitting_role_from_part_type_value(part_type)
+                role_text = fitting_role_display_name(role)
+                label = u"[{}] {} : {}".format(
+                    role_text or u"Undefined",
+                    get_real_family_name(fs),
+                    get_real_name(fs))
+                item = CmbItem(label, fs.Id)
+                item.PartType = part_type
+                item.Role = role
+                new_items.append(item)
+                iid = self.id_value(fs.Id)
+                if iid is not None:
+                    after_ids.add(iid)
+            except Exception:
+                pass
+
+        self.fitting_type_items = new_items
+
+        # IDs can change if a Family was reloaded. Keep only selections that are
+        # still real symbols; never silently transfer a choice to a different type.
+        self.selected_fitting_type_ids.intersection_update(after_ids)
+        self.selected_reducing_fitting_type_ids.intersection_update(after_ids)
+
+        try:
+            self.lst_FittingTypes.DisplayMemberPath = "Name"
+            self.lst_ReducingFittingTypes.DisplayMemberPath = "Name"
+        except Exception:
+            pass
+
+        self.refresh_fitting_list(
+            safe_text(getattr(self.txt_FilterFittings, 'Text', u'')))
+        self.refresh_reducing_fitting_list(
+            safe_text(getattr(self.txt_FilterReducingFittings, 'Text', u'')))
+
+        added_ids = after_ids - before_ids
+        removed_ids = before_ids - after_ids
+        missing_pt = len([x for x in self.fitting_type_items
+                          if getattr(x, 'PartType', None) is None])
+
+        if log_stats:
+            if reason:
+                self.log(u"--- V5.8.3 FULL FITTING SCAN: {} ---".format(safe_text(reason)))
+            self.log(
+                u"V5.8.3 Full Fitting Scan: direct-category {} | symbol-category {} | "
+                u"family-category {} | family-enumeration {} | all-element-types {} | "
+                u"instance-type {} | routing-reference {} | UNIQUE {}."
+                .format(fitting_scan_stats.get('direct_category', 0),
+                        fitting_scan_stats.get('symbol_category', 0),
+                        fitting_scan_stats.get('family_category', 0),
+                        fitting_scan_stats.get('family_enumeration', 0),
+                        fitting_scan_stats.get('all_element_types', 0),
+                        fitting_scan_stats.get('instance_type', 0),
+                        fitting_scan_stats.get('routing_reference', 0),
+                        fitting_scan_stats.get('unique_total', len(self.fitting_type_items))))
+            if added_ids:
+                added_labels = []
+                for item in self.fitting_type_items:
+                    try:
+                        if self.id_value(item.Value) in added_ids:
+                            added_labels.append(safe_text(item.Name))
+                    except Exception:
+                        pass
+                self.log(u"Mới phát hiện {} fitting type:".format(len(added_labels)))
+                for label in added_labels[:50]:
+                    self.log(u"  + {}".format(label))
+                if len(added_labels) > 50:
+                    self.log(u"  + ... {} type khác".format(len(added_labels) - 50))
+            if missing_pt:
+                self.log(
+                    u"CẢNH BÁO: {} fitting type không đọc được FAMILY_CONTENT_PART_TYPE; "
+                    u"vẫn hiển thị dưới nhóm Undefined.".format(missing_pt))
+
+        return fitting_scan_stats, added_ids, removed_ids
+
     def setup_data(self):
         self.log(u"Đang đọc dữ liệu trong model...")
-        self.log(u"V5.7 Universal | Revit {} | ElementId 64-bit Value mode.".format(
+        self.log(u"V5.8.3 Universal | Revit {} | ElementId 64-bit Value mode | Transition = Native ChangeTypeId.".format(
             REVIT_VERSION if REVIT_VERSION else u"không xác định"))
         if REVIT_VERSION and REVIT_VERSION not in SUPPORTED_REVIT_VERSIONS:
-            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.7 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
+            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.8.3 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
         pipes, fittings = collect_pipes_and_fittings()
 
-        # V5.7: build Min/Max dropdowns from actual Pipe diameters present
+        # V5.8: build Min/Max dropdowns from actual Pipe diameters present
         # anywhere in the current model. No arbitrary standard-size list is used.
         model_pipe_sizes = collect_model_pipe_sizes(pipes)
         for size_ft in model_pipe_sizes:
@@ -5231,7 +5667,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.cmb_MinPipeSize.SelectedIndex = 0
             self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MaxPipeSize.Items.Count - 1
         self._update_pipe_size_range_status()
-        self.log(u"V5.7 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
+        self.log(u"V5.8.3 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
             len(model_pipe_sizes),
             format_pipe_size(model_pipe_sizes[0]) if model_pipe_sizes else u"?",
             format_pipe_size(model_pipe_sizes[-1]) if model_pipe_sizes else u"?"))
@@ -5307,85 +5743,21 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if self.cmb_PipeTypes.Items.Count > 0:
             self.cmb_PipeTypes.SelectedIndex = 0
 
-        # V5.7: robust scan of ALL loaded Pipe Fitting FamilySymbols.  Do not
-        # rely on only one OfCategory collector because custom families can
-        # expose Category metadata inconsistently at symbol level.
-        all_routing_symbol_ids = set()
-        for _ids in self.routing_ids_by_pipe_type_id.values():
-            try:
-                all_routing_symbol_ids.update(list(_ids or []))
-            except Exception:
-                pass
-        fitting_symbols, fitting_scan_stats = collect_all_pipe_fitting_symbols(
-            instance_fittings=fittings,
-            routing_symbol_ids=all_routing_symbol_ids)
-
-        # V5.7: discover EVERY PartType that actually exists on loaded Pipe
-        # Fitting symbols.  This is safer than hard-coding an enum subset and
-        # automatically includes custom/new Revit content in 2025/2026.
-        discovered_roles = []
-        for _fs in fitting_symbols:
-            try:
-                _role = fitting_role_from_part_type_value(get_part_type(_fs))
-                if _role:
-                    discovered_roles.append(_role)
-            except Exception:
-                pass
-        global NORMAL_FITTING_ROLES, REDUCING_FITTING_ROLES
-        NORMAL_FITTING_ROLES = sort_pipe_fitting_roles(discovered_roles)
-        # Variable-size detection happens on the OLD instance at runtime, so any
-        # multi-port PartType may legitimately need a reducing symbol.  Keep the
-        # reducing list complete as well; one-port types will simply never be
-        # requested as reducing because they cannot have unequal port sizes.
-        REDUCING_FITTING_ROLES = tuple(NORMAL_FITTING_ROLES)
-
-        def fitting_sort_key(fs):
-            return (get_real_family_name(fs).lower(), get_real_name(fs).lower())
-
-        for fs in sorted(fitting_symbols, key=fitting_sort_key):
-            part_type = get_part_type(fs)
-            role = fitting_role_from_part_type_value(part_type)
-            role_text = fitting_role_display_name(role if role else part_type_enum_name(fs))
-            label = u"[{}] {} : {}".format(
-                role_text or u"Khác", get_real_family_name(fs), get_real_name(fs))
-            item = CmbItem(label, fs.Id)
-            item.PartType = part_type
-            item.Role = role
-            self.fitting_type_items.append(item)
-        self.lst_FittingTypes.DisplayMemberPath = "Name"
-        self.refresh_fitting_list(u"")
-        try:
-            self.lst_ReducingFittingTypes.DisplayMemberPath = "Name"
-            self.refresh_reducing_fitting_list(u"")
-        except Exception as ex:
-            self.log(u"Không thể khởi tạo ô Fitting giảm: {}".format(safe_text(ex)))
-
+        # V5.8: one catalog builder is shared by startup, manual Refresh, and
+        # supplemental .RFA loading so the visible lists cannot diverge.
+        self._rebuild_fitting_catalog(reason=u"Khởi tạo UI", log_stats=True)
         self.log(u"Tìm thấy {} system type, {} pipe type, {} fitting type, {} PartType Pipe Fitting.".format(
             self.cmb_Systems.Items.Count,
             self.cmb_PipeTypes.Items.Count,
             len(self.fitting_type_items),
             len(NORMAL_FITTING_ROLES)
         ))
-        try:
-            missing_pt = len([x for x in self.fitting_type_items if getattr(x, 'PartType', None) is None])
-            self.log(u"V5.7 Full Fitting Scan: direct-category {} | symbol-category {} | family-category {} | family-enumeration {} | instance-type {} | routing-reference {} | UNIQUE {}."
-                     .format(fitting_scan_stats.get('direct_category', 0),
-                             fitting_scan_stats.get('symbol_category', 0),
-                             fitting_scan_stats.get('family_category', 0),
-                             fitting_scan_stats.get('family_enumeration', 0),
-                             fitting_scan_stats.get('instance_type', 0),
-                             fitting_scan_stats.get('routing_reference', 0),
-                             fitting_scan_stats.get('unique_total', len(self.fitting_type_items))))
-            if missing_pt:
-                self.log(u"CẢNH BÁO: {} fitting type không đọc được FAMILY_CONTENT_PART_TYPE; vẫn hiển thị dưới nhóm 'Undefined' thay vì bị ẩn.".format(missing_pt))
-        except Exception:
-            pass
         if NORMAL_FITTING_ROLES:
             self.log(u"PartType đã nhận diện: {}".format(
                 u", ".join([fitting_role_display_name(r) for r in NORMAL_FITTING_ROLES])))
 
     def choose_replacement_fitting_type(self, fitting, selected_items=None, selected_reducing_items=None):
-        """V5.7: resolve by either Auto Routing or V5.3-style manual selection."""
+        """V5.8: resolve by either Auto Routing or V5.3-style manual selection."""
         if self._is_manual_fitting_mode():
             old_symbol = get_symbol_from_instance(fitting)
             old_part_type = get_part_type(old_symbol)
@@ -5396,7 +5768,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             source_label = u"Fitting giảm" if variable_size else u"Fitting thường"
             if role not in allowed_roles:
                 raise Exception(
-                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.7"
+                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.8.3"
                     .format(part_type_enum_name(old_symbol)))
             candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
             same_role = []
@@ -5413,7 +5785,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 raise Exception(u"{} đang có {} type PartType '{}'; chỉ được chọn đúng 1"
                                 .format(source_label, len(same_role), fitting_role_display_name(role)))
             chosen = same_role[0]
-            self.log(u"Fitting {}: MANUAL V5.7 -> {} {} chọn '{}'.{}"
+            self.log(u"Fitting {}: MANUAL V5.8.3 -> {} {} chọn '{}'.{}"
                      .format(self.id_value(fitting.Id), source_label,
                              fitting_role_display_name(role), chosen.Name,
                              u" Profile giảm {}".format(size_text) if variable_size else u""))
@@ -5578,7 +5950,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return created, restored, skipped_identity
 
     def create_direct_single_port_fitting(self, desired_symbol, old_port_records, old_params, links):
-        """V5.7 exact-symbol replacement for one-port Pipe Fittings (Cap/EndCap/etc.)."""
+        """V5.8 exact-symbol replacement for one-port Pipe Fittings (Cap/EndCap/etc.)."""
         if len(old_port_records) != 1 or len(links) != 1:
             raise Exception(u"Direct single-port cần đúng 1 connector và 1 kết nối thật")
         old = old_port_records[0]
@@ -5670,7 +6042,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return created, restored, note
 
     def create_direct_linear_fitting(self, desired_symbol, old_port_records, old_params, links):
-        """V5.7 exact-symbol replacement for two-port collinear Pipe Fittings.
+        """V5.8 exact-symbol replacement for two-port collinear Pipe Fittings.
 
         This covers specialized straight fittings (Union, PipeFlange,
         PipeMechanicalCoupling and custom straight PartTypes) without asking
@@ -6051,7 +6423,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             create_note = u""
             direct_restored_pre = 0
 
-            # V5.7 IMPORTANT: cross-family replacement always places the EXACT
+            # V5.8 IMPORTANT: cross-family replacement always places the EXACT
             # user-selected FamilySymbol.  Routing Preferences are not allowed to
             # silently substitute another PartType/Family.  Dispatch by topology:
             #   1 port  -> single-port exact placement (Cap/EndCap/etc.)
@@ -6068,19 +6440,19 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     doc.Regenerate()
 
                 if total_port_count == 1:
-                    self.log(u"{}: V5.7 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
+                    self.log(u"{}: V5.8.3 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
                              .format(label, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_single_port_fitting(
                         desired_symbol, old_port_records, old_params, links)
                     create_mode = u"direct-single"
                 elif total_port_count == 2 and not port_axes_have_nonparallel_pair(old_port_records):
-                    self.log(u"{}: V5.7 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
+                    self.log(u"{}: V5.8.3 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
                              .format(label, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_linear_fitting(
                         desired_symbol, old_port_records, old_params, links)
                     create_mode = u"direct-linear"
                 else:
-                    self.log(u"{}: V5.7 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
+                    self.log(u"{}: V5.8.3 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
                              .format(label, total_port_count, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_aligned_fitting(
                         desired_symbol, old_port_records, old_params, links)
@@ -6289,14 +6661,163 @@ class ReplaceElementsWindow(forms.WPFWindow):
             return False, (u"{} | ChangeTypeId ban đầu lỗi: {} | Fallback ngắt/nối lại cũng lỗi: {}"
                            .format(label, safe_text(first_error), safe_text(ex)))
 
+    def _is_transition_native_change(self, fitting, new_type_id):
+        """True when the old or requested fitting type is a Revit Transition/Reducer.
+
+        V5.8.3 deliberately routes these parts through the native Revit type-change
+        operation.  This avoids the direct-linear reconstruction/rotation solver,
+        which is unnecessary for a straight reducer and can fight families whose
+        connector sizes are driven internally by Revit/content lookup logic.
+        """
+        try:
+            old_symbol = get_symbol_from_instance(fitting)
+        except Exception:
+            old_symbol = None
+        try:
+            new_symbol = doc.GetElement(new_type_id)
+        except Exception:
+            new_symbol = None
+
+        names = []
+        for symbol in [old_symbol, new_symbol]:
+            if symbol is None:
+                continue
+            try:
+                names.append(safe_text(fitting_role_from_part_type_value(get_part_type(symbol))).lower())
+            except Exception:
+                pass
+            try:
+                names.append(safe_text(part_type_enum_name(symbol)).lower())
+            except Exception:
+                pass
+        return any((u"transition" in name or u"reducer" in name) for name in names)
+
+    def change_transition_type_native(self, fitting_id, new_type_id, label):
+        """V5.8.3: let Revit perform a Transition type change natively.
+
+        No disconnect/recreate, no auto-size probing, no rotation/flip, and no
+        pipe trim/extend are performed here.  We only validate that Revit kept
+        the existing external connections and that each connected end still
+        matches its partner size.  Any failure rolls back this fitting only.
+        """
+        fitting = doc.GetElement(fitting_id)
+        if fitting is None:
+            return False, u"{} | Transition native: fitting không còn tồn tại".format(label)
+
+        try:
+            old_type_name = get_real_name(get_symbol_from_instance(fitting))
+        except Exception:
+            old_type_name = u"?"
+        try:
+            desired_symbol = doc.GetElement(new_type_id)
+            new_type_name = get_real_name(desired_symbol)
+            new_family_name = get_real_family_name(desired_symbol)
+        except Exception:
+            desired_symbol = None
+            new_type_name = u"?"
+            new_family_name = u"?"
+
+        links = snapshot_fitting_connections(fitting)
+        old_port_count = len(physical_connectors(fitting))
+
+        st = DB.SubTransaction(doc)
+        try:
+            st.Start()
+            self.log(
+                u"{}: V5.8.3 Transition -> NATIVE REVIT ChangeTypeId '{}' -> '{} : {}'; "
+                u"KHÔNG recreate, KHÔNG auto-size, KHÔNG rotate/flip, KHÔNG trim/extend pipe."
+                .format(label, old_type_name, new_family_name, new_type_name))
+
+            changed_id = fitting.ChangeTypeId(new_type_id)
+            doc.Regenerate()
+
+            actual = None
+            try:
+                if (changed_id and changed_id != DB.ElementId.InvalidElementId):
+                    actual = doc.GetElement(changed_id)
+            except Exception:
+                actual = None
+            if actual is None:
+                try:
+                    actual = doc.GetElement(fitting_id)
+                except Exception:
+                    actual = None
+            if actual is None:
+                raise Exception(u"Revit không trả lại Transition sau ChangeTypeId")
+
+            try:
+                if not same_element_id(actual.GetTypeId(), new_type_id):
+                    actual_symbol = get_symbol_from_instance(actual)
+                    raise Exception(
+                        u"Revit tạo type thực tế '{} : {}' thay vì type yêu cầu '{} : {}'"
+                        .format(get_real_family_name(actual_symbol), get_real_name(actual_symbol),
+                                new_family_name, new_type_name))
+            except Exception as verify_ex:
+                if u"thay vì type yêu cầu" in safe_text(verify_ex):
+                    raise
+
+            new_port_count = len(physical_connectors(actual))
+            if old_port_count and new_port_count != old_port_count:
+                raise Exception(u"Số connector thay đổi {} -> {}".format(old_port_count, new_port_count))
+
+            # Native change must preserve all existing physical relations.  We do
+            # not attempt to repair them here because the user explicitly wants
+            # Transition handled by Revit's own type-change behavior.
+            matched = 0
+            size_mismatch = []
+            actual_connectors = list(physical_connectors(actual) or [])
+            for link in links:
+                partner = find_partner_connector(link)
+                if partner is None:
+                    raise Exception(
+                        u"Không tìm lại được connector đối tác ID {} sau native ChangeTypeId"
+                        .format(element_id_value(link.get('partner_owner_id'))))
+
+                connected = None
+                for fc in actual_connectors:
+                    try:
+                        if connectors_are_connected(fc, partner):
+                            connected = fc
+                            break
+                    except Exception:
+                        pass
+                if connected is None:
+                    raise Exception(
+                        u"Native ChangeTypeId làm mất kết nối vật lý với đối tượng ID {}"
+                        .format(element_id_value(link.get('partner_owner_id'))))
+                matched += 1
+                try:
+                    if not connector_sizes_match(connected, partner):
+                        size_mismatch.append(element_id_value(link.get('partner_owner_id')))
+                except Exception:
+                    pass
+
+            if size_mismatch:
+                raise Exception(
+                    u"Native ChangeTypeId giữ kết nối nhưng size connector không khớp với đối tượng ID {}"
+                    .format(u", ".join([safe_text(x) for x in size_mismatch])))
+
+            st.Commit()
+            return True, (
+                u"OK - Transition Native Revit ChangeTypeId; type '{} : {}'; giữ {}/{} kết nối; "
+                u"không recreate/rotate/auto-size/trim pipe"
+                .format(new_family_name, new_type_name, matched, len(links)))
+        except Exception as ex:
+            try:
+                st.RollBack()
+            except Exception:
+                pass
+            return False, u"{} | Transition Native ChangeTypeId lỗi: {}".format(label, safe_text(ex))
+
     def change_type_safe(self, elem, new_type_id, label, allow_force_reconnect=False):
         """Change one element safely.
 
-        Critical Revit 2025 rule:
-        - Pipe and same-Family fitting: ChangeTypeId is allowed.
-        - Different-Family MEP fitting: DO NOT call ChangeTypeId at all. Recreate
-          the fitting from its original partner connectors instead, because
-          Revit can post an "Error - cannot be ignored" family-change failure.
+        V5.8.3 rules:
+        - Transition/Reducer: always use native Revit ChangeTypeId; no recreate,
+          no angle/rotation solver and no pipe trim/extend.
+        - Pipe and same-Family non-Transition fitting: ChangeTypeId is allowed.
+        - Different-Family non-Transition MEP fitting: avoid ChangeTypeId and use
+          the existing safe recreate/direct-align workflow.
         """
         if elem is None or new_type_id is None:
             return False, u"Thiếu phần tử hoặc type mới"
@@ -6309,7 +6830,14 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         elem_id = elem.Id
 
-        # Avoid the unresolvable Revit failure BEFORE it can be posted.
+        # V5.8.3: Transition/Reducer must use Revit's native type change exactly
+        # as requested.  Do this BEFORE the cross-family recreate guard so a
+        # different-family reducer never enters direct-linear/rotation/auto-size.
+        if is_pipe_fitting(elem) and self._is_transition_native_change(elem, new_type_id):
+            return self.change_transition_type_native(elem_id, new_type_id, label)
+
+        # Avoid the unresolvable Revit failure BEFORE it can be posted for the
+        # remaining MEP fitting PartTypes.
         if allow_force_reconnect and is_pipe_fitting(elem):
             try:
                 if not same_family_for_type_ids(elem.GetTypeId(), new_type_id):
@@ -6472,7 +7000,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.log(u"Lỗi filter Fitting thường: {}".format(safe_text(ex)))
 
     def fitting_selection_changed(self, sender, args):
-        """V5.7: selecting a second type in the same normal role replaces the first."""
+        """V5.8: selecting a second type in the same normal role replaces the first."""
         if self._refreshing_fitting_list:
             return
         try:
@@ -6556,7 +7084,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.log(u"Lỗi filter Fitting giảm: {}".format(safe_text(ex)))
 
     def reducing_fitting_selection_changed(self, sender, args):
-        """V5.7: selecting a second reducing type in one role replaces the first."""
+        """V5.8: selecting a second reducing type in one role replaces the first."""
         if self._refreshing_reducing_fitting_list:
             return
         try:
@@ -6704,7 +7232,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         scope_name = u"các đối tượng đã chọn trước khi mở tool"
         self.log(u"Bắt đầu xử lý System Type: {}".format(system_name))
         self.log(u"Phạm vi xử lý: {}.".format(scope_name))
-        self.log(u"Giới hạn Pipe Size V5.7: {} <= Size <= {}.".format(
+        self.log(u"Giới hạn Pipe Size V5.8.3: {} <= Size <= {}.".format(
             format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
         pipes, fittings = collect_pipes_and_fittings(True, self.preselected_element_ids)
         if selected_only and not pipes and not fittings:
@@ -6714,7 +7242,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         system_pipes = [p for p in pipes if same_element_id(get_system_type_id(p), system_type_id)] if overwrite_pipes else []
         system_fittings = [f for f in fittings if same_element_id(get_system_type_id(f), system_type_id)] if overwrite_fittings else []
 
-        # V5.7: range is inclusive and uses the EXISTING size before any type
+        # V5.8: range is inclusive and uses the EXISTING size before any type
         # replacement.  A fitting is treated atomically: every physical port must
         # fit inside the selected range, otherwise the whole fitting is skipped.
         target_pipes = []
@@ -6763,7 +7291,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     self.log(line)
             return
 
-        # V5.7 manual mode must have exactly one selected FamilySymbol for every
+        # V5.8 manual mode must have exactly one selected FamilySymbol for every
         # PartType that will actually be processed in this range. Validate before
         # opening the main Transaction so the model cannot be changed partially.
         if overwrite_fittings and self._is_manual_fitting_mode() and target_fittings:
@@ -6924,7 +7452,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
 
 # ============================================================
-# Entry point - require preselection before opening UI (V5.7 Universal / Revit 2025-2026)
+# Entry point - require preselection before opening UI (V5.8 Universal / Revit 2025-2026)
 # ============================================================
 
 script_dir = os.path.dirname(__file__)
@@ -6985,5 +7513,5 @@ else:
             win.show_dialog()
         except Exception as ex:
             forms.alert(
-                u"Không thể mở UI V5.7 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
+                u"Không thể mở UI V5.8.3 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
                 title="Correct Pipes & Fittings")
