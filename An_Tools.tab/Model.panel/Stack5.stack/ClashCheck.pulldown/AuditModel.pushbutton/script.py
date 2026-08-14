@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 Pipe / Pipe Accessory / Pipe Fitting vs Linked Model Clash Checker
-Version 2.6 - Grouped clash headers + linked target zoom
+Version 2.9 - Active View stability / saved-link safety + region + pipe direction + grouped clash
 
 HOST OBJECTS (independent checkboxes)
     - Pipes
+        - Vertical Pipe
+        - Horizontal / Sloped Pipe
     - Pipe Accessories
     - Pipe Fittings
 
@@ -20,7 +22,7 @@ WORKFLOW
        (Rooms + Fire Rated Walls).
     3. Pick Structure link group
        (Structural Framing + Structural Columns).
-    4. UI opens: choose Entire Model / Active View.
+    4. UI opens: choose Entire Model / Active View / Pick Region in Active View.
     5. Optional Inspection Mode: choose one category, select + zoom it.
     6. If Inspection Mode is OFF, clash test runs normally.
     7. Output host ElementIds as clickable pyRevit links.
@@ -60,6 +62,16 @@ GEOM_EPS_FT = 1.0 / MM_PER_FOOT      # ~1 mm
 BBOX_EPS_FT = 1.0 / MM_PER_FOOT      # ~1 mm
 AUTO_FLOOR_MATCH_TOL_FT = 10.0 / MM_PER_FOOT  # ~10 mm
 MAX_WARNINGS = 80
+
+# Pipe direction classification. A pipe is treated as vertical when its
+# normalized axis is almost parallel to global Z. All other valid pipe axes
+# (level or sloped) are classified as horizontal/sloped.
+PIPE_VERTICAL_Z_COS = 0.9999
+
+# V2.9 UI safety: selecting/zooming a very large set in Revit can be expensive.
+# The output still reports every found element, but UI selection is capped.
+MAX_HOST_UI_SELECTION = 300
+MAX_LINKED_UI_SELECTION = 200
 
 
 doc = revit.doc
@@ -190,6 +202,97 @@ config = get_project_config()
 
 
 # ============================================================
+# API OBJECT SAFETY - V2.9
+# ============================================================
+
+def is_valid_api_object(obj):
+    if obj is None:
+        return False
+    try:
+        return bool(obj.IsValidObject)
+    except Exception:
+        # Some API wrappers do not expose IsValidObject. If the object exists,
+        # allow later guarded checks to decide.
+        return True
+
+
+def is_valid_loaded_link(link):
+    if not is_valid_api_object(link):
+        return False
+    try:
+        current = doc.GetElement(link.Id)
+        if current is None or not is_valid_api_object(current):
+            return False
+        if not isinstance(current, DB.RevitLinkInstance):
+            return False
+        if current.GetLinkDocument() is None:
+            return False
+        # Touch transform while still in managed/guarded code. A stale instance
+        # should be rejected before it reaches linked-view collectors.
+        current.GetTotalTransform()
+        return True
+    except Exception:
+        return False
+
+
+def get_active_view_visible_link_id_values(settings, warnings=None):
+    """Return link instance ids that are eligible in the current Active View.
+
+    This uses the normal HOST view collector first. The risky 3-argument
+    linked-element collector is never called for a saved link unless its host
+    link instance survives this validation.
+    """
+    if not is_active_view_scope(settings):
+        return None
+
+    cached = settings.get("_active_view_visible_link_ids")
+    if cached is not None:
+        return cached
+
+    values = set()
+    try:
+        collector = (
+            DB.FilteredElementCollector(doc, doc.ActiveView.Id)
+            .OfClass(DB.RevitLinkInstance)
+            .WhereElementIsNotElementType()
+        )
+        for link in collector:
+            try:
+                if is_valid_loaded_link(link):
+                    values.add(id_value(link.Id))
+            except Exception:
+                pass
+    except Exception as ex:
+        if warnings is not None:
+            warnings.append(u"Không xác minh được Revit Link trong Active View: {0}".format(ex))
+
+    settings["_active_view_visible_link_ids"] = values
+    return values
+
+
+def sanitize_links_for_scope(links, settings, warnings, group_label):
+    """Remove stale/unloaded/ineligible saved links before native view calls."""
+    clean = []
+    visible_ids = get_active_view_visible_link_id_values(settings, warnings)
+
+    for link in links or []:
+        if not is_valid_loaded_link(link):
+            warnings.append(u"{0}: bỏ qua Link cũ/unloaded/không còn hợp lệ.".format(group_label))
+            continue
+
+        if visible_ids is not None and id_value(link.Id) not in visible_ids:
+            warnings.append(
+                u"{0}: Link '{1}' không có trong Active View hiện tại -> bỏ qua để tránh gọi linked-view collector không hợp lệ.".format(
+                    group_label, get_link_label(link)
+                )
+            )
+            continue
+
+        clean.append(link)
+
+    return clean
+
+# ============================================================
 # REVIT LINK PICKING / RESTORE
 # ============================================================
 
@@ -246,7 +349,7 @@ def resolve_links_from_config(config_key):
     found = []
     for link in get_loaded_links():
         try:
-            if link.UniqueId in wanted:
+            if link.UniqueId in wanted and is_valid_loaded_link(link):
                 found.append(link)
         except Exception:
             pass
@@ -380,7 +483,7 @@ def get_link_groups():
 
 # UI is stored separately in ui.xaml inside this pushbutton bundle.
 UI_XAML_PATH = script.get_bundle_file("ui.xaml")
-EXPECTED_UI_VERSION = u"2.6"
+EXPECTED_UI_VERSION = u"2.8"
 
 
 def validate_ui_bundle(window):
@@ -391,7 +494,10 @@ def validate_ui_bundle(window):
         "cb_inspection_category",
         "rb_scope_model",
         "rb_scope_view",
+        "rb_scope_region",
         "cb_zoom_linked_after_clash",
+        "cb_pipe_vertical",
+        "cb_pipe_horizontal",
         "btn_run",
     ]
     missing = []
@@ -430,7 +536,8 @@ class OptionsWindow(forms.WPFWindow):
 
         scope = to_text(getattr(config, "scope_mode", u"model")).lower()
         self.rb_scope_view.IsChecked = (scope == u"view")
-        self.rb_scope_model.IsChecked = not bool(self.rb_scope_view.IsChecked)
+        self.rb_scope_region.IsChecked = (scope == u"region")
+        self.rb_scope_model.IsChecked = not bool(self.rb_scope_view.IsChecked or self.rb_scope_region.IsChecked)
 
         try:
             active_name = to_text(doc.ActiveView.Name)
@@ -445,6 +552,8 @@ class OptionsWindow(forms.WPFWindow):
         self._set_inspect_category(saved_inspect)
 
         self.cb_pipe.IsChecked = as_bool(getattr(config, "host_pipe", True), True)
+        self.cb_pipe_vertical.IsChecked = as_bool(getattr(config, "host_pipe_vertical", True), True)
+        self.cb_pipe_horizontal.IsChecked = as_bool(getattr(config, "host_pipe_horizontal", True), True)
         self.cb_accessory.IsChecked = as_bool(getattr(config, "host_accessory", True), True)
         self.cb_fitting.IsChecked = as_bool(getattr(config, "host_fitting", True), True)
 
@@ -521,6 +630,8 @@ class OptionsWindow(forms.WPFWindow):
     def _sync_all_checks(self):
         self.cb_host_all.IsChecked = bool(
             self.cb_pipe.IsChecked and
+            self.cb_pipe_vertical.IsChecked and
+            self.cb_pipe_horizontal.IsChecked and
             self.cb_accessory.IsChecked and
             self.cb_fitting.IsChecked
         )
@@ -534,6 +645,8 @@ class OptionsWindow(forms.WPFWindow):
     def host_all_changed(self, sender, args):
         state = bool(self.cb_host_all.IsChecked)
         self.cb_pipe.IsChecked = state
+        self.cb_pipe_vertical.IsChecked = state
+        self.cb_pipe_horizontal.IsChecked = state
         self.cb_accessory.IsChecked = state
         self.cb_fitting.IsChecked = state
 
@@ -552,11 +665,18 @@ class OptionsWindow(forms.WPFWindow):
         self.Close()
 
     def run_clicked(self, sender, args):
-        scope_mode = u"view" if bool(self.rb_scope_view.IsChecked) else u"model"
+        if bool(self.rb_scope_region.IsChecked):
+            scope_mode = u"region"
+        elif bool(self.rb_scope_view.IsChecked):
+            scope_mode = u"view"
+        else:
+            scope_mode = u"model"
         inspection_mode = bool(self.cb_inspection_mode.IsChecked)
         inspection_category = self._get_inspect_category()
 
         host_pipe = bool(self.cb_pipe.IsChecked)
+        host_pipe_vertical = bool(self.cb_pipe_vertical.IsChecked)
+        host_pipe_horizontal = bool(self.cb_pipe_horizontal.IsChecked)
         host_accessory = bool(self.cb_accessory.IsChecked)
         host_fitting = bool(self.cb_fitting.IsChecked)
 
@@ -566,6 +686,17 @@ class OptionsWindow(forms.WPFWindow):
         target_firewall = bool(self.cb_firewall.IsChecked)
 
         raw_keywords = to_text(self.tb_keywords.Text).strip()
+
+        pipe_direction_required = (
+            ((not inspection_mode) and host_pipe) or
+            (inspection_mode and inspection_category == u"pipe")
+        )
+        if pipe_direction_required and not (host_pipe_vertical or host_pipe_horizontal):
+            forms.alert(
+                u"Hãy tick Vertical Pipe, Horizontal / Sloped Pipe, hoặc cả hai.",
+                title="Linked Clash Checker"
+            )
+            return
 
         if inspection_mode:
             if inspection_category == u"room" and not raw_keywords:
@@ -596,6 +727,8 @@ class OptionsWindow(forms.WPFWindow):
             "inspection_category": inspection_category,
             "inspect_category": inspection_category,
             "host_pipe": host_pipe,
+            "host_pipe_vertical": host_pipe_vertical,
+            "host_pipe_horizontal": host_pipe_horizontal,
             "host_accessory": host_accessory,
             "host_fitting": host_fitting,
             "target_room": target_room,
@@ -615,6 +748,8 @@ class OptionsWindow(forms.WPFWindow):
         config.inspection_category = inspection_category
         config.inspect_category = inspection_category
         config.host_pipe = host_pipe
+        config.host_pipe_vertical = host_pipe_vertical
+        config.host_pipe_horizontal = host_pipe_horizontal
         config.host_accessory = host_accessory
         config.host_fitting = host_fitting
         config.target_room = target_room
@@ -1101,11 +1236,28 @@ def get_room_check_solids_link_coords(room, calculator, settings, floor_bboxes):
 
 
 # ============================================================
-# SCOPE HELPERS - ENTIRE MODEL / ACTIVE VIEW
+# SCOPE HELPERS - ENTIRE MODEL / ACTIVE VIEW / ACTIVE VIEW REGION
 # ============================================================
 
+def scope_mode(settings):
+    return to_text(settings.get("scope_mode", u"model")).lower()
+
+
 def is_active_view_scope(settings):
-    return to_text(settings.get("scope_mode", u"model")).lower() == u"view"
+    return scope_mode(settings) in (u"view", u"region")
+
+
+def is_region_scope(settings):
+    return scope_mode(settings) == u"region"
+
+
+def scope_label(settings):
+    mode = scope_mode(settings)
+    if mode == u"region":
+        return u"Pick Region in Active View"
+    if mode == u"view":
+        return u"Active View"
+    return u"Entire Model"
 
 
 def validate_scope(settings):
@@ -1141,11 +1293,24 @@ def make_link_collector(link, settings):
     Entire Model:
         collector belongs directly to linked Document.
 
-    Active View (Revit 2024+):
+    Active View / Pick Region in Active View (Revit 2024+):
         collector searches visible linked elements for this specific
         RevitLinkInstance in the host Active View.
+
+    NOTE:
+        Region scope intentionally limits HOST MEP only. Linked targets
+        remain Active-View scoped because the rectangle is used to choose
+        which host Pipe / Accessory / Fitting participate in clash checking.
     """
+    if not is_valid_loaded_link(link):
+        return None
+
     if is_active_view_scope(settings):
+        visible_ids = get_active_view_visible_link_id_values(settings)
+        if visible_ids is not None and id_value(link.Id) not in visible_ids:
+            return None
+        # Only call the native 3-argument collector after validating both the
+        # current view and this exact link instance in that view.
         return DB.FilteredElementCollector(doc, doc.ActiveView.Id, link.Id)
 
     link_doc = link.GetLinkDocument()
@@ -1170,11 +1335,215 @@ def collect_link_category(link, bic, settings, warnings, context_label):
             u"Không collect được {0} | Link {1} | Scope {2}: {3}".format(
                 context_label,
                 get_link_label(link),
-                to_text(settings.get("scope_mode", u"model")),
+                scope_label(settings),
                 ex
             )
         )
         return []
+
+
+# ============================================================
+# ACTIVE VIEW RECTANGLE REGION - V2.8
+# ============================================================
+
+class HostRegionSelectionFilter(ISelectionFilter):
+    """Native Revit rectangle filter for enabled host MEP categories."""
+
+    def __init__(self, settings):
+        self.settings = settings
+        self.inspection_mode = bool(settings.get("inspection_mode", settings.get("inspect_select", False)))
+        self.inspection_category = to_text(
+            settings.get("inspection_category", settings.get("inspect_category", u"pipe"))
+        ).lower()
+
+    def _category_allowed(self, element):
+        try:
+            cat_id = id_value(element.Category.Id)
+        except Exception:
+            return False
+
+        pipe_id = int(DB.BuiltInCategory.OST_PipeCurves)
+        accessory_id = int(DB.BuiltInCategory.OST_PipeAccessory)
+        fitting_id = int(DB.BuiltInCategory.OST_PipeFitting)
+
+        if self.inspection_mode:
+            if self.inspection_category == u"pipe":
+                return cat_id == pipe_id
+            if self.inspection_category == u"accessory":
+                return cat_id == accessory_id
+            if self.inspection_category == u"fitting":
+                return cat_id == fitting_id
+            return False
+
+        if cat_id == pipe_id:
+            return bool(self.settings.get("host_pipe", False))
+        if cat_id == accessory_id:
+            return bool(self.settings.get("host_accessory", False))
+        if cat_id == fitting_id:
+            return bool(self.settings.get("host_fitting", False))
+        return False
+
+    def AllowElement(self, element):
+        if element is None or not self._category_allowed(element):
+            return False
+
+        if is_pipe_element(element):
+            return pipe_orientation_matches_settings(element, self.settings)
+        return True
+
+    def AllowReference(self, reference, point):
+        return False
+
+
+def pick_host_region_elements(settings):
+    """Prompt a native Revit rectangle selection in the current Active View.
+
+    The returned IDs become a hard whitelist for host MEP clash candidates.
+    Linked Room/Beam/Column/Fire Wall targets are still collected from the
+    Active View, but only these picked host MEP elements can be reported as
+    clashes.
+    """
+    if not is_region_scope(settings):
+        return True, u""
+
+    inspection_mode = bool(settings.get("inspection_mode", settings.get("inspect_select", False)))
+    inspection_category = to_text(
+        settings.get("inspection_category", settings.get("inspect_category", u"pipe"))
+    ).lower()
+
+    # Region applies only to host MEP. For linked inspection, simply use the
+    # Active View collector and do not force an irrelevant host rectangle.
+    if inspection_mode and inspection_category not in (u"pipe", u"accessory", u"fitting"):
+        settings["_region_host_id_values"] = None
+        settings["_region_host_count"] = 0
+        return True, u""
+
+    prompt = (
+        u"Kéo một vùng trong Active View để chọn Pipe / Pipe Accessories / "
+        u"Pipe Fittings dùng cho clash check. ESC để hủy."
+    )
+
+    try:
+        selection_filter = HostRegionSelectionFilter(settings)
+        elements = uidoc.Selection.PickElementsByRectangle(selection_filter, prompt)
+    except OperationCanceledException:
+        return False, u"Đã hủy chọn vùng Active View."
+    except Exception as ex:
+        return False, u"Không thể chọn vùng trong Active View: {0}".format(ex)
+
+    id_values = set()
+    try:
+        for element in elements:
+            if element is not None:
+                id_values.add(id_value(element.Id))
+    except Exception:
+        pass
+
+    settings["_region_host_id_values"] = id_values
+    settings["_region_host_count"] = len(id_values)
+
+    if not id_values:
+        return False, u"Vùng đã chọn không chứa Pipe / Pipe Accessories / Pipe Fittings phù hợp với checkbox hiện tại."
+
+    return True, u""
+
+
+def host_id_in_region(element_id, settings):
+    if not is_region_scope(settings):
+        return True
+    allowed = settings.get("_region_host_id_values")
+    if allowed is None:
+        return True
+    try:
+        return id_value(element_id) in allowed
+    except Exception:
+        return False
+
+
+# ============================================================
+# PIPE DIRECTION CLASSIFICATION - V2.8
+# ============================================================
+
+def is_pipe_element(element):
+    try:
+        return id_value(element.Category.Id) == int(DB.BuiltInCategory.OST_PipeCurves)
+    except Exception:
+        return False
+
+
+def get_pipe_axis_direction(pipe):
+    """Return a normalized pipe axis direction, or None if unavailable."""
+    try:
+        location = pipe.Location
+        curve = location.Curve if location is not None else None
+        if curve is None:
+            return None
+
+        # Line exposes Direction directly. For any other valid curve, use
+        # the chord between its two endpoints as a stable fallback.
+        try:
+            direction = curve.Direction
+            if direction is not None:
+                return direction.Normalize()
+        except Exception:
+            pass
+
+        p0 = curve.GetEndPoint(0)
+        p1 = curve.GetEndPoint(1)
+        vector = p1 - p0
+        if vector.GetLength() <= 1.0e-9:
+            return None
+        return vector.Normalize()
+    except Exception:
+        return None
+
+
+def get_pipe_orientation(pipe):
+    """Classify pipe as 'vertical', 'horizontal', or 'unknown'.
+
+    Horizontal includes both zero-slope and sloped pipes.
+    """
+    direction = get_pipe_axis_direction(pipe)
+    if direction is None:
+        return u"unknown"
+
+    try:
+        if abs(float(direction.Z)) >= PIPE_VERTICAL_Z_COS:
+            return u"vertical"
+    except Exception:
+        return u"unknown"
+
+    return u"horizontal"
+
+
+def pipe_orientation_matches_settings(pipe, settings):
+    """Apply the vertical/horizontal pipe toggles."""
+    want_vertical = bool(settings.get("host_pipe_vertical", True))
+    want_horizontal = bool(settings.get("host_pipe_horizontal", True))
+
+    # Both selected = preserve historical behavior and include every pipe,
+    # even a rare pipe whose direction cannot be resolved.
+    if want_vertical and want_horizontal:
+        return True
+
+    orientation = get_pipe_orientation(pipe)
+    if orientation == u"vertical":
+        return want_vertical
+    if orientation == u"horizontal":
+        return want_horizontal
+
+    # Unknown direction is intentionally excluded when filtering to only one
+    # orientation so the result does not silently mix categories.
+    return False
+
+
+def pipe_orientation_label(pipe):
+    orientation = get_pipe_orientation(pipe)
+    if orientation == u"vertical":
+        return u"Vertical Pipe"
+    if orientation == u"horizontal":
+        return u"Horizontal / Sloped Pipe"
+    return u"Pipe"
 
 
 # ============================================================
@@ -1219,9 +1588,37 @@ def find_host_elements_intersecting_solid(host_filter, host_solid, settings):
     collector = collector.WherePasses(DB.ElementIntersectsSolidFilter(host_solid))
 
     try:
-        return list(collector.ToElementIds())
+        ids = list(collector.ToElementIds())
     except Exception:
         return []
+
+    # V2.8 region scope is a hard whitelist picked by the user in Active View.
+    if is_region_scope(settings):
+        ids = [element_id for element_id in ids if host_id_in_region(element_id, settings)]
+
+    # Category/solid filters cannot classify pipe orientation, so apply the
+    # Pipe direction filter after intersection. Accessories/Fittings are
+    # never affected by this filter.
+    if not settings.get("host_pipe", False):
+        return ids
+
+    if settings.get("host_pipe_vertical", True) and settings.get("host_pipe_horizontal", True):
+        return ids
+
+    filtered = []
+    for element_id in ids:
+        try:
+            element = doc.GetElement(element_id)
+            if element is None:
+                continue
+            if is_pipe_element(element):
+                if pipe_orientation_matches_settings(element, settings):
+                    filtered.append(element_id)
+            else:
+                filtered.append(element_id)
+        except Exception:
+            pass
+    return filtered
 
 
 # ============================================================
@@ -1425,7 +1822,7 @@ def host_category_label(element):
     try:
         cid = id_value(element.Category.Id)
         if cid == int(DB.BuiltInCategory.OST_PipeCurves):
-            return u"Pipe"
+            return pipe_orientation_label(element)
         if cid == int(DB.BuiltInCategory.OST_PipeAccessory):
             return u"Pipe Accessory"
         if cid == int(DB.BuiltInCategory.OST_PipeFitting):
@@ -1549,7 +1946,7 @@ def scan_clashes(records, settings, warnings):
 
 
 # ============================================================
-# INSPECTION MODE / SELECT-ZOOM - V2.6
+# INSPECTION MODE / SELECT-ZOOM - V2.9
 # ============================================================
 
 INSPECT_LABELS = {
@@ -1586,9 +1983,18 @@ def inspect_host_category(category_key, settings, warnings):
 
     records = []
     for elem in elems:
+        if is_region_scope(settings) and not host_id_in_region(elem.Id, settings):
+            continue
+        if category_key == u"pipe" and not pipe_orientation_matches_settings(elem, settings):
+            continue
+
+        kind_label = INSPECT_LABELS.get(category_key, category_key)
+        if category_key == u"pipe":
+            kind_label = pipe_orientation_label(elem)
+
         records.append({
             "host": True,
-            "kind": INSPECT_LABELS.get(category_key, category_key),
+            "kind": kind_label,
             "element": elem,
             "id": elem.Id,
             "label": get_element_type_name(elem, doc) or element_id_text(elem)
@@ -1761,11 +2167,58 @@ def zoom_to_linked_records(records):
         return False, to_text(ex)
 
 
-def select_host_records(records, warnings):
-    ids = List[DB.ElementId]()
+def zoom_to_host_records(records):
+    points = []
     for record in records:
+        points.extend(get_bbox_host_points(record.get("element"), None))
+
+    if not points:
+        return False, u"Không lấy được bounding box host để zoom."
+
+    try:
+        min_x = min(p.X for p in points)
+        min_y = min(p.Y for p in points)
+        min_z = min(p.Z for p in points)
+        max_x = max(p.X for p in points)
+        max_y = max(p.Y for p in points)
+        max_z = max(p.Z for p in points)
+
+        span = max(max_x - min_x, max_y - min_y, max_z - min_z)
+        padding = max(1.0, span * 0.05)
+        p1 = DB.XYZ(min_x - padding, min_y - padding, min_z - padding)
+        p2 = DB.XYZ(max_x + padding, max_y + padding, max_z + padding)
+
+        ui_view = get_active_ui_view()
+        if ui_view is None:
+            return False, u"Không tìm thấy UIView của Active View."
+        ui_view.ZoomAndCenterRectangle(p1, p2)
+        return True, u""
+    except Exception as ex:
+        return False, to_text(ex)
+
+
+def select_host_records(records, warnings):
+    if not records:
         try:
-            ids.Add(record["id"])
+            uidoc.Selection.SetElementIds(List[DB.ElementId]())
+        except Exception:
+            pass
+        return 0
+
+    safe_records = records[:MAX_HOST_UI_SELECTION]
+    if len(records) > MAX_HOST_UI_SELECTION:
+        warnings.append(
+            u"Tìm thấy {0} host elements. Vì an toàn UI, chỉ select/zoom {1} phần tử đầu; output vẫn liệt kê toàn bộ.".format(
+                len(records), MAX_HOST_UI_SELECTION
+            )
+        )
+
+    ids = List[DB.ElementId]()
+    for record in safe_records:
+        try:
+            elem = record.get("element")
+            if elem is not None and is_valid_api_object(elem):
+                ids.Add(record["id"])
         except Exception:
             pass
 
@@ -1776,11 +2229,14 @@ def select_host_records(records, warnings):
         uidoc.Selection.SetElementIds(ids)
     except Exception as ex:
         warnings.append(u"Không select được host elements: {0}".format(ex))
+        return 0
 
-    try:
-        uidoc.ShowElements(ids)
-    except Exception as ex:
-        warnings.append(u"Không zoom-to-fit được host elements: {0}".format(ex))
+    # V2.9: do NOT call uidoc.ShowElements() on a bulk MEP set. Zoom with the
+    # current UIView and bounding boxes instead; this avoids asking Revit to
+    # resolve/show a potentially huge mixed set through a native UI call.
+    zoom_ok, zoom_error = zoom_to_host_records(safe_records)
+    if not zoom_ok and zoom_error:
+        warnings.append(u"Không zoom được host elements: {0}".format(zoom_error))
 
     return ids.Count
 
@@ -1795,15 +2251,29 @@ def select_linked_records(records, warnings):
             pass
         return 0
 
-    for record in records:
+    safe_records = records[:MAX_LINKED_UI_SELECTION]
+    if len(records) > MAX_LINKED_UI_SELECTION:
+        warnings.append(
+            u"Tìm thấy {0} linked elements. Vì an toàn UI, chỉ select/zoom {1} phần tử đầu; output vẫn liệt kê toàn bộ.".format(
+                len(records), MAX_LINKED_UI_SELECTION
+            )
+        )
+
+    valid_records = []
+    for record in safe_records:
         try:
-            link_ref = DB.Reference(record["element"]).CreateLinkReference(record["link"])
+            link = record.get("link")
+            elem = record.get("element")
+            if not is_valid_loaded_link(link) or not is_valid_api_object(elem):
+                continue
+            link_ref = DB.Reference(elem).CreateLinkReference(link)
             refs.Add(link_ref)
+            valid_records.append(record)
         except Exception as ex:
             warnings.append(
                 u"Không tạo linked Reference | {0} | Linked ID {1}: {2}".format(
-                    get_link_label(record["link"]),
-                    id_value(record["id"]),
+                    get_link_label(record.get("link")),
+                    id_value(record.get("id")),
                     ex
                 )
             )
@@ -1813,8 +2283,9 @@ def select_linked_records(records, warnings):
             uidoc.Selection.SetReferences(refs)
         except Exception as ex:
             warnings.append(u"Không SetReferences được linked elements: {0}".format(ex))
+            return 0
 
-    zoom_ok, zoom_error = zoom_to_linked_records(records)
+    zoom_ok, zoom_error = zoom_to_linked_records(valid_records)
     if not zoom_ok and zoom_error:
         warnings.append(u"Không zoom được linked elements: {0}".format(zoom_error))
 
@@ -1823,8 +2294,10 @@ def select_linked_records(records, warnings):
 
 def print_inspect_results(settings, category_key, records, warnings):
     label = INSPECT_LABELS.get(category_key, category_key)
-    output.print_md(u"# INSPECTION MODE - LINKED CLASH CHECKER V2.6")
-    print(u"Scope: {0}".format(u"Active View" if is_active_view_scope(settings) else u"Entire Model"))
+    output.print_md(u"# INSPECTION MODE - LINKED CLASH CHECKER V2.9")
+    print(u"Scope: {0}".format(scope_label(settings)))
+    if is_region_scope(settings) and category_key in (u"pipe", u"accessory", u"fitting"):
+        print(u"Host MEP trong vùng đã chọn: {0}".format(settings.get("_region_host_count", 0)))
     print(u"Category: {0}".format(label))
     print(u"Found: {0}".format(len(records)))
     print(u"")
@@ -1883,7 +2356,7 @@ def run_inspect_mode(arch_links, struct_links, settings):
 
 
 # ============================================================
-# CLASH LINKED TARGET NAVIGATION - V2.6
+# CLASH LINKED TARGET NAVIGATION - V2.9
 # ============================================================
 
 def linked_records_from_clashes(clash_results):
@@ -1964,7 +2437,17 @@ def grouped_clash_pairs(clash_results):
 def selected_host_labels(settings):
     values = []
     if settings["host_pipe"]:
-        values.append(u"Pipe")
+        pipe_parts = []
+        if settings.get("host_pipe_vertical", True):
+            pipe_parts.append(u"Vertical")
+        if settings.get("host_pipe_horizontal", True):
+            pipe_parts.append(u"Horizontal / Sloped")
+        if len(pipe_parts) == 2:
+            values.append(u"Pipe [Vertical + Horizontal / Sloped]")
+        elif pipe_parts:
+            values.append(u"Pipe [{0}]".format(pipe_parts[0]))
+        else:
+            values.append(u"Pipe [NONE]")
     if settings["host_accessory"]:
         values.append(u"Pipe Accessories")
     if settings["host_fitting"]:
@@ -1986,15 +2469,17 @@ def selected_target_labels(settings):
 
 
 def print_results(arch_links, struct_links, settings, clash_results, target_stats, room_ext_stats, warnings):
-    output.print_md(u"# LINKED CLASH CHECKER V2.6")
+    output.print_md(u"# LINKED CLASH CHECKER V2.9")
 
     output.print_md(u"## Thiết lập")
-    print(u"Scope: {0}".format(u"Active View" if is_active_view_scope(settings) else u"Entire Model"))
+    print(u"Scope: {0}".format(scope_label(settings)))
     if is_active_view_scope(settings):
         try:
             print(u"Active View: {0}".format(to_text(doc.ActiveView.Name)))
         except Exception:
             pass
+    if is_region_scope(settings):
+        print(u"Host MEP trong vùng đã chọn: {0}".format(settings.get("_region_host_count", 0)))
     print(u"HOST: {0}".format(u", ".join(selected_host_labels(settings))))
     print(u"LINK TARGET: {0}".format(u", ".join(selected_target_labels(settings))))
     print(u"Zoom linked clash targets after check: {0}".format(
@@ -2112,15 +2597,39 @@ def main():
         forms.alert(scope_error, title="Linked Clash Checker")
         script.exit()
 
+    # V2.9: when Region scope is selected, the WPF window is already closed.
+    # Revit now prompts for a native rectangle selection in the Active View.
+    region_ok, region_error = pick_host_region_elements(settings)
+    if not region_ok:
+        if region_error:
+            forms.alert(region_error, title="Linked Clash Checker - Active View Region")
+        script.exit()
+
     # --------------------------------------------------------
-    # INSPECTION MODE / SELECT-ZOOM - V2.6
+    # INSPECTION MODE / SELECT-ZOOM - V2.9 SAFE MODE
     # --------------------------------------------------------
     if settings.get("inspection_mode", settings.get("inspect_select", False)):
         category_key = to_text(settings.get("inspection_category", settings.get("inspect_category", u"pipe"))).lower()
 
+        # IMPORTANT: Host MEP inspection must not touch saved Revit Links at
+        # all. Changing Active View between runs therefore cannot make an old
+        # saved Link participate in Pipe / Accessory / Fitting inspection.
+        if category_key in (u"pipe", u"accessory", u"fitting"):
+            run_inspect_mode([], [], settings)
+            return
+
+        link_safety_warnings = []
+        if is_active_view_scope(settings):
+            arch_links = sanitize_links_for_scope(arch_links, settings, link_safety_warnings, u"Architecture Link")
+            struct_links = sanitize_links_for_scope(struct_links, settings, link_safety_warnings, u"Structure Link")
+            for warning in link_safety_warnings:
+                print(u"[SAFE MODE] {0}".format(warning))
+
         if category_key in (u"room", u"firewall") and not arch_links:
             forms.alert(
-                u"Inspect {0} cần Architecture Link (Room + Fire Wall).".format(
+                u"Inspect {0} không có Architecture Link hợp lệ trong scope hiện tại.\n\n"
+                u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "
+                u"Hãy chuyển Entire Model hoặc Pick lại Link phù hợp.".format(
                     INSPECT_LABELS.get(category_key, category_key)
                 ),
                 title="Linked Clash Checker"
@@ -2129,7 +2638,9 @@ def main():
 
         if category_key in (u"beam", u"column") and not struct_links:
             forms.alert(
-                u"Inspect {0} cần Structure Link.".format(
+                u"Inspect {0} không có Structure Link hợp lệ trong scope hiện tại.\n\n"
+                u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "
+                u"Hãy chuyển Entire Model hoặc Pick lại Link phù hợp.".format(
                     INSPECT_LABELS.get(category_key, category_key)
                 ),
                 title="Linked Clash Checker"
@@ -2140,18 +2651,29 @@ def main():
         return
 
     # --------------------------------------------------------
-    # NORMAL CLASH MODE
+    # NORMAL CLASH MODE - V2.9 SAFE LINK VALIDATION
     # --------------------------------------------------------
+    link_safety_warnings = []
+    if is_active_view_scope(settings):
+        arch_links = sanitize_links_for_scope(arch_links, settings, link_safety_warnings, u"Architecture Link")
+        struct_links = sanitize_links_for_scope(struct_links, settings, link_safety_warnings, u"Structure Link")
+        for warning in link_safety_warnings:
+            print(u"[SAFE MODE] {0}".format(warning))
+
     if (settings["target_room"] or settings["target_firewall"]) and not arch_links:
         forms.alert(
-            u"Bạn đang kiểm tra Room / Fire Rated Wall nhưng chưa có Architecture Link.",
+            u"Không có Architecture Link hợp lệ trong scope hiện tại.\n\n"
+            u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "
+            u"Hãy chuyển Entire Model hoặc Pick lại Link phù hợp.",
             title="Linked Clash Checker"
         )
         script.exit()
 
     if (settings["target_beam"] or settings["target_column"]) and not struct_links:
         forms.alert(
-            u"Bạn đang kiểm tra Beam / Column nhưng chưa có Structure Link.",
+            u"Không có Structure Link hợp lệ trong scope hiện tại.\n\n"
+            u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "
+            u"Hãy chuyển Entire Model hoặc Pick lại Link phù hợp.",
             title="Linked Clash Checker"
         )
         script.exit()

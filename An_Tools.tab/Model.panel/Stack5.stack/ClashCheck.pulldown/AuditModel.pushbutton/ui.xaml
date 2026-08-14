@@ -1,6 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Linked Clash Checker V2.6"
+        Title="Linked Clash Checker V2.8"
         Width="740" Height="920"
         MinWidth="700" MinHeight="760"
         WindowStartupLocation="CenterScreen"
@@ -11,9 +11,9 @@
             <Border BorderBrush="#4472C4" BorderThickness="2" CornerRadius="6"
                     Background="#DDEBF7" Padding="10" Margin="0,0,0,12">
                 <StackPanel>
-                    <TextBlock Text="V2.6 - GROUPED CLASH + LINKED ZOOM"
+                    <TextBlock Text="V2.8 - ACTIVE VIEW REGION + PIPE DIRECTION + GROUPED CLASH"
                                FontSize="20" FontWeight="Bold" Foreground="#203864"/>
-                    <TextBlock Text="Scope phải hiển thị: Entire Model / Active View. Inspection Mode nằm ngay bên dưới."
+                    <TextBlock Text="Scope: Entire Model / Active View / Pick Region in Active View. Region chỉ giới hạn MEP Host dùng để clash."
                                Margin="0,3,0,0" FontWeight="SemiBold" TextWrapping="Wrap"/>
                 </StackPanel>
             </Border>
@@ -32,7 +32,7 @@
                     <TextBlock Text="INSPECTION MODE - SELECT / ZOOM"
                                FontSize="17" FontWeight="Bold" Foreground="#9E480E"/>
                     <TextBlock x:Name="tb_ui_version"
-                               Text="UI V2.6 - Grouped Clash + Linked Zoom ready"
+                               Text="UI V2.8 - Active View Region ready"
                                Margin="0,2,0,8" FontWeight="SemiBold" Foreground="#9E480E"/>
 
                     <CheckBox x:Name="cb_inspection_mode"
@@ -68,7 +68,12 @@
                     <RadioButton x:Name="rb_scope_model" GroupName="scope"
                                  Content="Entire Model - quét toàn bộ model" Margin="0,2,0,4"/>
                     <RadioButton x:Name="rb_scope_view" GroupName="scope"
-                                 Content="Active View - chỉ phạm vi view hiện hành" Margin="0,2,0,4"/>
+                                 Content="Active View - toàn bộ MEP đang thuộc view hiện hành" Margin="0,2,0,4"/>
+                    <RadioButton x:Name="rb_scope_region" GroupName="scope"
+                                 Content="Pick Region in Active View - kéo 1 vùng để giới hạn Pipe / Accessories / Fittings"
+                                 Margin="0,2,0,4"/>
+                    <TextBlock Margin="18,2,0,4" Foreground="#9E480E" TextWrapping="Wrap"
+                               Text="Khi chọn Pick Region: sau khi bấm RUN CHECK, UI đóng và Revit cho kéo một khung chữ nhật. Chỉ MEP Host trong khung được dùng để check; Linked targets vẫn theo Active View."/>
                     <TextBlock x:Name="tb_active_view" Margin="18,3,0,0"
                                Foreground="Gray" TextWrapping="Wrap"/>
                 </StackPanel>
@@ -78,6 +83,16 @@
                 <StackPanel Margin="10">
                     <CheckBox x:Name="cb_host_all" Content="Chọn tất cả MEP" FontWeight="Bold" Margin="0,0,0,7"/>
                     <CheckBox x:Name="cb_pipe" Content="Pipe" Margin="14,2,0,2"/>
+                    <StackPanel Margin="34,2,0,6">
+                        <CheckBox x:Name="cb_pipe_vertical"
+                                  Content="Vertical Pipe - Ống đứng / trục gần song song Global Z"
+                                  Margin="0,2,0,2"/>
+                        <CheckBox x:Name="cb_pipe_horizontal"
+                                  Content="Horizontal / Sloped Pipe - Ống ngang, gồm cả không dốc và có slope"
+                                  Margin="0,2,0,2"/>
+                        <TextBlock Margin="0,3,0,0" Foreground="Gray" TextWrapping="Wrap"
+                                   Text="Hai lựa chọn này áp dụng cho Clash Check và cả Inspection Mode khi chọn Pipe. Tick cả hai = kiểm tra toàn bộ Pipe."/>
+                    </StackPanel>
                     <CheckBox x:Name="cb_accessory" Content="Pipe Accessories" Margin="14,2,0,2"/>
                     <CheckBox x:Name="cb_fitting" Content="Pipe Fittings" Margin="14,2,0,2"/>
                 </StackPanel>
