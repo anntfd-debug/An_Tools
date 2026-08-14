@@ -1,6 +1,6 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Correct Pipes &amp; Fittings V5.8.3 Dual Mode - Revit 2025/2026"
+        Title="Correct Pipes &amp; Fittings V5.8.5 Dual Mode - Revit 2025/2026"
         Height="900" Width="1180" MinHeight="620" MinWidth="820"
         WindowStartupLocation="CenterScreen" ResizeMode="CanResizeWithGrip">
     <Grid Margin="12">
@@ -17,7 +17,7 @@
                 <Border Background="#EEF6FF" BorderBrush="#B7D7F2" BorderThickness="1" Padding="10" Margin="0,0,0,9">
                     <StackPanel>
                         <TextBlock Text="Correct Pipes &amp; Fittings — Dual Mode" FontSize="17" FontWeight="Bold" Foreground="#0B4778"/>
-                        <TextBlock Text="V5.8.3 Universal / Revit 2025-2026: Dual Mode + Size Range + Full Fitting Scan. Transition/Reducer dùng Native Revit ChangeTypeId, không recreate, không auto-size và không chỉnh góc/xoay. Option 2 chỉ dùng Family/Type đã load sẵn trong project." TextWrapping="Wrap" Margin="0,4,0,0"/>
+                        <TextBlock Text="V5.8.5 Universal / Revit 2025-2026: System Type Lock + Dual Mode + Size Range. Tool khóa System Type của Pipe trước/sau mọi thay đổi; mixed-system fitting mặc định được bỏ qua. Tê/Wye giảm kiểm tra size theo RUN/BRANCH; isolated fallback và Transition Native ChangeTypeId vẫn được giữ." TextWrapping="Wrap" Margin="0,4,0,0"/>
                     </StackPanel>
                 </Border>
 
@@ -147,11 +147,23 @@
 
                 <Border Background="#FFF8E8" BorderBrush="#E1B65A" BorderThickness="1" Padding="9" Margin="0,0,0,10">
                     <StackPanel>
-                        <TextBlock FontWeight="Bold" Foreground="#8A5200" Text="Quy tắc V5.8.3:"/>
+                        <TextBlock FontWeight="Bold" Foreground="#8A5200" Text="Quy tắc V5.8.5:"/>
                         <TextBlock TextWrapping="Wrap" Margin="0,4,0,0"
-                                   Text="• Option 1: Pipe Type mới quyết định fitting qua Routing Preferences.&#x0a;• Option 2: người dùng chỉ định đúng FamilySymbol đã load sẵn trong project; mỗi PartType tối đa 1 type. Không còn Nạp Family/Reload Family trong UI.&#x0a;• Transition/Reducer: dùng Native Revit ChangeTypeId trực tiếp trên fitting hiện hữu; không recreate, không auto-size, không rotate/flip và không trim/extend ống.&#x0a;• Các PartType khác tiếp tục dùng centerline alignment, auto-size, reconnect và rollback từng fitting khi cần.&#x0a;• Cả hai Option đều dùng chung Min/Max Pipe Size."/>
+                                   Text="• Option 1: Pipe Type mới quyết định fitting qua Routing Preferences.&#x0a;• Option 2: người dùng chỉ định đúng FamilySymbol đã load sẵn trong project; mỗi PartType tối đa 1 type. Không còn Nạp Family/Reload Family trong UI.&#x0a;• Transition/Reducer: dùng Native Revit ChangeTypeId trực tiếp trên fitting hiện hữu; không recreate, không auto-size, không rotate/flip và không trim/extend ống.&#x0a;• Các PartType khác tiếp tục dùng centerline alignment, auto-size, reconnect và rollback từng fitting khi cần.&#x0a;• SYSTEM TYPE LOCK luôn bật: Pipe Type/Fitting Type có thể đổi nhưng System Type của Pipe không được phép thay đổi.&#x0a;• Cả hai Option đều dùng chung Min/Max Pipe Size."/>
                     </StackPanel>
                 </Border>
+
+                <GroupBox Header="5. Bảo vệ System Type V5.8.5 — SYSTEM TYPE LOCK luôn bật" FontWeight="Bold" Margin="0,0,0,10" BorderBrush="#B64040">
+                    <StackPanel Margin="8">
+                        <TextBlock Text="Tool chỉ được đổi Pipe Type / Fitting Type. System Type của từng Pipe phải giữ nguyên tuyệt đối trước và sau thao tác; nếu Revit tự tái gán System Type, SubTransaction sẽ rollback."
+                                   TextWrapping="Wrap" Foreground="#8A1F1F" FontWeight="Bold"/>
+                        <CheckBox x:Name="chk_SkipMixedSystemFittings" IsChecked="True" Margin="0,8,0,0"
+                                  Content="Bỏ qua fitting đang nối trực tiếp các Pipe thuộc nhiều System Type (khuyến nghị)"
+                                  Foreground="#8A1F1F" FontWeight="Bold"/>
+                        <TextBlock Margin="22,4,0,0" TextWrapping="Wrap" Foreground="#666666"
+                                   Text="Nếu bỏ tick, tool được phép xử lý thử mixed-system fitting nhưng vẫn snapshot System Type của từng Pipe partner. Chỉ cần một Pipe đổi System Type là fitting đó rollback; trước khi commit toàn batch còn có một lớp kiểm tra System Type lần cuối."/>
+                    </StackPanel>
+                </GroupBox>
 
                 <StackPanel Margin="0,0,0,2">
                     <WrapPanel Orientation="Horizontal">
@@ -173,7 +185,7 @@
                      VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" IsReadOnly="True" FontWeight="Normal"/>
         </GroupBox>
 
-        <Button Grid.Row="4" x:Name="btn_Replace" Content="Thực hiện — Auto Routing + Size Range" Height="44"
+        <Button Grid.Row="4" x:Name="btn_Replace" Content="Thực hiện — System Type Lock + Dual Mode" Height="44"
                 FontWeight="Bold" FontSize="14" Background="#007ACC" Foreground="White" Click="replace_click"/>
     </Grid>
 </Window>

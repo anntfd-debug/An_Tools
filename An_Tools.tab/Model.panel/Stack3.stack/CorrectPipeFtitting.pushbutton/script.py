@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__ = "Correct Pipes & Fittings"
-__doc__ = "V5.8.3 Universal / Revit 2025-2026: Transition uses native Revit ChangeTypeId without rotate/recreate; Option 2 uses only fitting types already loaded in the project."
+__doc__ = "V5.8.5 Universal / Revit 2025-2026: System Type Lock + role-aware reducing Tee sizing + isolated fitting fallback; Transition uses native Revit ChangeTypeId; Manual mode uses only fitting types already loaded in the project."
 
 import os
 import traceback
@@ -277,6 +277,211 @@ def get_system_type_id(elem):
 
     return DB.ElementId.InvalidElementId
 
+
+
+# ============================================================
+# V5.8.5 System Type Lock helpers
+# ============================================================
+
+def _system_type_snapshot_name(system_value):
+    """Readable PipingSystemType name for a stored Int64 id value."""
+    if system_value is None:
+        return u"<Không có System Type>"
+    try:
+        elem = doc.GetElement(make_element_id(system_value))
+        if elem is not None:
+            return get_real_name(elem)
+    except Exception:
+        pass
+    return u"System ID {}".format(system_value)
+
+
+def _pipe_system_record(pipe):
+    """Return immutable System Type information for one Pipe."""
+    if pipe is None:
+        return None
+    try:
+        if not is_pipe(pipe):
+            return None
+    except Exception:
+        return None
+    try:
+        owner_id = element_id_value(pipe.Id)
+    except Exception:
+        owner_id = None
+    if owner_id is None:
+        return None
+    try:
+        sid = get_system_type_id(pipe)
+        sval = element_id_value(sid) if is_valid_element_id(sid) else None
+    except Exception:
+        sval = None
+    return {
+        'owner_id': owner_id,
+        'system_value': sval,
+        'system_name': _system_type_snapshot_name(sval),
+    }
+
+
+def snapshot_pipe_systems_from_owner_ids(owner_ids):
+    """Snapshot System Type of Pipe owners only.
+
+    V5.8.5 deliberately protects the Pipe System Type, not the transient System
+    value exposed by a fitting instance. A fitting can sit on a boundary between
+    different systems, while each connected Pipe must retain its own System Type.
+    """
+    result = {}
+    for raw_id in list(owner_ids or []):
+        try:
+            value = element_id_value(raw_id) if isinstance(raw_id, DB.ElementId) else int(raw_id)
+        except Exception:
+            value = None
+        if value is None or value in result:
+            continue
+        try:
+            owner = doc.GetElement(make_element_id(value))
+        except Exception:
+            owner = None
+        rec = _pipe_system_record(owner)
+        if rec is not None:
+            result[value] = rec
+    return result
+
+
+def snapshot_pipe_systems_from_links(links):
+    owner_ids = []
+    for link in list(links or []):
+        try:
+            owner_ids.append(link.get('partner_owner_id'))
+        except Exception:
+            pass
+    return snapshot_pipe_systems_from_owner_ids(owner_ids)
+
+
+def snapshot_pipe_systems_from_elements(elements):
+    owner_ids = []
+    for elem in list(elements or []):
+        try:
+            if is_pipe(elem):
+                owner_ids.append(elem.Id)
+        except Exception:
+            pass
+    return snapshot_pipe_systems_from_owner_ids(owner_ids)
+
+
+def merge_system_lock_snapshots(*snapshots):
+    result = {}
+    for snap in snapshots:
+        for key, rec in dict(snap or {}).items():
+            if key not in result:
+                result[key] = rec
+    return result
+
+
+def validate_pipe_system_snapshot(snapshot):
+    """Validate invariant: every protected Pipe keeps exactly the same System Type."""
+    changes = []
+    for owner_id, before in dict(snapshot or {}).items():
+        try:
+            owner = doc.GetElement(make_element_id(owner_id))
+        except Exception:
+            owner = None
+        if owner is None:
+            changes.append(u"Pipe ID {} không còn tồn tại".format(owner_id))
+            continue
+        if not is_pipe(owner):
+            changes.append(u"Element ID {} không còn là Pipe".format(owner_id))
+            continue
+        after = _pipe_system_record(owner)
+        before_val = before.get('system_value') if before else None
+        after_val = after.get('system_value') if after else None
+        if before_val != after_val:
+            changes.append(
+                u"Pipe ID {}: '{}' -> '{}'"
+                .format(owner_id,
+                        before.get('system_name') if before else u"?",
+                        after.get('system_name') if after else u"?"))
+    return (len(changes) == 0), changes
+
+
+def system_lock_failure_text(changes, prefix=u"SYSTEM TYPE LOCK"):
+    lines = list(changes or [])
+    if not lines:
+        return prefix
+    return u"{}: {}".format(prefix, u"; ".join(lines))
+
+
+def fitting_connected_pipe_system_snapshot(fitting):
+    """System snapshot of Pipes physically connected to one fitting."""
+    try:
+        return snapshot_pipe_systems_from_links(snapshot_fitting_connections(fitting))
+    except Exception:
+        return {}
+
+
+def fitting_connected_system_values(fitting):
+    snap = fitting_connected_pipe_system_snapshot(fitting)
+    values = []
+    for rec in snap.values():
+        value = rec.get('system_value')
+        if value is not None and value not in values:
+            values.append(value)
+    return values
+
+
+def fitting_is_mixed_system_boundary(fitting):
+    values = fitting_connected_system_values(fitting)
+    return len(values) > 1
+
+
+def fitting_mixed_system_description(fitting):
+    snap = fitting_connected_pipe_system_snapshot(fitting)
+    by_system = {}
+    for owner_id, rec in snap.items():
+        key = rec.get('system_value')
+        name = rec.get('system_name') or _system_type_snapshot_name(key)
+        by_system.setdefault((key, name), []).append(owner_id)
+    if len(by_system) <= 1:
+        return u""
+    parts = []
+    for (_key, name), ids in sorted(by_system.items(), key=lambda x: safe_text(x[0][1]).lower()):
+        parts.append(u"{} -> Pipe {}".format(name, u", ".join([safe_text(i) for i in ids])))
+    return u" | ".join(parts)
+
+
+def fitting_touches_system_type(fitting, target_system_type_id):
+    """True if fitting itself OR any directly connected Pipe belongs to target system.
+
+    This prevents a mixed-system boundary fitting from disappearing merely because
+    get_system_type_id(fitting) returned the other connected system first.
+    """
+    try:
+        if same_element_id(get_system_type_id(fitting), target_system_type_id):
+            return True
+    except Exception:
+        pass
+    target_value = element_id_value(target_system_type_id)
+    if target_value is None:
+        return False
+    try:
+        return target_value in fitting_connected_system_values(fitting)
+    except Exception:
+        return False
+
+
+def batch_pipe_system_lock_snapshot(target_pipes, target_fittings):
+    """Capture all Pipes that can be affected by this batch.
+
+    Includes Pipes being type-changed plus every Pipe directly connected to a
+    fitting being processed, even when that partner Pipe is outside the selection.
+    """
+    snapshots = [snapshot_pipe_systems_from_elements(target_pipes)]
+    for fitting in list(target_fittings or []):
+        try:
+            snapshots.append(fitting_connected_pipe_system_snapshot(fitting))
+        except Exception:
+            pass
+    return merge_system_lock_snapshots(*snapshots)
 
 def get_system_type_name_by_id(system_type_id):
     try:
@@ -952,12 +1157,42 @@ def _dangerous_identity_parameter(param, storage_type, value):
     return name in dangerous_names
 
 
-def restore_instance_parameters(elem, values, safe_cross_family=False, diagnostics=None):
+
+def _dangerous_system_parameter(param):
+    """True only for parameters that can identify/drive an MEP System.
+
+    Unlike _dangerous_identity_parameter(), this does NOT reject every ElementId.
+    It is used for same-family restore where materials/other ElementId parameters
+    may still be legitimate, while System Type/Classification/Name must never be
+    copied back by the tool.
+    """
+    bip = _parameter_bip(param)
+    for attr in [
+        'RBS_PIPING_SYSTEM_TYPE_PARAM',
+        'RBS_SYSTEM_CLASSIFICATION_PARAM',
+        'RBS_SYSTEM_NAME_PARAM',
+    ]:
+        try:
+            if hasattr(DB.BuiltInParameter, attr) and bip == getattr(DB.BuiltInParameter, attr):
+                return True
+        except Exception:
+            pass
+    try:
+        name = safe_text(param.Definition.Name).strip().lower()
+    except Exception:
+        name = u''
+    return name in set([
+        u'system type', u'system classification', u'system name',
+        u'hệ thống', u'loại hệ thống', u'tên hệ thống',
+    ])
+
+def restore_instance_parameters(elem, values, safe_cross_family=False, diagnostics=None, protect_system_identity=False):
     """Restore compatible instance values.
 
     When safe_cross_family=True, never copy ElementId/type-family/system identity
-    parameters. This prevents an innocent-looking parameter restore from changing
-    the newly created fitting back to the old MEP family/type.
+    parameters. When protect_system_identity=True, System Type / classification /
+    system-name parameters are excluded even for same-family changes. This prevents
+    parameter restore from reassigning the MEP system.
     """
     restored = 0
     skipped = []
@@ -971,6 +1206,9 @@ def restore_instance_parameters(elem, values, safe_cross_family=False, diagnosti
                 if p.IsReadOnly or p.StorageType != storage_type:
                     continue
                 if safe_cross_family and _dangerous_identity_parameter(p, storage_type, value):
+                    skipped.append(name)
+                    break
+                if protect_system_identity and _dangerous_system_parameter(p):
                     skipped.append(name)
                     break
                 if storage_type == DB.StorageType.String:
@@ -3426,7 +3664,7 @@ def _trial_size_parameter_set(created_id, assignments, target_radius, commit_if_
         return False, 0, 0, 0, safe_text(ex)
 
 
-def try_match_direct_fitting_size(created_id, old_records):
+def try_match_direct_fitting_size(created_id, old_records, links=None):
     """Best-effort sizing for exact-symbol direct placement (V4.8).
 
     V4.2 could only trial ONE instance parameter at a time. That fails on many
@@ -3454,7 +3692,7 @@ def try_match_direct_fitting_size(created_id, old_records):
     # V4.8: unequal-size fittings need a different solver. Do not silently
     # keep the Family default size because the later alignment/connect check
     # will correctly reject it. Configure all required port sizes first.
-    variable_result, variable_note = try_match_direct_fitting_variable_size(created_id, old_records)
+    variable_result, variable_note = try_match_direct_fitting_variable_size(created_id, old_records, links)
     if variable_result is not None:
         return variable_result, variable_note
 
@@ -3496,7 +3734,7 @@ def try_match_direct_fitting_size(created_id, old_records):
     raw_candidates = _collect_size_driver_candidates(current, max_items=10)
 
     if not raw_candidates:
-        type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+        type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records, links)
         if type_ok:
             return True, type_note
         current = doc.GetElement(created_id)
@@ -3581,10 +3819,10 @@ def try_match_direct_fitting_size(created_id, old_records):
     for r in probes:
         probe_text.append(u"{}->{}/{} @ {:.6f}".format(
             r.get('name', u'?'), r.get('matched', 0), r.get('total', 0), r.get('value', 0.0)))
-    type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+    type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records, links)
     if type_ok:
         return True, type_note
-    return False, (u"auto-size V5.8.3 không giải được đồng thời tất cả connector bằng instance parameter; "
+    return False, (u"auto-size V5.8.5 không giải được đồng thời tất cả connector bằng instance parameter; "
                    u"target radius {:.6f} ft; size hiện tại {}; probe [{}]; double params [{}] | {}"
                    .format(target_radius, safe_text(current_sizes), u"; ".join(probe_text),
                            writable_double_parameter_diagnostics(current), type_note))
@@ -3646,6 +3884,167 @@ def _radius_multiset_matches(actual_radii, target_radii):
     matched, total = _count_radius_multiset_matches(actual_radii, target_radii)
     return bool(total > 0 and actual_radii is not None and
                 len(actual_radii) == len(target_radii) and matched == total)
+
+
+def _most_collinear_pair_indices(axes):
+    """Return the connector-index pair that best represents the Tee/Wye run."""
+    axes = list(axes or [])
+    if len(axes) < 2:
+        return None, None
+    best_pair = None
+    best_score = -1.0
+    for i in range(len(axes)):
+        ai = _safe_unit(axes[i])
+        if ai is None:
+            continue
+        for j in range(i + 1, len(axes)):
+            aj = _safe_unit(axes[j])
+            if aj is None:
+                continue
+            try:
+                score = abs(max(-1.0, min(1.0, ai.DotProduct(aj))))
+            except Exception:
+                continue
+            if score > best_score:
+                best_score = score
+                best_pair = (i, j)
+    return best_pair, best_score
+
+
+def _tee_role_target_from_old_records(old_records, links=None):
+    """Build a role-aware size target for a 3-port Tee/Wye.
+
+    V5.8.3 compared only the unordered multiset of connector radii. That can
+    accept DN160/DN160/DN150 even when DN150 is on a RUN port instead of the
+    BRANCH. V5.8.5 preserves the intrinsic Tee role: the most-collinear pair is
+    RUN A/RUN B and the remaining connector is BRANCH.
+    """
+    records = list(old_records or [])
+    if len(records) != 3:
+        return None
+    radii = _round_target_radii(records)
+    if radii is None or len(radii) != 3:
+        return None
+    try:
+        axes = target_axes_for_old_ports(records, links or [])
+    except Exception:
+        axes = [r.get('axis') for r in records]
+    pair, score = _most_collinear_pair_indices(axes)
+    if pair is None:
+        return None
+    # Require a clearly identifiable main run. A real Tee/Wye normally has a
+    # near-opposite connector pair; if content is exotic, fall back to the old
+    # unordered solver rather than imposing a false role.
+    if score is None or score < 0.94:
+        return None
+    branch_index = [i for i in range(3) if i not in pair][0]
+    return {
+        'kind': u'tee3',
+        'run_indices': tuple(pair),
+        'branch_index': branch_index,
+        'run_radii': sorted([float(radii[pair[0]]), float(radii[pair[1]])]),
+        'branch_radius': float(radii[branch_index]),
+        'axis_score': float(score),
+    }
+
+
+def _tee_role_profile_from_element(elem):
+    ports = list(physical_connectors(elem) or [])
+    if len(ports) != 3:
+        return None
+    radii = _round_port_radii(elem)
+    if radii is None or len(radii) != 3:
+        return None
+    axes = [connector_axis(c) for c in ports]
+    pair, score = _most_collinear_pair_indices(axes)
+    if pair is None or score is None or score < 0.94:
+        return None
+    branch_index = [i for i in range(3) if i not in pair][0]
+    return {
+        'kind': u'tee3',
+        'run_indices': tuple(pair),
+        'branch_index': branch_index,
+        'run_radii': sorted([float(radii[pair[0]]), float(radii[pair[1]])]),
+        'branch_radius': float(radii[branch_index]),
+        'axis_score': float(score),
+    }
+
+
+def _radii_pair_matches(a, b):
+    if a is None or b is None or len(a) != len(b):
+        return False
+    aa = sorted([float(x) for x in a])
+    bb = sorted([float(x) for x in b])
+    return all(abs(x - y) <= SIZE_TOLERANCE_FT for x, y in zip(aa, bb))
+
+
+def _tee_role_profiles_match(actual_role, target_role):
+    if not actual_role or not target_role:
+        return True
+    if target_role.get('kind') != u'tee3' or actual_role.get('kind') != u'tee3':
+        return True
+    if not _radii_pair_matches(actual_role.get('run_radii'), target_role.get('run_radii')):
+        return False
+    try:
+        return abs(float(actual_role.get('branch_radius')) -
+                   float(target_role.get('branch_radius'))) <= SIZE_TOLERANCE_FT
+    except Exception:
+        return False
+
+
+def _radius_to_dn_text(radius):
+    try:
+        mm = float(radius) * 2.0 * 304.8
+        if abs(mm - round(mm)) <= 0.02:
+            return u'DN{}'.format(int(round(mm)))
+        return u'DN{:.1f}'.format(mm)
+    except Exception:
+        return u'?'
+
+
+def _tee_role_profile_text(role):
+    if not role or role.get('kind') != u'tee3':
+        return u'n/a'
+    runs = role.get('run_radii') or []
+    branch = role.get('branch_radius')
+    return u'RUN {} / {} | BRANCH {}'.format(
+        _radius_to_dn_text(runs[0]) if len(runs) > 0 else u'?',
+        _radius_to_dn_text(runs[1]) if len(runs) > 1 else u'?',
+        _radius_to_dn_text(branch))
+
+
+def _radius_profile_matches_element(elem, target_radii, role_target=None):
+    """Validate both total sizes and, for a Tee/Wye, run-vs-branch placement."""
+    actual = _round_port_radii(elem)
+    matched, total = _count_radius_multiset_matches(actual, target_radii)
+    multiset_ok = bool(total > 0 and actual is not None and
+                       len(actual) == len(target_radii) and matched == total)
+    if not multiset_ok:
+        return False, actual, matched, total, u''
+    if role_target:
+        actual_role = _tee_role_profile_from_element(elem)
+        if not _tee_role_profiles_match(actual_role, role_target):
+            # Keep probe counts meaningful: all diameters exist, but one role is
+            # wrong, so report one logical port as unresolved.
+            logical_matched = max(0, total - 1)
+            return False, actual, logical_matched, total, (
+                u'role SAI: target [{}] -> actual [{}]'.format(
+                    _tee_role_profile_text(role_target),
+                    _tee_role_profile_text(actual_role)))
+        return True, actual, matched, total, (
+            u'role OK [{}]'.format(_tee_role_profile_text(role_target)))
+    return True, actual, matched, total, u''
+
+
+def _old_port_role_name(old_records, links, index):
+    role = _tee_role_target_from_old_records(old_records, links)
+    if not role:
+        return u'PORT {}'.format(index + 1)
+    if index == role.get('branch_index'):
+        return u'BRANCH'
+    if index in (role.get('run_indices') or ()):
+        return u'RUN'
+    return u'PORT {}'.format(index + 1)
 
 
 
@@ -3715,7 +4114,7 @@ def _assign_instance_symbol_same_family(elem, symbol):
     elem.ChangeTypeId(symbol.Id)
 
 
-def _trial_existing_family_symbol_profile(created_id, symbol, target_radii, commit_if_match=False):
+def _trial_existing_family_symbol_profile(created_id, symbol, target_radii, role_target=None, commit_if_match=False):
     st = DB.SubTransaction(doc)
     started = False
     try:
@@ -3728,13 +4127,13 @@ def _trial_existing_family_symbol_profile(created_id, symbol, target_radii, comm
         _assign_instance_symbol_same_family(elem, symbol)
         doc.Regenerate()
         elem = doc.GetElement(created_id)
-        actual = _round_port_radii(elem)
-        ok = _radius_multiset_matches(actual, target_radii)
+        ok, actual, matched, total, role_note = _radius_profile_matches_element(
+            elem, target_radii, role_target)
         if ok and commit_if_match:
             st.Commit()
         else:
             st.RollBack()
-        return ok, actual, u''
+        return ok, actual, role_note
     except Exception as ex:
         if started:
             try:
@@ -3745,7 +4144,7 @@ def _trial_existing_family_symbol_profile(created_id, symbol, target_radii, comm
 
 
 def _trial_duplicate_symbol_profile(created_id, assignments, target_radii, duplicate_name,
-                                    commit_if_match=False):
+                                    role_target=None, commit_if_match=False):
     """Duplicate the selected type, change TYPE parameters, then test connector sizes.
 
     Failed trials are rolled back completely.  A successful trial commits the
@@ -3798,13 +4197,13 @@ def _trial_duplicate_symbol_profile(created_id, assignments, target_radii, dupli
         _assign_instance_symbol_same_family(elem, dup_symbol)
         doc.Regenerate()
         elem = doc.GetElement(created_id)
-        actual = _round_port_radii(elem)
-        ok = _radius_multiset_matches(actual, target_radii)
+        ok, actual, matched, total, role_note = _radius_profile_matches_element(
+            elem, target_radii, role_target)
         if ok and commit_if_match:
             st.Commit()
-            return True, actual, set_count, u'', dup_symbol.Id
+            return True, actual, set_count, role_note, dup_symbol.Id
         st.RollBack()
-        return False, actual, set_count, u'', None
+        return False, actual, set_count, role_note, None
     except Exception as ex:
         if started:
             try:
@@ -3814,8 +4213,8 @@ def _trial_duplicate_symbol_profile(created_id, assignments, target_radii, dupli
         return False, None, 0, safe_text(ex), None
 
 
-def try_match_direct_fitting_size_by_type(created_id, old_records, max_trials=180):
-    """V5.8.3 fallback for content whose connector sizes are TYPE-driven.
+def try_match_direct_fitting_size_by_type(created_id, old_records, links=None, max_trials=180):
+    """V5.8.5 fallback for content whose connector sizes are TYPE-driven.
 
     Strategy:
       1) try every already-loaded sibling FamilySymbol in the SAME Family;
@@ -3826,6 +4225,7 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, max_trials=18
     target_radii = _round_target_radii(old_records)
     if target_radii is None or not target_radii:
         return False, u'type-size fallback chỉ hỗ trợ connector tròn'
+    role_target = _tee_role_target_from_old_records(old_records, links)
     elem = doc.GetElement(created_id)
     if elem is None:
         return False, u'fitting mới không tồn tại'
@@ -3842,20 +4242,21 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, max_trials=18
         except Exception:
             pass
         ok, actual, err = _trial_existing_family_symbol_profile(
-            created_id, fs, target_radii, commit_if_match=False)
+            created_id, fs, target_radii, role_target=role_target, commit_if_match=False)
         if ok:
             ok2, actual2, err2 = _trial_existing_family_symbol_profile(
-                created_id, fs, target_radii, commit_if_match=True)
+                created_id, fs, target_radii, role_target=role_target, commit_if_match=True)
             if ok2:
-                return True, (u"V5.8.3 type-size: dùng type đã load cùng Family '{}'; "
+                return True, (u"V5.8.5 type-size: dùng type đã load cùng Family '{}'; "
                               u"connector profile {}"
-                              .format(get_real_name(fs), safe_text(actual2)))
+                              .format(get_real_name(fs), safe_text(actual2)) +
+                              ((u"; " + _tee_role_profile_text(role_target)) if role_target else u""))
         if err:
             existing_notes.append(u"{}: {}".format(get_real_name(fs), err))
 
     type_candidates = _collect_size_driver_candidates(base_symbol, max_items=8)
     if not type_candidates:
-        return False, (u"V5.8.3 type-size: không có type cùng Family khớp profile và không tìm được "
+        return False, (u"V5.8.5 type-size: không có type cùng Family khớp profile và không tìm được "
                        u"TYPE parameter Diameter/DN/Radius/Size có thể ghi; target radii {}; "
                        u"type double params [{}]"
                        .format(safe_text(sorted(target_radii)),
@@ -3896,13 +4297,15 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, max_trials=18
                 # Failed trials roll back, therefore the same candidate name can be reused.
                 trial_name = profile_name
                 ok, actual, set_count, err, new_type_id = _trial_duplicate_symbol_profile(
-                    created_id, assignments, target_radii, trial_name, commit_if_match=True)
+                    created_id, assignments, target_radii, trial_name,
+                    role_target=role_target, commit_if_match=True)
                 probe.append((assignments, actual, err))
                 if ok:
                     names = u", ".join([u"{}={:.6f}".format(a[1], a[2]) for a in assignments])
-                    return True, (u"V5.8.3 TYPE auto-size: duplicate '{}' -> '{}'; [{}] ft; "
+                    return True, (u"V5.8.5 TYPE auto-size: duplicate '{}' -> '{}'; [{}] ft; "
                                   u"connector profile {} đúng. Type gốc không bị sửa."
-                                  .format(base_name, trial_name, names, safe_text(actual)))
+                                  .format(base_name, trial_name, names, safe_text(actual)) +
+                                  ((u"; " + _tee_role_profile_text(role_target)) if role_target else u""))
             if trial_count > max_trials:
                 break
         if trial_count > max_trials:
@@ -3913,7 +4316,7 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, max_trials=18
         names = u",".join([u"{}={:.4f}".format(a[1], a[2]) for a in assignments])
         probe_text.append(u"[{}]->{}{}".format(names, safe_text(actual),
                                                   (u" ERR=" + safe_text(err)) if err else u""))
-    return False, (u"V5.8.3 TYPE auto-size không giải được profile; target radii {}; "
+    return False, (u"V5.8.5 TYPE auto-size không giải được profile; target radii {}; "
                    u"TYPE size-driver [{}]; thử {} tổ hợp; probe [{}]; type double params [{}]"
                    .format(safe_text(sorted(target_radii)),
                            u", ".join([safe_text(x[1]) for x in type_candidates]),
@@ -3922,7 +4325,7 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, max_trials=18
 
 
 def _trial_size_parameter_profile(created_id, assignments, target_radii,
-                                  commit_if_match=False):
+                                  role_target=None, commit_if_match=False):
     """Trial an atomic parameter set against an UNEQUAL round-size profile."""
     st = DB.SubTransaction(doc)
     started = False
@@ -3950,14 +4353,13 @@ def _trial_size_parameter_profile(created_id, assignments, target_radii,
 
         doc.Regenerate()
         elem = doc.GetElement(created_id)
-        actual = _round_port_radii(elem)
-        matched, total = _count_radius_multiset_matches(actual, target_radii)
-        all_match = bool(actual is not None and len(actual) == len(target_radii) and matched == total)
+        all_match, actual, matched, total, role_note = _radius_profile_matches_element(
+            elem, target_radii, role_target)
         if all_match and commit_if_match:
             st.Commit()
         else:
             st.RollBack()
-        return all_match, matched, total, set_count, u'', actual
+        return all_match, matched, total, set_count, role_note, actual
     except Exception as ex:
         if started:
             try:
@@ -3967,10 +4369,11 @@ def _trial_size_parameter_profile(created_id, assignments, target_radii,
         return False, 0, len(target_radii or []), 0, safe_text(ex), None
 
 
-def try_match_direct_fitting_variable_size(created_id, old_records):
+def try_match_direct_fitting_variable_size(created_id, old_records, links=None):
     """V4.8 auto-size solver for reducing fittings with unequal round ports.
 
-    The solver does NOT assume connector enumeration order. It compares the
+    The solver does NOT assume connector enumeration order. For 3-port Tee/Wye
+    it preserves RUN-vs-BRANCH size roles; for other topologies it compares the
     multiset of actual connector radii with the target multiset, then searches
     combinations of writable instance Diameter/DN/Radius parameters. This is
     intended for families such as reducing Tee/Elbow where e.g. Diameter 1
@@ -3982,12 +4385,15 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
     if not size_profile_is_variable([(u'round', r) for r in target_radii]):
         return None, u""
 
+    role_target = _tee_role_target_from_old_records(old_records, links)
     current = doc.GetElement(created_id)
     if current is None:
         return False, u"fitting mới không tồn tại"
-    actual = _round_port_radii(current)
-    if _radius_multiset_matches(actual, target_radii):
-        return True, u"size giảm đã đúng {}".format(safe_text(sorted(target_radii)))
+    profile_ok, actual, matched0, total0, role_note0 = _radius_profile_matches_element(
+        current, target_radii, role_target)
+    if profile_ok:
+        suffix = (u"; " + role_note0) if role_note0 else u""
+        return True, u"size giảm đã đúng {}{}".format(safe_text(sorted(target_radii)), suffix)
 
     # V4.8: use the same robust collector as the uniform-size solver.
     # The log that led to this change showed writable ``Nominal Diameter 1``
@@ -3996,7 +4402,7 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
     raw_candidates = _collect_size_driver_candidates(current, max_items=10)
 
     if not raw_candidates:
-        type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+        type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records, links)
         if type_ok:
             return True, type_note
         return False, (u"fitting giảm không có instance parameter Diameter/Radius/Size có thể ghi; "
@@ -4030,7 +4436,8 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
                 value_seen.add(rounded)
                 assignment = [(pid_value, pname, value)]
                 all_match, matched, total, set_count, err, after = _trial_size_parameter_profile(
-                    created_id, assignment, target_radii, commit_if_match=False)
+                    created_id, assignment, target_radii,
+                    role_target=role_target, commit_if_match=False)
                 row = {
                     'pid': pid_value, 'name': pname, 'priority': priority,
                     'value': value, 'matched': matched, 'total': total,
@@ -4040,11 +4447,13 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
                 diagnostics.append(row)
                 if all_match:
                     ok, m2, t2, sc2, err2, after2 = _trial_size_parameter_profile(
-                        created_id, assignment, target_radii, commit_if_match=True)
+                        created_id, assignment, target_radii,
+                        role_target=role_target, commit_if_match=True)
                     if ok:
-                        return True, (u"auto-size V4.8 fitting giảm: '{}'={:.6f} ft; "
-                                      u"profile {}/{} đúng"
-                                      .format(pname, value, m2, t2))
+                        role_suffix = ((u"; " + _tee_role_profile_text(role_target)) if role_target else u"")
+                        return True, (u"auto-size V5.8.5 fitting giảm: '{}'={:.6f} ft; "
+                                      u"profile {}/{} đúng{}"
+                                      .format(pname, value, m2, t2, role_suffix))
         # Deterministic order: most useful solo result first, but retain every
         # unique required-size variant for grouped trials.
         rows.sort(key=lambda r: (-int(r.get('matched', 0)), int(r.get('priority', 5)),
@@ -4092,12 +4501,14 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
                 assignments = [(key_group[i][0], key_group[i][1], values[i])
                                for i in range(group_size)]
                 ok, matched, total, set_count, err, after = _trial_size_parameter_profile(
-                    created_id, assignments, target_radii, commit_if_match=True)
+                    created_id, assignments, target_radii,
+                    role_target=role_target, commit_if_match=True)
                 if ok:
                     names = u", ".join([u"{}={:.6f}".format(a[1], a[2]) for a in assignments])
-                    return True, (u"auto-size V4.8 fitting giảm đa cỡ: [{}] ft; "
-                                  u"target radii {}; connector {}/{} đúng"
-                                  .format(names, safe_text(sorted(target_radii)), matched, total))
+                    role_suffix = ((u"; " + _tee_role_profile_text(role_target)) if role_target else u"")
+                    return True, (u"auto-size V5.8.5 fitting giảm đa cỡ: [{}] ft; "
+                                  u"target radii {}; connector {}/{} đúng{}"
+                                  .format(names, safe_text(sorted(target_radii)), matched, total, role_suffix))
             if trial_count > max_trials:
                 break
         if trial_count > max_trials:
@@ -4118,12 +4529,14 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
                         break
                     assignments = [(r['pid'], r['name'], r['value']) for r in combo]
                     ok, matched, total, set_count, err, after = _trial_size_parameter_profile(
-                        created_id, assignments, target_radii, commit_if_match=True)
+                        created_id, assignments, target_radii,
+                    role_target=role_target, commit_if_match=True)
                     if ok:
                         names = u", ".join([u"{}={:.6f}".format(r['name'], r['value']) for r in combo])
-                        return True, (u"auto-size V4.8 fitting giảm đa cỡ: [{}] ft; "
-                                      u"target radii {}; connector {}/{} đúng"
-                                      .format(names, safe_text(sorted(target_radii)), matched, total))
+                        role_suffix = ((u"; " + _tee_role_profile_text(role_target)) if role_target else u"")
+                        return True, (u"auto-size V5.8.5 fitting giảm đa cỡ: [{}] ft; "
+                                      u"target radii {}; connector {}/{} đúng{}"
+                                      .format(names, safe_text(sorted(target_radii)), matched, total, role_suffix))
                 if trial_count > max_trials:
                     break
             if trial_count > max_trials:
@@ -4131,6 +4544,10 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
 
     current = doc.GetElement(created_id)
     actual = _round_port_radii(current)
+    role_actual = _tee_role_profile_from_element(current) if role_target else None
+    role_diag = (u" | role target [{}] -> current [{}]".format(
+        _tee_role_profile_text(role_target), _tee_role_profile_text(role_actual))
+        if role_target else u"")
     probe_rows = sorted(diagnostics, key=lambda r: (-int(r.get('matched', 0)),
                                                      safe_text(r.get('name')).lower(),
                                                      float(r.get('value', 0.0))))[:18]
@@ -4141,15 +4558,15 @@ def try_match_direct_fitting_variable_size(created_id, old_records):
             safe_text(r.get('after')),
             (u" ERR=" + safe_text(r.get('error'))) if r.get('error') else u"")
         for r in probe_rows])
-    type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records)
+    type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records, links)
     if type_ok:
         return True, type_note
-    return False, (u"auto-size V5.8.3 fitting giảm không giải được instance profile đa cỡ; "
-                   u"target radii {}; hiện tại {}; size-driver [{}]; thử {} tổ hợp; "
-                   u"probe [{}]; double params [{}] | {}"
-                   .format(safe_text(sorted(target_radii)), safe_text(actual),
-                           u", ".join(candidate_names), trial_count, probe_text,
-                           writable_double_parameter_diagnostics(current), type_note))
+    return False, ((u"auto-size V5.8.5 fitting giảm không giải được instance profile đa cỡ; "
+                    u"target radii {}; hiện tại {}; size-driver [{}]; thử {} tổ hợp; "
+                    u"probe [{}]; double params [{}] | {}"
+                    .format(safe_text(sorted(target_radii)), safe_text(actual),
+                            u", ".join(candidate_names), trial_count, probe_text,
+                            writable_double_parameter_diagnostics(current), type_note)) + role_diag)
 
 
 def _parameter_is_angle_like(param):
@@ -4549,8 +4966,21 @@ def connect_axis_aligned_fitting(created, old_records, links, target_axes, assig
         if gap > RECONNECT_TOLERANCE_FT:
             raise Exception(u"Connector vẫn hở {:.6f} ft sau trim/extend".format(gap))
         if not connector_sizes_match(fc, partner):
-            raise Exception(u"Size connector fitting mới không khớp pipe ID {}"
-                            .format(element_id_value(owner.Id)))
+            role_name = _old_port_role_name(old_records, links, oi)
+            fit_sig = connector_size_signature(fc)
+            pipe_sig = connector_size_signature(partner)
+            role_target = _tee_role_target_from_old_records(old_records, links)
+            role_actual = _tee_role_profile_from_element(doc.GetElement(created_id)) if role_target else None
+            extra = u""
+            if role_target:
+                extra = (u" | Tee role target [{}] -> fitting mới [{}]"
+                         .format(_tee_role_profile_text(role_target),
+                                 _tee_role_profile_text(role_actual)))
+            raise Exception(
+                u"Size connector fitting mới không khớp pipe ID {} | role {} | "
+                u"fitting {} | pipe {}{}"
+                .format(element_id_value(owner.Id), role_name, safe_text(fit_sig),
+                        safe_text(pipe_sig), extra))
 
         dot_value = connector_dot(fc, partner)
         partner_target = copy_xyz(partner.Origin)
@@ -5019,7 +5449,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def __init__(self, xaml_file_name, preselected_ids):
         forms.WPFWindow.__init__(self, xaml_file_name)
         try:
-            self.Title = u"Correct Pipes & Fittings V5.8.3 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
+            self.Title = u"Correct Pipes & Fittings V5.8.5 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
         except Exception:
             pass
         # V4.9: size the dialog against the actual Windows work area.  The XAML
@@ -5141,9 +5571,9 @@ class ReplaceElementsWindow(forms.WPFWindow):
         except Exception:
             pass
         try:
-            self.btn_Replace.Content = (u"Thực hiện — Fitting thủ công + Size Range"
+            self.btn_Replace.Content = (u"Thực hiện — Manual + System Type Lock"
                                         if manual else
-                                        u"Thực hiện — Auto Routing + Size Range")
+                                        u"Thực hiện — Auto Routing + System Type Lock")
         except Exception:
             pass
         # Refresh the manual lists whenever they become visible. Routing symbols
@@ -5156,7 +5586,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             except Exception:
                 pass
         if log_change:
-            self.log(u"Chế độ Fitting V5.8.3: {}."
+            self.log(u"Chế độ Fitting V5.8.5: {}."
                      .format(u"CHỌN THỦ CÔNG như V5.3" if manual else u"AUTO ROUTING PREFERENCES"))
 
     def fitting_mode_click(self, sender, args):
@@ -5178,10 +5608,15 @@ class ReplaceElementsWindow(forms.WPFWindow):
         for value in self.preselected_element_ids:
             try:
                 elem = doc.GetElement(make_element_id(value))
-                sid = get_system_type_id(elem)
-                sid_value = self.id_value(sid)
-                if sid_value is not None and sid != DB.ElementId.InvalidElementId:
-                    system_values.add(sid_value)
+                if is_pipe_fitting(elem):
+                    for sid_value in fitting_connected_system_values(elem):
+                        if sid_value is not None:
+                            system_values.add(sid_value)
+                else:
+                    sid = get_system_type_id(elem)
+                    sid_value = self.id_value(sid)
+                    if sid_value is not None and sid != DB.ElementId.InvalidElementId:
+                        system_values.add(sid_value)
             except Exception:
                 pass
         if len(system_values) == 1:
@@ -5467,7 +5902,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self._set_fitting_selection_mode('manual' if saved_mode == 'manual' else 'auto', False)
             self._update_pipe_size_range_status()
             self.update_fittings_for_selected_pipe_type(clear_invalid=False)
-            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.8.3.")
+            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.8.5.")
         except Exception as ex:
             self._loading_choices = False
             try:
@@ -5612,9 +6047,9 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         if log_stats:
             if reason:
-                self.log(u"--- V5.8.3 FULL FITTING SCAN: {} ---".format(safe_text(reason)))
+                self.log(u"--- V5.8.5 FULL FITTING SCAN: {} ---".format(safe_text(reason)))
             self.log(
-                u"V5.8.3 Full Fitting Scan: direct-category {} | symbol-category {} | "
+                u"V5.8.5 Full Fitting Scan: direct-category {} | symbol-category {} | "
                 u"family-category {} | family-enumeration {} | all-element-types {} | "
                 u"instance-type {} | routing-reference {} | UNIQUE {}."
                 .format(fitting_scan_stats.get('direct_category', 0),
@@ -5647,10 +6082,11 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
     def setup_data(self):
         self.log(u"Đang đọc dữ liệu trong model...")
-        self.log(u"V5.8.3 Universal | Revit {} | ElementId 64-bit Value mode | Transition = Native ChangeTypeId.".format(
+        self.log(u"V5.8.5 Universal | Revit {} | ElementId 64-bit Value mode | Transition = Native ChangeTypeId.".format(
             REVIT_VERSION if REVIT_VERSION else u"không xác định"))
+        self.log(u"V5.8.5 SYSTEM TYPE LOCK: luôn bật; Pipe System Type được snapshot/verify ở cấp phần tử và trước commit toàn batch.")
         if REVIT_VERSION and REVIT_VERSION not in SUPPORTED_REVIT_VERSIONS:
-            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.8.3 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
+            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.8.5 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
         pipes, fittings = collect_pipes_and_fittings()
 
         # V5.8: build Min/Max dropdowns from actual Pipe diameters present
@@ -5667,7 +6103,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.cmb_MinPipeSize.SelectedIndex = 0
             self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MaxPipeSize.Items.Count - 1
         self._update_pipe_size_range_status()
-        self.log(u"V5.8.3 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
+        self.log(u"V5.8.5 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
             len(model_pipe_sizes),
             format_pipe_size(model_pipe_sizes[0]) if model_pipe_sizes else u"?",
             format_pipe_size(model_pipe_sizes[-1]) if model_pipe_sizes else u"?"))
@@ -5768,7 +6204,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             source_label = u"Fitting giảm" if variable_size else u"Fitting thường"
             if role not in allowed_roles:
                 raise Exception(
-                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.8.3"
+                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.8.5"
                     .format(part_type_enum_name(old_symbol)))
             candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
             same_role = []
@@ -5785,7 +6221,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 raise Exception(u"{} đang có {} type PartType '{}'; chỉ được chọn đúng 1"
                                 .format(source_label, len(same_role), fitting_role_display_name(role)))
             chosen = same_role[0]
-            self.log(u"Fitting {}: MANUAL V5.8.3 -> {} {} chọn '{}'.{}"
+            self.log(u"Fitting {}: MANUAL V5.8.5 -> {} {} chọn '{}'.{}"
                      .format(self.id_value(fitting.Id), source_label,
                              fitting_role_display_name(role), chosen.Name,
                              u" Profile giảm {}".format(size_text) if variable_size else u""))
@@ -5968,7 +6404,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             desired_symbol, target_point, old_params)
         created_id = created.Id
 
-        size_ok, size_note = try_match_direct_fitting_size(created_id, old_port_records)
+        size_ok, size_note = try_match_direct_fitting_size(created_id, old_port_records, links)
         doc.Regenerate()
         created = doc.GetElement(created_id)
         ports = physical_connectors(created) if created is not None else []
@@ -6041,6 +6477,72 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 .format(get_real_name(desired_symbol), size_note, len(skipped_identity)))
         return created, restored, note
 
+    def create_direct_isolated_single_port_fitting(self, desired_symbol, old_port_records, old_params):
+        """V5.8.5 exact-symbol replacement for an isolated one-port fitting.
+
+        There is deliberately no ConnectTo attempt. Geometry is restored from
+        the old fitting port itself because no external MEP relation exists.
+        """
+        if len(old_port_records) != 1:
+            raise Exception(u"Isolated single-port cần đúng 1 connector")
+        old = old_port_records[0]
+        target_point = copy_xyz(old.get('origin'))
+        target_axis = _safe_unit(old.get('axis'))
+        if target_point is None:
+            raise Exception(u"Isolated single-port không đọc được Origin cũ")
+
+        created, restored, skipped_identity = self._place_exact_fitting_symbol(
+            desired_symbol, target_point, old_params)
+        created_id = created.Id
+        size_ok, size_note = try_match_direct_fitting_size(created_id, old_port_records, [])
+        doc.Regenerate()
+        created = doc.GetElement(created_id)
+        ports = physical_connectors(created) if created is not None else []
+        if len(ports) != 1:
+            raise Exception(u"Isolated single-port: fitting mới có {} connector".format(len(ports)))
+        fc = ports[0]
+        if not size_ok and not size_signatures_match(connector_size_signature(fc), old.get('size')):
+            raise Exception(u"Isolated single-port: size không khớp | {}".format(size_note))
+
+        source_axis = _safe_unit(connector_axis(fc))
+        pivot = copy_xyz(fc.Origin)
+        axis, angle = _rotation_axis_angle(source_axis, target_axis)
+        if axis is not None and abs(angle) > 1.0e-10:
+            line = DB.Line.CreateBound(pivot, pivot + axis)
+            DB.ElementTransformUtils.RotateElement(doc, created_id, line, angle)
+            doc.Regenerate()
+
+        created = doc.GetElement(created_id)
+        ports = physical_connectors(created) if created is not None else []
+        if len(ports) != 1:
+            raise Exception(u"Isolated single-port: mất connector sau rotate")
+        fc = ports[0]
+        move = target_point - fc.Origin
+        if move.GetLength() > 1.0e-10:
+            DB.ElementTransformUtils.MoveElement(doc, created_id, move)
+            doc.Regenerate()
+
+        created = doc.GetElement(created_id)
+        ports = physical_connectors(created) if created is not None else []
+        if len(ports) != 1:
+            raise Exception(u"Isolated single-port: mất connector sau move")
+        fc = ports[0]
+        if xyz_distance(fc.Origin, target_point) > RECONNECT_TOLERANCE_FT:
+            raise Exception(u"Isolated single-port: không khôi phục được Origin cũ")
+        if target_axis is not None:
+            ca = _safe_unit(connector_axis(fc))
+            if ca is not None:
+                try:
+                    if abs(ca.DotProduct(target_axis)) < AXIS_ALIGNMENT_DOT_MIN:
+                        raise Exception(u"Isolated single-port: axis mới không khớp axis cũ")
+                except Exception:
+                    pass
+        return created, restored, (
+            u"isolated-single V5.8.5; exact FamilySymbol '{}'; {}; KHÔNG ConnectTo; "
+            u"bỏ qua {} parameter identity/ElementId"
+            .format(get_real_name(desired_symbol), size_note, len(skipped_identity)))
+
+
     def create_direct_linear_fitting(self, desired_symbol, old_port_records, old_params, links):
         """V5.8 exact-symbol replacement for two-port collinear Pipe Fittings.
 
@@ -6060,7 +6562,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         created, restored, skipped_identity = self._place_exact_fitting_symbol(
             desired_symbol, target_center, old_params)
         created_id = created.Id
-        size_ok, size_note = try_match_direct_fitting_size(created_id, old_port_records)
+        size_ok, size_note = try_match_direct_fitting_size(created_id, old_port_records, links)
         doc.Regenerate()
         created = doc.GetElement(created_id)
         new_ports = physical_connectors(created) if created is not None else []
@@ -6217,7 +6719,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if created is None:
             raise Exception(u"Direct-align: fitting mới mất sau khi hiệu chỉnh góc")
 
-        size_ok_pre, size_note = try_match_direct_fitting_size(created_id, old_port_records)
+        size_ok_pre, size_note = try_match_direct_fitting_size(created_id, old_port_records, links)
         doc.Regenerate()
         created = doc.GetElement(created_id)
         if created is None:
@@ -6332,14 +6834,24 @@ class ReplaceElementsWindow(forms.WPFWindow):
                                        part_type_enum_name(desired_symbol)))
 
         links = snapshot_fitting_connections(fitting)
+        system_lock_snapshot = snapshot_pipe_systems_from_links(links)
+        if len(set([rec.get('system_value') for rec in system_lock_snapshot.values()
+                    if rec.get('system_value') is not None])) > 1:
+            self.log(u"{}: V5.8.5 SYSTEM TYPE LOCK -> fitting là ranh giới nhiều System Type: {}"
+                     .format(label, fitting_mixed_system_description(fitting)))
         old_params = snapshot_instance_parameters(fitting)
         all_old_ports = physical_connectors(fitting)
         old_port_records = snapshot_port_geometry(fitting)
         total_port_count = len(all_old_ports)
         open_ports = get_open_physical_fitting_connectors(fitting, links)
 
-        if not links:
-            return False, u"{} | Fitting không có kết nối vật lý để recreate".format(label)
+        isolated_mode = (len(links) == 0)
+        if total_port_count <= 0:
+            return False, u"{} | Fitting không có connector vật lý để recreate".format(label)
+        if isolated_mode:
+            self.log(u"{}: V5.8.5 ISOLATED FITTING -> không có kết nối vật lý; "
+                     u"recreate exact FamilySymbol theo geometry cũ, KHÔNG ConnectTo/trim pipe."
+                     .format(label))
 
         # Diagnostics are captured before any deletion so they remain valid on error.
         current_partner_connectors = []
@@ -6440,19 +6952,26 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     doc.Regenerate()
 
                 if total_port_count == 1:
-                    self.log(u"{}: V5.8.3 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
-                             .format(label, get_real_name(desired_symbol)))
-                    created, direct_restored_pre, create_note = self.create_direct_single_port_fitting(
-                        desired_symbol, old_port_records, old_params, links)
-                    create_mode = u"direct-single"
+                    if isolated_mode:
+                        self.log(u"{}: V5.8.5 topology 1 cổng ISOLATED -> exact FamilySymbol '{}'; không ConnectTo."
+                                 .format(label, get_real_name(desired_symbol)))
+                        created, direct_restored_pre, create_note = self.create_direct_isolated_single_port_fitting(
+                            desired_symbol, old_port_records, old_params)
+                        create_mode = u"direct-isolated-single"
+                    else:
+                        self.log(u"{}: V5.8.5 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
+                                 .format(label, get_real_name(desired_symbol)))
+                        created, direct_restored_pre, create_note = self.create_direct_single_port_fitting(
+                            desired_symbol, old_port_records, old_params, links)
+                        create_mode = u"direct-single"
                 elif total_port_count == 2 and not port_axes_have_nonparallel_pair(old_port_records):
-                    self.log(u"{}: V5.8.3 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
+                    self.log(u"{}: V5.8.5 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
                              .format(label, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_linear_fitting(
                         desired_symbol, old_port_records, old_params, links)
                     create_mode = u"direct-linear"
                 else:
-                    self.log(u"{}: V5.8.3 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
+                    self.log(u"{}: V5.8.5 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
                              .format(label, total_port_count, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_aligned_fitting(
                         desired_symbol, old_port_records, old_params, links)
@@ -6545,8 +7064,16 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 raise Exception(u"Số cổng fitting thay đổi {} -> {}"
                                 .format(total_port_count, final_port_count))
 
+            lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
+            if not lock_ok:
+                raise Exception(system_lock_failure_text(
+                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
+
             st.Commit()
-            mode_text = u"recreate khác Family" if create_mode == u"routing" else u"direct-align V4.8 khác Family"
+            if isolated_mode:
+                mode_text = u"isolated-direct V5.8.5 khác Family"
+            else:
+                mode_text = u"recreate khác Family" if create_mode == u"routing" else u"direct-align V5.8.5 khác Family"
             note_text = (u"; " + create_note) if create_note else u""
             return True, (u"OK - {}; topology {} cổng; ngắt {} kết nối thật, "
                           u"dùng {} ống tạm cho cổng hở, nối lại {}/{}; khôi phục {} instance parameter; "
@@ -6574,6 +7101,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             return False, u"{} | fitting không còn tồn tại".format(label)
 
         links = snapshot_fitting_connections(fitting)
+        system_lock_snapshot = snapshot_pipe_systems_from_links(links)
         old_transform = snapshot_transform(fitting)
         old_params = snapshot_instance_parameters(fitting)
 
@@ -6593,7 +7121,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 pass
 
             doc.Regenerate()
-            restored = restore_instance_parameters(fitting, old_params)
+            restored = restore_instance_parameters(
+                fitting, old_params, protect_system_identity=True)
             doc.Regenerate()
 
             if not transform_is_preserved(fitting, old_transform):
@@ -6650,8 +7179,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
                 reconnected += 1
 
+            lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
+            if not lock_ok:
+                raise Exception(system_lock_failure_text(
+                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
+
             st.Commit()
-            return True, (u"OK - cùng Family, đã ngắt/nối lại {}/{} connector; khôi phục {} instance parameter; {}"
+            return True, (u"OK - cùng Family, đã ngắt/nối lại {}/{} connector; khôi phục {} instance parameter; SYSTEM TYPE LOCK OK; {}"
                           .format(reconnected, len(links), restored, orientation_msg))
         except Exception as ex:
             try:
@@ -6664,7 +7198,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def _is_transition_native_change(self, fitting, new_type_id):
         """True when the old or requested fitting type is a Revit Transition/Reducer.
 
-        V5.8.3 deliberately routes these parts through the native Revit type-change
+        V5.8.5 deliberately routes these parts through the native Revit type-change
         operation.  This avoids the direct-linear reconstruction/rotation solver,
         which is unnecessary for a straight reducer and can fight families whose
         connector sizes are driven internally by Revit/content lookup logic.
@@ -6693,7 +7227,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return any((u"transition" in name or u"reducer" in name) for name in names)
 
     def change_transition_type_native(self, fitting_id, new_type_id, label):
-        """V5.8.3: let Revit perform a Transition type change natively.
+        """V5.8.5: let Revit perform a Transition type change natively.
 
         No disconnect/recreate, no auto-size probing, no rotation/flip, and no
         pipe trim/extend are performed here.  We only validate that Revit kept
@@ -6718,13 +7252,14 @@ class ReplaceElementsWindow(forms.WPFWindow):
             new_family_name = u"?"
 
         links = snapshot_fitting_connections(fitting)
+        system_lock_snapshot = snapshot_pipe_systems_from_links(links)
         old_port_count = len(physical_connectors(fitting))
 
         st = DB.SubTransaction(doc)
         try:
             st.Start()
             self.log(
-                u"{}: V5.8.3 Transition -> NATIVE REVIT ChangeTypeId '{}' -> '{} : {}'; "
+                u"{}: V5.8.5 Transition -> NATIVE REVIT ChangeTypeId '{}' -> '{} : {}'; "
                 u"KHÔNG recreate, KHÔNG auto-size, KHÔNG rotate/flip, KHÔNG trim/extend pipe."
                 .format(label, old_type_name, new_family_name, new_type_name))
 
@@ -6797,10 +7332,15 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     u"Native ChangeTypeId giữ kết nối nhưng size connector không khớp với đối tượng ID {}"
                     .format(u", ".join([safe_text(x) for x in size_mismatch])))
 
+            lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
+            if not lock_ok:
+                raise Exception(system_lock_failure_text(
+                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
+
             st.Commit()
             return True, (
                 u"OK - Transition Native Revit ChangeTypeId; type '{} : {}'; giữ {}/{} kết nối; "
-                u"không recreate/rotate/auto-size/trim pipe"
+                u"SYSTEM TYPE LOCK OK; không recreate/rotate/auto-size/trim pipe"
                 .format(new_family_name, new_type_name, matched, len(links)))
         except Exception as ex:
             try:
@@ -6812,7 +7352,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def change_type_safe(self, elem, new_type_id, label, allow_force_reconnect=False):
         """Change one element safely.
 
-        V5.8.3 rules:
+        V5.8.5 rules:
         - Transition/Reducer: always use native Revit ChangeTypeId; no recreate,
           no angle/rotation solver and no pipe trim/extend.
         - Pipe and same-Family non-Transition fitting: ChangeTypeId is allowed.
@@ -6830,7 +7370,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         elem_id = elem.Id
 
-        # V5.8.3: Transition/Reducer must use Revit's native type change exactly
+        # V5.8.5: Transition/Reducer must use Revit's native type change exactly
         # as requested.  Do this BEFORE the cross-family recreate guard so a
         # different-family reducer never enters direct-linear/rotation/auto-size.
         if is_pipe_fitting(elem) and self._is_transition_native_change(elem, new_type_id):
@@ -6846,13 +7386,28 @@ class ReplaceElementsWindow(forms.WPFWindow):
             except Exception as ex:
                 return False, u"{} | Không kiểm tra được Family cũ/mới: {}".format(label, safe_text(ex))
 
+        system_lock_snapshot = {}
+        try:
+            if is_pipe(elem):
+                system_lock_snapshot = snapshot_pipe_systems_from_owner_ids([elem.Id])
+            elif is_pipe_fitting(elem):
+                system_lock_snapshot = snapshot_pipe_systems_from_links(
+                    snapshot_fitting_connections(elem))
+        except Exception:
+            system_lock_snapshot = {}
+
         st = DB.SubTransaction(doc)
         first_error = None
         try:
             st.Start()
             elem.ChangeTypeId(new_type_id)
+            doc.Regenerate()
+            lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
+            if not lock_ok:
+                raise Exception(system_lock_failure_text(
+                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
             st.Commit()
-            return True, u"OK"
+            return True, u"OK - SYSTEM TYPE LOCK giữ nguyên"
         except Exception as ex:
             first_error = ex
             try:
@@ -7202,6 +7757,10 @@ class ReplaceElementsWindow(forms.WPFWindow):
             force_reconnect_fittings = bool(self.chk_ForceReconnectFittings.IsChecked)
         except Exception:
             force_reconnect_fittings = True
+        try:
+            skip_mixed_system_fittings = bool(self.chk_SkipMixedSystemFittings.IsChecked)
+        except Exception:
+            skip_mixed_system_fittings = True
 
         if not overwrite_pipes and not overwrite_fittings:
             forms.alert(u"Vui lòng chọn ít nhất một hạng mục: Thay Pipe hoặc Thay Fitting.", title="Thiếu dữ liệu")
@@ -7232,21 +7791,28 @@ class ReplaceElementsWindow(forms.WPFWindow):
         scope_name = u"các đối tượng đã chọn trước khi mở tool"
         self.log(u"Bắt đầu xử lý System Type: {}".format(system_name))
         self.log(u"Phạm vi xử lý: {}.".format(scope_name))
-        self.log(u"Giới hạn Pipe Size V5.8.3: {} <= Size <= {}.".format(
+        self.log(u"Giới hạn Pipe Size V5.8.5: {} <= Size <= {}.".format(
             format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
+        self.log(u"SYSTEM TYPE LOCK V5.8.5: BẬT BẮT BUỘC; {}.".format(
+            u"bỏ qua fitting nối nhiều System Type" if skip_mixed_system_fittings
+            else u"cho phép thử mixed-system fitting nhưng rollback nếu bất kỳ Pipe đổi System Type"))
         pipes, fittings = collect_pipes_and_fittings(True, self.preselected_element_ids)
         if selected_only and not pipes and not fittings:
             forms.alert(u"Các đối tượng đã chọn trước khi mở tool không còn hợp lệ. Hãy đóng tool, chọn lại Pipe/Fitting rồi chạy lệnh lại.", title="Không có đối tượng hợp lệ")
             return
 
         system_pipes = [p for p in pipes if same_element_id(get_system_type_id(p), system_type_id)] if overwrite_pipes else []
-        system_fittings = [f for f in fittings if same_element_id(get_system_type_id(f), system_type_id)] if overwrite_fittings else []
+        # V5.8.5: a boundary fitting may report only one of its connected systems.
+        # Include it when the selected System Type is present on ANY directly connected Pipe.
+        system_fittings = [f for f in fittings if fitting_touches_system_type(f, system_type_id)] if overwrite_fittings else []
 
         # V5.8: range is inclusive and uses the EXISTING size before any type
         # replacement.  A fitting is treated atomically: every physical port must
         # fit inside the selected range, otherwise the whole fitting is skipped.
         target_pipes = []
         range_skipped_lines = []
+        system_lock_skipped_lines = []
+        mixed_attempt_lines = []
         for p in system_pipes:
             try:
                 pipe_id_value = self.id_value(p.Id)
@@ -7271,7 +7837,20 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 in_range, port_sizes = fitting_size_in_range(
                     f, min_pipe_size_ft, max_pipe_size_ft)
                 if in_range:
-                    target_fittings.append(f)
+                    if fitting_is_mixed_system_boundary(f):
+                        mixed_desc = fitting_mixed_system_description(f)
+                        if skip_mixed_system_fittings:
+                            system_lock_skipped_lines.append(
+                                u"Fitting ID {}: SYSTEM TYPE LOCK - Bỏ qua mixed-system boundary: {}"
+                                .format(fitting_id_value, mixed_desc or u"nhiều System Type"))
+                        else:
+                            target_fittings.append(f)
+                            mixed_attempt_lines.append(
+                                u"Fitting ID {}: mixed-system boundary -> cho phép xử lý thử; "
+                                u"mọi Pipe partner bị đổi System Type sẽ làm rollback. {}"
+                                .format(fitting_id_value, mixed_desc or u""))
+                    else:
+                        target_fittings.append(f)
                 else:
                     profile = u", ".join([format_pipe_size(x) for x in port_sizes]) if port_sizes else u"không đọc được"
                     range_skipped_lines.append(
@@ -7288,6 +7867,10 @@ class ReplaceElementsWindow(forms.WPFWindow):
             if range_skipped_lines:
                 self.log(u"--- BỎ QUA DO SIZE RANGE ({}) ---".format(len(range_skipped_lines)))
                 for line in range_skipped_lines:
+                    self.log(line)
+            if system_lock_skipped_lines:
+                self.log(u"--- BỎ QUA DO SYSTEM TYPE LOCK ({}) ---".format(len(system_lock_skipped_lines)))
+                for line in system_lock_skipped_lines:
                     self.log(line)
             return
 
@@ -7306,14 +7889,24 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         self.log(u"Chế độ Fitting: {}.".format(
             u"CHỌN THỦ CÔNG như V5.3" if self._is_manual_fitting_mode() else u"AUTO ROUTING PREFERENCES"))
+        for line in mixed_attempt_lines:
+            self.log(u"SYSTEM TYPE LOCK: {}".format(line))
 
-        changed, skipped, failed = 0, len(range_skipped_lines), []
+        changed, skipped, failed = 0, len(range_skipped_lines) + len(system_lock_skipped_lines), []
         forced_reconnected = 0
         # V4.9: keep a complete audit trail in the on-screen log.  No final
         # result popup is shown after a committed batch.
         success_lines = []
-        skipped_lines = list(range_skipped_lines)
-        tx = DB.Transaction(doc, u"Replace Pipes and Fittings - Skip Failed")
+        skipped_lines = list(range_skipped_lines) + list(system_lock_skipped_lines)
+
+        # V5.8.5 batch-level invariant. This protects all selected Pipes and every
+        # directly connected partner Pipe around fittings, including Pipes outside
+        # the current selection. Per-element SubTransactions also validate this;
+        # this final snapshot is a second safety net before the main commit.
+        batch_system_lock = batch_pipe_system_lock_snapshot(pipes, system_fittings)
+        self.log(u"SYSTEM TYPE LOCK snapshot: bảo vệ {} Pipe; mixed-system bỏ qua: {}; mixed-system xử lý thử: {}.".format(
+            len(batch_system_lock), len(system_lock_skipped_lines), len(mixed_attempt_lines)))
+        tx = DB.Transaction(doc, u"Replace Pipes and Fittings - System Type Lock")
         try:
             tx.Start()
             try:
@@ -7380,6 +7973,11 @@ class ReplaceElementsWindow(forms.WPFWindow):
                         skipped_lines.append(u"{}: {}".format(fitting_label, safe_text(msg)))
                     else:
                         failed.append(u"{}: {}".format(fitting_label, safe_text(msg)))
+
+            batch_lock_ok, batch_lock_changes = validate_pipe_system_snapshot(batch_system_lock)
+            if not batch_lock_ok:
+                raise Exception(system_lock_failure_text(
+                    batch_lock_changes, u"V5.8.5 SYSTEM TYPE LOCK CẤP BATCH - ROLLBACK TOÀN BỘ"))
             tx.Commit()
         except Exception as ex:
             try:
@@ -7400,6 +7998,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             u"CHỌN THỦ CÔNG như V5.3" if self._is_manual_fitting_mode() else u"AUTO ROUTING PREFERENCES"))
         self.log(u"Pipe Size range: {} -> {} (inclusive)".format(
             format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
+        self.log(u"System Type Lock: OK - mọi Pipe được bảo vệ giữ nguyên System Type trước/sau batch.")
         self.log(u"Thành công: {} | Fallback/recreate: {} | Bỏ qua không lỗi: {} | Bỏ qua do lỗi: {} | Tổng không thay đổi: {}".format(
             changed, forced_reconnected, len(skipped_lines), len(failed), skipped))
 
@@ -7513,5 +8112,5 @@ else:
             win.show_dialog()
         except Exception as ex:
             forms.alert(
-                u"Không thể mở UI V5.8.3 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
+                u"Không thể mở UI V5.8.5 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
                 title="Correct Pipes & Fittings")
