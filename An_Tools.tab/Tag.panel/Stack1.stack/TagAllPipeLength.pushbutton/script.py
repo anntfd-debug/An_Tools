@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
-__title__ = u'Tag Without Leader'
-__doc__ = u'Chọn loại Pipe Tag, lọc chiều dài Min/Max, kích thước Min/Max, hướng ống, View Range và tự lưu cấu hình lần chạy trước.'
+__title__ = u'Tag Pipes Pro V2.0'
+__doc__ = u'Tạo mới, align hoặc chuẩn hóa Pipe Tag; lọc chiều dài, kích thước, hướng ống, View Range và tự lưu cấu hình.'
 
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.DB.Plumbing import Pipe
@@ -109,7 +109,8 @@ DEFAULT_SETTINGS = {
     'use_max_size': True,        # False = không giới hạn đường kính lớn nhất
     'scope': 'selection',        # selection | view
     'orientation': 'all',        # all | horizontal | vertical
-    'tag_condition': 'all',      # all | untagged
+    'tag_condition': 'all',      # all | untagged (chỉ áp dụng mode create)
+    'operation_mode': 'create',   # create | align | normalize
     'tag_side': 'left',           # left | right
     'view_range_mode': 'none',    # none | manual | active
     'view_range_bottom_mm': '-1000',
@@ -403,6 +404,12 @@ class TagParallelPipesWPF(forms.WPFWindow):
         }, self.settings.get('tag_condition', 'all'), 'all')
 
         self.set_radio_value({
+            'create': self.rbOperationCreate,
+            'align': self.rbOperationAlign,
+            'normalize': self.rbOperationNormalize
+        }, self.settings.get('operation_mode', 'create'), 'create')
+
+        self.set_radio_value({
             'left': self.rbTagSideLeft,
             'right': self.rbTagSideRight
         }, self.settings.get('tag_side', 'left'), 'left')
@@ -442,6 +449,13 @@ class TagParallelPipesWPF(forms.WPFWindow):
         else:
             tag_condition = 'all'
 
+        if bool(self.rbOperationAlign.IsChecked):
+            operation_mode = 'align'
+        elif bool(self.rbOperationNormalize.IsChecked):
+            operation_mode = 'normalize'
+        else:
+            operation_mode = 'create'
+
         if bool(self.rbTagSideRight.IsChecked):
             tag_side = 'right'
         else:
@@ -465,6 +479,7 @@ class TagParallelPipesWPF(forms.WPFWindow):
             'scope': scope,
             'orientation': orientation,
             'tag_condition': tag_condition,
+            'operation_mode': operation_mode,
             'tag_side': tag_side,
             'view_range_mode': view_range_mode,
             'view_range_bottom_mm': to_text(self.txtRangeBottom.Text),
@@ -556,6 +571,12 @@ class TagParallelPipesWPF(forms.WPFWindow):
                 orientation = 'all'
 
             tag_condition = 'untagged' if bool(self.rbUntaggedOnly.IsChecked) else 'all'
+            if bool(self.rbOperationAlign.IsChecked):
+                operation_mode = 'align'
+            elif bool(self.rbOperationNormalize.IsChecked):
+                operation_mode = 'normalize'
+            else:
+                operation_mode = 'create'
             tag_side = 'right' if bool(self.rbTagSideRight.IsChecked) else 'left'
 
             if bool(self.rbViewRangeManual.IsChecked):
@@ -597,6 +618,7 @@ class TagParallelPipesWPF(forms.WPFWindow):
                 'scope': scope,
                 'orientation': orientation,
                 'tag_condition': tag_condition,
+                'operation_mode': operation_mode,
                 'tag_side': tag_side,
                 'view_range_mode': view_range_mode,
                 'view_range_bottom_mm': range_bottom_mm,
@@ -668,8 +690,44 @@ def deduplicate_pipes(elements):
     return result
 
 
-def get_preselected_pipes(doc, uidoc):
-    """Đọc các Pipe đã được chọn trước khi mở lệnh."""
+def get_tagged_pipe_elements_from_tag(doc, tag):
+    """Resolve Pipe host từ một Pipe Tag local, tương thích Revit cũ/mới."""
+    result = []
+    if not tag or not isinstance(tag, IndependentTag):
+        return result
+
+    try:
+        if not tag.Category or get_id_value(tag.Category.Id) != int(BuiltInCategory.OST_PipeTags):
+            return result
+    except:
+        return result
+
+    try:
+        rvt_year = int(doc.Application.VersionNumber)
+    except:
+        rvt_year = 2022
+
+    if rvt_year >= 2022:
+        try:
+            for tagged_ref in tag.GetTaggedReferences():
+                elem = doc.GetElement(tagged_ref.ElementId)
+                if is_pipe_element(elem):
+                    result.append(elem)
+        except:
+            pass
+    else:
+        try:
+            elem = doc.GetElement(tag.TaggedLocalElementId)
+            if is_pipe_element(elem):
+                result.append(elem)
+        except:
+            pass
+
+    return deduplicate_pipes(result)
+
+
+def get_preselected_pipes(doc, uidoc, active_view=None):
+    """Đọc Pipe đã preselect; nếu user chọn Pipe Tag thì resolve ngược về host Pipe."""
     elements = []
     try:
         selected_ids = list(uidoc.Selection.GetElementIds())
@@ -678,12 +736,26 @@ def get_preselected_pipes(doc, uidoc):
 
     for elem_id in selected_ids:
         try:
-            elements.append(doc.GetElement(elem_id))
+            elem = doc.GetElement(elem_id)
         except:
-            pass
+            elem = None
+
+        if not elem:
+            continue
+
+        if is_pipe_element(elem):
+            elements.append(elem)
+            continue
+
+        if isinstance(elem, IndependentTag):
+            try:
+                if active_view and get_id_value(elem.OwnerViewId) != get_id_value(active_view.Id):
+                    continue
+            except:
+                pass
+            elements.extend(get_tagged_pipe_elements_from_tag(doc, elem))
 
     return deduplicate_pipes(elements)
-
 
 def resolve_view_range_bounds(doc, active_view, options):
     """Tính View Range sau khi cửa sổ WPF đã đóng."""
@@ -719,7 +791,7 @@ def collect_input_pipes(doc, uidoc, active_view, options, view_range_bounds):
                      .ToElements()
         return deduplicate_pipes(elements), False
 
-    preselected = get_preselected_pipes(doc, uidoc)
+    preselected = get_preselected_pipes(doc, uidoc, active_view)
     if preselected:
         return preselected, True
 
@@ -815,8 +887,14 @@ def filter_pipes(raw_elements, options, view_range_bounds, tagged_dict):
                 continue
 
             pipe_id_value = get_id_value(elem.Id)
-            if options['tag_condition'] == 'untagged' and pipe_id_value in tagged_dict:
-                continue
+            operation_mode = options.get('operation_mode', 'create')
+            if operation_mode == 'create':
+                if options['tag_condition'] == 'untagged' and pipe_id_value in tagged_dict:
+                    continue
+            else:
+                # Align/Normalize chỉ làm việc với Pipe đã có Pipe Tag trong active view.
+                if pipe_id_value not in tagged_dict:
+                    continue
 
             length_param = elem.get_Parameter(BuiltInParameter.CURVE_ELEM_LENGTH)
             if length_param:
@@ -868,10 +946,10 @@ def build_parallel_clusters(pipes_to_process):
     return clusters
 
 
-def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
-    tag_symbol = doc.GetElement(options['tag_type_id'])
-    if not tag_symbol:
-        raise Exception(u'Không tìm thấy loại Pipe Tag đã chọn trong model.')
+def get_cluster_layout(active_view, options, cluster):
+    """Tính thứ tự Pipe và vị trí TagHead theo cùng một quy tắc cho cả 3 mode."""
+    if not cluster:
+        return [], None, None, 0.0, 0.0
 
     view_scale = active_view.Scale
     if view_scale <= 0:
@@ -879,19 +957,55 @@ def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
 
     view_right = active_view.RightDirection
     view_up = active_view.UpDirection
+    tag_side_left = options['tag_side'] == 'left'
+
+    first_curve = cluster[0].Location.Curve
+    direction_vector = first_curve.GetEndPoint(1) - first_curve.GetEndPoint(0)
+    if direction_vector.GetLength() <= 0.000001:
+        raise Exception(u'Pipe trong cụm không có hướng hợp lệ.')
+    pipe_direction = direction_vector.Normalize()
+
+    if abs(pipe_direction.DotProduct(view_right)) > 0.707:
+        dir_perp = view_up
+        dir_para = reverse_xyz(view_right) if tag_side_left else view_right
+        sorted_cluster = sorted(
+            cluster,
+            key=lambda p: p.Location.Curve.Evaluate(0.5, True).DotProduct(view_up)
+        )
+    else:
+        dir_perp = reverse_xyz(view_right) if tag_side_left else view_right
+        dir_para = view_up
+        sorted_cluster = sorted(
+            cluster,
+            key=lambda p: p.Location.Curve.Evaluate(0.5, True).DotProduct(view_right)
+        )
 
     first_offset_mm = 4.0
     model_first_offset = mm_to_feet(first_offset_mm, view_scale)
     model_spacing = mm_to_feet(options['spacing_mm'], view_scale)
-    tag_all_pipes = options['tag_condition'] == 'all'
-    tag_side_left = options['tag_side'] == 'left'
+    return sorted_cluster, dir_perp, dir_para, model_first_offset, model_spacing
 
+
+def get_target_tag_head(pipe, index, dir_perp, dir_para,
+                        model_first_offset, model_spacing):
+    mid_point = pipe.Location.Curve.Evaluate(0.5, True)
+    vec_perp = dir_perp * model_first_offset
+    vec_para = dir_para * (index * model_spacing)
+    return mid_point + vec_perp + vec_para
+
+
+def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
+    tag_symbol = doc.GetElement(options['tag_type_id'])
+    if not tag_symbol:
+        raise Exception(u'Không tìm thấy loại Pipe Tag đã chọn trong model.')
+
+    tag_all_pipes = options['tag_condition'] == 'all'
     success_count = 0
     deleted_count = 0
     skipped_count = 0
     deleted_tag_keys = set()
 
-    with revit.Transaction('Tag Pipes Pro'):
+    with revit.Transaction('Tag Pipes Pro - Create'):
         if not tag_symbol.IsActive:
             tag_symbol.Activate()
             doc.Regenerate()
@@ -901,27 +1015,8 @@ def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
                 continue
 
             try:
-                first_curve = cluster[0].Location.Curve
-                direction_vector = first_curve.GetEndPoint(1) - first_curve.GetEndPoint(0)
-                if direction_vector.GetLength() <= 0.000001:
-                    skipped_count += len(cluster)
-                    continue
-                pipe_direction = direction_vector.Normalize()
-
-                if abs(pipe_direction.DotProduct(view_right)) > 0.707:
-                    dir_perp = view_up
-                    dir_para = reverse_xyz(view_right) if tag_side_left else view_right
-                    sorted_cluster = sorted(
-                        cluster,
-                        key=lambda p: p.Location.Curve.Evaluate(0.5, True).DotProduct(view_up)
-                    )
-                else:
-                    dir_perp = reverse_xyz(view_right) if tag_side_left else view_right
-                    dir_para = view_up
-                    sorted_cluster = sorted(
-                        cluster,
-                        key=lambda p: p.Location.Curve.Evaluate(0.5, True).DotProduct(view_right)
-                    )
+                sorted_cluster, dir_perp, dir_para, model_first_offset, model_spacing = \
+                    get_cluster_layout(active_view, options, cluster)
             except Exception as ex:
                 skipped_count += len(cluster)
                 try:
@@ -946,10 +1041,10 @@ def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
                             except:
                                 pass
 
-                    mid_point = pipe.Location.Curve.Evaluate(0.5, True)
-                    vec_perp = dir_perp * model_first_offset
-                    vec_para = dir_para * (index * model_spacing)
-                    head_pos = mid_point + vec_perp + vec_para
+                    head_pos = get_target_tag_head(
+                        pipe, index, dir_perp, dir_para,
+                        model_first_offset, model_spacing
+                    )
 
                     new_tag = IndependentTag.Create(
                         doc,
@@ -961,7 +1056,7 @@ def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
                         head_pos
                     )
 
-                    # Giữ nguyên logic leader của bản gốc.
+                    # Giữ nguyên logic leader của bản gốc cho tag mới.
                     try:
                         new_tag.HasLeader = True
                     except:
@@ -980,26 +1075,166 @@ def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
                     except:
                         pass
 
-    return success_count, deleted_count, skipped_count
+    return {
+        'created': success_count,
+        'deleted': deleted_count,
+        'aligned': 0,
+        'type_changed': 0,
+        'skipped': skipped_count,
+        'duplicate_tags': 0
+    }
 
 
-def show_result(options, success_count, deleted_count, skipped_count,
-                view_range_skipped, used_preselection):
+def process_existing_pipe_tags(doc, active_view, options, clusters, tagged_dict,
+                               change_type=False):
+    """Align tag hiện có, hoặc đổi type + đưa về đúng cấu hình.
+
+    Không xóa/recreate tag. Vì vậy ElementId và host reference của tag được giữ nguyên.
+    Nếu một Pipe có nhiều Pipe Tag trong active view, tất cả tag đó đều được xử lý;
+    chúng sẽ cùng nhận vị trí chuẩn của Pipe và được báo trong summary là duplicate.
+    """
+    tag_symbol = doc.GetElement(options['tag_type_id']) if change_type else None
+    if change_type and not tag_symbol:
+        raise Exception(u'Không tìm thấy loại Pipe Tag đã chọn trong model.')
+
+    aligned_count = 0
+    type_changed_count = 0
+    skipped_count = 0
+    duplicate_tags = 0
+
+    transaction_name = 'Tag Pipes Pro - Normalize' if change_type else 'Tag Pipes Pro - Align'
+    with revit.Transaction(transaction_name):
+        if change_type and not tag_symbol.IsActive:
+            tag_symbol.Activate()
+            doc.Regenerate()
+
+        for cluster in clusters:
+            if not cluster:
+                continue
+
+            try:
+                sorted_cluster, dir_perp, dir_para, model_first_offset, model_spacing = \
+                    get_cluster_layout(active_view, options, cluster)
+            except Exception as ex:
+                skipped_count += len(cluster)
+                try:
+                    print(ensure_unicode(u'Lỗi xử lý cụm Pipe: {}'.format(ensure_unicode(ex))))
+                except:
+                    pass
+                continue
+
+            for index, pipe in enumerate(sorted_cluster):
+                pipe_id_value = get_id_value(pipe.Id)
+                tag_ids = list(tagged_dict.get(pipe_id_value, []))
+                if not tag_ids:
+                    continue
+                if len(tag_ids) > 1:
+                    duplicate_tags += len(tag_ids) - 1
+
+                head_pos = get_target_tag_head(
+                    pipe, index, dir_perp, dir_para,
+                    model_first_offset, model_spacing
+                )
+
+                for tag_id in tag_ids:
+                    subtrans = None
+                    type_changed_this_tag = False
+                    try:
+                        tag = doc.GetElement(tag_id)
+                        if not tag or not isinstance(tag, IndependentTag):
+                            skipped_count += 1
+                            continue
+
+                        # Normalize dùng SubTransaction riêng cho từng tag để tránh
+                        # trạng thái nửa chừng: đổi Type thành công nhưng align thất bại.
+                        if change_type:
+                            subtrans = SubTransaction(doc)
+                            subtrans.Start()
+
+                            try:
+                                if get_id_value(tag.GetTypeId()) != get_id_value(tag_symbol.Id):
+                                    tag.ChangeTypeId(tag_symbol.Id)
+                                    type_changed_this_tag = True
+                            except Exception as type_ex:
+                                raise Exception(u'Không đổi được Tag Type: {}'.format(ensure_unicode(type_ex)))
+
+                            # Normalize = type + orientation + leader + vị trí.
+                            # Các thuộc tính presentation được áp dụng best-effort vì
+                            # một số family/tag state có thể không cho set trực tiếp.
+                            try:
+                                tag.TagOrientation = TagOrientation.Horizontal
+                            except:
+                                pass
+                            try:
+                                tag.HasLeader = True
+                            except:
+                                pass
+                            try:
+                                tag.LeaderEndCondition = LeaderEndCondition.Attached
+                            except:
+                                pass
+
+                        # Align mode chỉ đổi vị trí; không tự ý đổi type/leader/orientation.
+                        tag.TagHeadPosition = head_pos
+
+                        if subtrans:
+                            subtrans.Commit()
+                        aligned_count += 1
+                        if type_changed_this_tag:
+                            type_changed_count += 1
+
+                    except Exception as ex:
+                        if subtrans:
+                            try:
+                                subtrans.RollBack()
+                            except:
+                                pass
+                        skipped_count += 1
+                        try:
+                            print(ensure_unicode(
+                                u'Lỗi xử lý Tag ID {} của Pipe ID {}: {}'.format(
+                                    tag_id, pipe.Id, ensure_unicode(ex)
+                                )
+                            ))
+                        except:
+                            pass
+
+    return {
+        'created': 0,
+        'deleted': 0,
+        'aligned': aligned_count,
+        'type_changed': type_changed_count,
+        'skipped': skipped_count,
+        'duplicate_tags': duplicate_tags
+    }
+
+
+def show_result(options, result, view_range_skipped, used_preselection):
     lines = []
+    operation_mode = options.get('operation_mode', 'create')
 
-    if options['tag_condition'] == 'all' and deleted_count > 0:
-        lines.append(u'Đã xóa {} tag cũ.'.format(deleted_count))
-    lines.append(u'Đã tạo mới {} tag xếp bậc.'.format(success_count))
+    if operation_mode == 'create':
+        if options['tag_condition'] == 'all' and result['deleted'] > 0:
+            lines.append(u'Đã xóa {} tag cũ.'.format(result['deleted']))
+        lines.append(u'Đã tạo mới {} tag xếp bậc.'.format(result['created']))
+    elif operation_mode == 'align':
+        lines.append(u'Đã align {} tag hiện có.'.format(result['aligned']))
+        lines.append(u'Không đổi Tag Type, leader hoặc orientation.')
+    else:
+        lines.append(u'Đã đưa {} tag hiện có về vị trí cấu hình.'.format(result['aligned']))
+        lines.append(u'Đã đổi type cho {} tag.'.format(result['type_changed']))
+        lines.append(u'Đã áp dụng Horizontal + Leader Attached cho tag được xử lý.')
 
-    if skipped_count > 0:
-        lines.append(u'Bỏ qua {} Pipe do lỗi khi tạo tag.'.format(skipped_count))
+    if result['duplicate_tags'] > 0:
+        lines.append(u'Phát hiện {} tag bổ sung trên các Pipe có nhiều tag; các tag này cũng được xử lý.'.format(result['duplicate_tags']))
+    if result['skipped'] > 0:
+        lines.append(u'Bỏ qua {} tag/Pipe do lỗi khi xử lý.'.format(result['skipped']))
     if view_range_skipped > 0:
         lines.append(u'Bỏ qua {} Pipe nằm ngoài View Range.'.format(view_range_skipped))
     if used_preselection:
         lines.append(u'Đã dùng trực tiếp các Pipe được chọn trước khi mở lệnh.')
 
     toast_msg(u'\n'.join(lines))
-
 
 def run_tool():
     doc = revit.doc
@@ -1029,7 +1264,7 @@ def run_tool():
         return
 
     if not raw_elements:
-        alert_msg(u'Không có Pipe nào được chọn để đặt Tag.')
+        alert_msg(u'Không có Pipe nào trong phạm vi xử lý.')
         return
 
     try:
@@ -1042,26 +1277,34 @@ def run_tool():
         )
 
         if not pipes_to_process:
-            if view_range_bounds and view_range_skipped > 0:
+            operation_mode = options.get('operation_mode', 'create')
+            if operation_mode in ('align', 'normalize'):
+                alert_msg(u'Không tìm thấy Pipe đã có Pipe Tag trong active view và thỏa mãn các điều kiện lọc.')
+            elif view_range_bounds and view_range_skipped > 0:
                 alert_msg(u'Không tìm thấy Pipe nào thỏa mãn điều kiện lọc. Có {} Pipe bị bỏ qua vì nằm ngoài View Range.'.format(view_range_skipped))
             else:
                 alert_msg(u'Không tìm thấy Pipe nào thỏa mãn các điều kiện lọc.')
             return
 
         clusters = build_parallel_clusters(pipes_to_process)
-        success_count, deleted_count, skipped_count = create_pipe_tags(
-            doc,
-            active_view,
-            options,
-            clusters,
-            tagged_dict
-        )
+        operation_mode = options.get('operation_mode', 'create')
+
+        if operation_mode == 'align':
+            result = process_existing_pipe_tags(
+                doc, active_view, options, clusters, tagged_dict, False
+            )
+        elif operation_mode == 'normalize':
+            result = process_existing_pipe_tags(
+                doc, active_view, options, clusters, tagged_dict, True
+            )
+        else:
+            result = create_pipe_tags(
+                doc, active_view, options, clusters, tagged_dict
+            )
 
         show_result(
             options,
-            success_count,
-            deleted_count,
-            skipped_count,
+            result,
             view_range_skipped,
             used_preselection
         )

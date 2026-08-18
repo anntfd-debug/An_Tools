@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Tag Pipes Pro"
-        Height="820" Width="540"
+        Title="Tag Pipes Pro V2.0"
+        Height="900" Width="560"
         MinHeight="700" MinWidth="520"
         WindowStartupLocation="CenterScreen"
         Topmost="True"
@@ -87,12 +87,12 @@
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
                 <TextBlock Grid.Row="0"
-                           Text="Tag Pipes Pro"
+                           Text="Tag Pipes Pro V2.0"
                            Foreground="White"
                            FontSize="22"
                            FontWeight="Bold"/>
                 <TextBlock Grid.Row="1"
-                           Text="Tự đặt pipe tag xếp bậc, lọc theo kích thước, hướng ống và View Range"
+                           Text="Tạo mới, align hoặc chuẩn hóa Pipe Tag theo cùng một cấu hình"
                            Foreground="#DBEAFE"
                            Margin="0,5,0,0"
                            TextWrapping="Wrap"/>
@@ -193,7 +193,7 @@
                     <StackPanel>
                         <TextBlock Text="Phạm vi áp dụng" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBrush}"/>
                         <StackPanel Orientation="Vertical" Margin="0,8,0,0">
-                            <RadioButton x:Name="rbSelection" GroupName="ScopeGroup" Content="Dùng Pipe đã chọn trước; nếu chưa chọn thì quét sau khi bấm Đặt Tag" IsChecked="True"/>
+                            <RadioButton x:Name="rbSelection" GroupName="ScopeGroup" Content="Dùng Pipe hoặc Pipe Tag đã chọn trước; nếu chưa chọn thì quét Pipe sau khi bấm Thực hiện" IsChecked="True"/>
                             <RadioButton x:Name="rbView" GroupName="ScopeGroup" Content="Toàn bộ pipe trong view hiện hành"/>
                         </StackPanel>
                     </StackPanel>
@@ -255,12 +255,29 @@
                     </StackPanel>
                 </Border>
 
+
                 <Border Style="{StaticResource CardStyle}">
                     <StackPanel>
-                        <TextBlock Text="Điều kiện tag" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBrush}"/>
+                        <TextBlock Text="Chế độ xử lý" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBrush}"/>
+                        <TextBlock Text="Cùng một bộ lọc Pipe và quy tắc xếp bậc được dùng cho cả ba chế độ."
+                                   Foreground="{StaticResource MutedBrush}" Margin="0,3,0,8" TextWrapping="Wrap"/>
+                        <StackPanel Orientation="Vertical">
+                            <RadioButton x:Name="rbOperationCreate" GroupName="OperationGroup"
+                                         Content="Tạo Tag mới / thay tag cũ theo điều kiện bên dưới" IsChecked="True"/>
+                            <RadioButton x:Name="rbOperationAlign" GroupName="OperationGroup"
+                                         Content="Align Tag hiện có - chỉ đưa TagHead về đúng vị trí, giữ nguyên Type/Leader"/>
+                            <RadioButton x:Name="rbOperationNormalize" GroupName="OperationGroup"
+                                         Content="Đổi Type + Align Tag hiện có - đưa tag về đúng cấu hình đang chọn"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border Style="{StaticResource CardStyle}">
+                    <StackPanel>
+                        <TextBlock Text="Khi tạo Tag mới" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBrush}"/>
                         <StackPanel Orientation="Vertical" Margin="0,8,0,0">
-                            <RadioButton x:Name="rbAllPipes" GroupName="TagModeGroup" Content="Tag toàn bộ ống, xóa tag cũ nếu đã có" IsChecked="True"/>
-                            <RadioButton x:Name="rbUntaggedOnly" GroupName="TagModeGroup" Content="Chỉ tag những ống chưa có tag"/>
+                            <RadioButton x:Name="rbAllPipes" GroupName="TagModeGroup" Content="Tạo lại tag cho toàn bộ Pipe; xóa tag cũ nếu đã có" IsChecked="True"/>
+                            <RadioButton x:Name="rbUntaggedOnly" GroupName="TagModeGroup" Content="Chỉ tạo tag cho những Pipe chưa có tag"/>
                         </StackPanel>
                     </StackPanel>
                 </Border>
@@ -280,7 +297,7 @@
                 <Border Style="{StaticResource CardStyle}">
                     <StackPanel>
                         <TextBlock Text="Loại Pipe Tag" FontSize="15" FontWeight="SemiBold" Foreground="{StaticResource TextBrush}"/>
-                        <TextBlock Text="Lần sau mở tool sẽ tự chọn lại loại tag đã dùng gần nhất nếu family/type còn tồn tại trong project."
+                        <TextBlock Text="Loại này dùng khi tạo Tag mới và khi chạy chế độ Đổi Type + Align. Align thuần sẽ giữ nguyên Tag Type hiện có."
                                    Foreground="{StaticResource MutedBrush}" Margin="0,3,0,10" TextWrapping="Wrap"/>
                         <ComboBox x:Name="cbTagTypes"/>
                     </StackPanel>
@@ -307,7 +324,7 @@
 
                 <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
                     <Button x:Name="btnCancel" Content="Đóng" Style="{StaticResource SecondaryButtonStyle}" Margin="0,0,10,0"/>
-                    <Button x:Name="btnExecute" Content="Đặt Tag" Style="{StaticResource PrimaryButtonStyle}"/>
+                    <Button x:Name="btnExecute" Content="Thực hiện" Style="{StaticResource PrimaryButtonStyle}"/>
                 </StackPanel>
             </Grid>
         </Border>
