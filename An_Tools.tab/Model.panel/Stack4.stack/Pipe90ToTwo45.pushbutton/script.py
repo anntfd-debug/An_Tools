@@ -22,6 +22,7 @@ The selected Pipe Type must have a suitable elbow in Routing Preferences.
 The elbow family must support a 45-degree connection (fixed 45 or adjustable).
 """
 
+import json
 import math
 import traceback
 
@@ -33,7 +34,10 @@ from Autodesk.Revit.Exceptions import OperationCanceledException
 
 __title__ = "90 to 2x45"
 __author__ = "OpenAI"
-__doc__ = "Replace one 90-degree pipe elbow with two 45-degree elbows using full 3D geometry."
+__doc__ = (
+    "Continuously replace 90-degree pipe elbows with two 45-degree elbows "
+    "and remember setback length separately for each pipe size."
+)
 
 
 doc = revit.doc
@@ -126,7 +130,8 @@ def is_pipe_fitting(element):
         return False
 
 
-def get_selected_or_pick_fitting():
+def get_single_preselected_fitting():
+    """Return exactly one preselected pipe fitting; otherwise return None."""
     preselected = []
     try:
         for element_id in uidoc.Selection.GetElementIds():
@@ -138,13 +143,25 @@ def get_selected_or_pick_fitting():
 
     if len(preselected) == 1:
         return preselected[0]
+    return None
 
+
+def pick_fitting():
+    """Pick the next fitting. Escape is handled by the outer continuous loop."""
     reference = uidoc.Selection.PickObject(
         ObjectType.Element,
         PipeFittingSelectionFilter(),
-        "Chọn elbow 90 đang kết nối trực tiếp hai ống"
+        "Chọn elbow 90 để chuyển. Nhấn Esc để kết thúc lệnh."
     )
     return doc.GetElement(reference.ElementId)
+
+
+def get_selected_or_pick_fitting():
+    """Compatibility helper used by Shift+Click configuration mode."""
+    fitting = get_single_preselected_fitting()
+    if fitting is not None:
+        return fitting
+    return pick_fitting()
 
 
 # -----------------------------------------------------------------------------
@@ -490,9 +507,60 @@ def is_shift_click():
         return False
 
 
-def get_saved_setback_mm():
+def _normalize_size_mm(diameter_internal):
+    """Return a stable string key for a Revit pipe diameter in millimeters."""
+    diameter_mm = round(internal_to_mm(diameter_internal), 3)
+    if abs(diameter_mm - round(diameter_mm)) < 0.001:
+        return str(int(round(diameter_mm)))
+    return ("{:.3f}".format(diameter_mm)).rstrip("0").rstrip(".")
+
+
+def _size_label(diameter_internal):
+    return "DN{} mm".format(_normalize_size_mm(diameter_internal))
+
+
+def get_saved_setback_table():
+    """
+    Load per-size setback settings from pyRevit config.
+
+    Storage format is JSON so one config field can hold any number of pipe sizes:
+        {"50": 300.0, "100": 420.0, "150": 550.0}
+    """
     try:
-        value = float(config.setback_mm)
+        raw = config.setback_by_size_json
+    except Exception:
+        return {}
+
+    try:
+        if isinstance(raw, dict):
+            data = raw
+        else:
+            data = json.loads(str(raw))
+    except Exception:
+        return {}
+
+    cleaned = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            try:
+                number = float(value)
+                if number > 0.0:
+                    cleaned[str(key)] = number
+            except Exception:
+                continue
+    return cleaned
+
+
+def save_setback_table(table):
+    config.setback_by_size_json = json.dumps(table, sort_keys=True)
+    script.save_config()
+
+
+def get_saved_setback_mm_for_size(diameter_internal):
+    key = _normalize_size_mm(diameter_internal)
+    table = get_saved_setback_table()
+    try:
+        value = float(table.get(key))
         if value > 0.0:
             return value
     except Exception:
@@ -500,9 +568,26 @@ def get_saved_setback_mm():
     return None
 
 
-def save_setback_mm(value_mm):
-    config.setback_mm = float(value_mm)
-    script.save_config()
+def save_setback_mm_for_size(diameter_internal, value_mm):
+    key = _normalize_size_mm(diameter_internal)
+    table = get_saved_setback_table()
+    table[key] = float(value_mm)
+    save_setback_table(table)
+
+
+def get_legacy_setback_mm():
+    """
+    Read the old single-value setting only as a suggested default.
+    It is intentionally NOT applied automatically to a new size because every
+    previously unseen size must still ask once, per the new workflow.
+    """
+    try:
+        value = float(config.setback_mm)
+        if value > 0.0:
+            return value
+    except Exception:
+        pass
+    return None
 
 
 def suggest_setback_mm(corner_data, diameter_internal):
@@ -515,19 +600,30 @@ def suggest_setback_mm(corner_data, diameter_internal):
     return math.ceil(suggested_mm / 10.0) * 10.0
 
 
-def ask_setback_mm(default_mm):
+def ask_setback_mm(default_mm, diameter_internal, replacing_existing=False):
+    size_label = _size_label(diameter_internal)
+    if replacing_existing:
+        first_line = "Cập nhật chiều dài setting cho {}.".format(size_label)
+    else:
+        first_line = (
+            "{} chưa có chiều dài setting đã lưu. "
+            "Nhập giá trị cho size này.".format(size_label)
+        )
+
     prompt = (
+        first_line + "\n\n"
         "Nhập khoảng lùi từ giao điểm lý thuyết đến đầu mỗi ống (mm).\n\n"
         "- Góc được tính trong không gian 3D, có xét độ dốc.\n"
         "- Giá trị lớn hơn sẽ tạo đoạn ống chéo dài hơn.\n"
-        "- Giá trị này sẽ được lưu cho những lần Click tiếp theo."
-    )
+        "- Giá trị được lưu RIÊNG cho {}.\n"
+        "- Những lần sau gặp lại size này tool sẽ chạy thẳng, không hỏi nữa."
+    ).format(size_label)
 
     default_text = "{:.3f}".format(default_mm).rstrip("0").rstrip(".")
     text = forms.ask_for_string(
         default=default_text,
         prompt=prompt,
-        title="Cài đặt 90° → 2 elbow 45°"
+        title="Cài đặt {} - 90° → 2 elbow 45°".format(size_label)
     )
 
     if text is None:
@@ -541,30 +637,62 @@ def ask_setback_mm(default_mm):
     if value_mm <= 0.0:
         raise Exception("Khoảng lùi phải lớn hơn 0 mm.")
 
-    save_setback_mm(value_mm)
+    save_setback_mm_for_size(diameter_internal, value_mm)
     return value_mm
-
-
-def configure_setback_only():
-    """Shift+Click configuration mode. Save the value and do not edit model."""
-    saved_mm = get_saved_setback_mm()
-    if saved_mm is None:
-        saved_mm = 300.0
-    ask_setback_mm(saved_mm)
 
 
 def get_setback_mm(corner_data, diameter_internal):
     """
-    Normal Click: reuse the last saved value without showing UI.
-    First run: show UI once because no saved value exists yet.
+    Reuse the saved setback for this exact pipe size.
+    Ask only when this size has never been saved before.
     """
-    saved_mm = get_saved_setback_mm()
+    saved_mm = get_saved_setback_mm_for_size(diameter_internal)
     if saved_mm is not None:
         return saved_mm
 
     suggested_mm = suggest_setback_mm(corner_data, diameter_internal)
-    return ask_setback_mm(suggested_mm)
+    legacy_mm = get_legacy_setback_mm()
+    if legacy_mm is not None:
+        suggested_mm = legacy_mm
 
+    return ask_setback_mm(
+        suggested_mm,
+        diameter_internal,
+        replacing_existing=False
+    )
+
+
+def configure_setback_only():
+    """
+    Shift+Click: pick/preselect one elbow and edit the saved length for its size.
+    The Revit model is not modified.
+    """
+    fitting = get_selected_or_pick_fitting()
+    validate_editable(fitting, "Elbow")
+
+    connected = get_two_connected_pipes(fitting)
+    pipe_1 = connected[0]["pipe"]
+    pipe_2 = connected[1]["pipe"]
+    diameter_1 = get_pipe_diameter(pipe_1)
+    diameter_2 = get_pipe_diameter(pipe_2)
+    validate_compatibility(pipe_1, pipe_2, diameter_1, diameter_2)
+
+    pipe_data_1 = get_pipe_end_data(pipe_1, connected[0]["pipe_connector"])
+    pipe_data_2 = get_pipe_end_data(pipe_2, connected[1]["pipe_connector"])
+    corner_data = analyze_corner(pipe_data_1, pipe_data_2)
+
+    saved_mm = get_saved_setback_mm_for_size(diameter_1)
+    if saved_mm is None:
+        saved_mm = suggest_setback_mm(corner_data, diameter_1)
+        legacy_mm = get_legacy_setback_mm()
+        if legacy_mm is not None:
+            saved_mm = legacy_mm
+
+    ask_setback_mm(
+        saved_mm,
+        diameter_1,
+        replacing_existing=True
+    )
 
 def validate_compatibility(pipe_1, pipe_2, diameter_1, diameter_2):
     diameter_difference = abs(diameter_1 - diameter_2)
@@ -588,13 +716,9 @@ def validate_compatibility(pipe_1, pipe_2, diameter_1, diameter_2):
 # -----------------------------------------------------------------------------
 # Main operation
 # -----------------------------------------------------------------------------
-def main():
-    # Shift+Click is configuration-only: save the length and exit silently.
-    if is_shift_click():
-        configure_setback_only()
-        return
-
-    fitting = get_selected_or_pick_fitting()
+def process_fitting(fitting):
+    """Convert one fitting. Each call owns its own Transaction."""
+    fitting_id_value = element_id_value(fitting.Id)
     validate_editable(fitting, "Elbow")
 
     connected = get_two_connected_pipes(fitting)
@@ -723,6 +847,84 @@ def main():
             transaction.RollBack()
         raise
 
+    return {
+        "fitting_id": fitting_id_value,
+        "size": _size_label(diameter_1),
+        "setback_mm": setback_mm,
+        "middle_pipe_id": element_id_value(middle_pipe.Id),
+        "elbow_1_id": element_id_value(elbow_1.Id),
+        "elbow_2_id": element_id_value(elbow_2.Id),
+    }
+
+
+def show_failure(fitting, error):
+    """Show only a small error dialog. Successful conversions stay silent."""
+    try:
+        fitting_id = element_id_value(fitting.Id)
+    except Exception:
+        fitting_id = "?"
+
+    forms.alert(
+        "Elbow ID {} không thể chuyển đổi.\n\n{}\n\n"
+        "Nhấn OK để tiếp tục chọn elbow khác, hoặc Esc khi quay lại chế độ Pick để kết thúc.".format(
+            fitting_id, str(error)
+        ),
+        title="90° → 2 elbow 45°",
+        warn_icon=True
+    )
+
+
+def run_continuous():
+    """
+    Process an optional single preselection once, then keep asking for the next
+    elbow until PickObject is cancelled with Escape.
+    """
+    success_count = 0
+    failure_count = 0
+
+    first_fitting = get_single_preselected_fitting()
+    if first_fitting is not None:
+        try:
+            process_fitting(first_fitting)
+            success_count += 1
+        except SystemExit:
+            raise
+        except OperationCanceledException:
+            return success_count, failure_count
+        except Exception as error:
+            failure_count += 1
+            show_failure(first_fitting, error)
+
+    while True:
+        try:
+            fitting = pick_fitting()
+        except OperationCanceledException:
+            break
+
+        try:
+            process_fitting(fitting)
+            success_count += 1
+        except SystemExit:
+            raise
+        except OperationCanceledException:
+            break
+        except Exception as error:
+            failure_count += 1
+            show_failure(fitting, error)
+            # Important: one failed elbow does not terminate the command.
+            continue
+
+    return success_count, failure_count
+
+
+def main():
+    # Shift+Click edits the saved value for one selected/picked pipe size only.
+    if is_shift_click():
+        configure_setback_only()
+        return
+
+    # Silent-success mode: Esc ends the command without any completion popup/log.
+    run_continuous()
 
 
 try:
@@ -732,11 +934,8 @@ except OperationCanceledException:
 except SystemExit:
     pass
 except Exception as error:
-    output.print_md("## 90° → 2 elbow 45° - Chi tiết lỗi")
-    output.print_md("**{}**".format(str(error)))
-    output.print_code(traceback.format_exc())
     forms.alert(
-        "Không thể chuyển kết nối.\n\n{}\n\n"
+        "Không thể tiếp tục lệnh.\n\n{}\n\n"
         "Mô hình đã được hoàn tác nếu lỗi xảy ra trong Transaction.".format(error),
         title="90° → 2 elbow 45°",
         warn_icon=True

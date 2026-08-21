@@ -7,6 +7,7 @@ Chức năng:
 - Pick nhiều RevitLinkInstance trước khi mở giao diện.
 - Chỉ xử lý Link và Family đang hiển thị trong Active View.
 - Lọc FamilyInstance theo Family Name hoặc Type Name bằng ô nhập nhiều dòng.
+- Hoặc pick trực tiếp một FamilyInstance trong Revit Link và chỉ quét đúng Family đó; có thể khóa đúng Type đã pick.
 - Đặt Model Group tại một trong bốn góc cục bộ:
   LEFT_FRONT, RIGHT_FRONT, LEFT_BACK, RIGHT_BACK.
 - Xoay Group theo HandOrientation hoặc FacingOrientation.
@@ -14,7 +15,7 @@ Chức năng:
 - Offset X/Y có dấu: dương và âm theo trục cục bộ của Family.
 - Cache kết quả được lưu bền giữa các lần chạy tool.
 - Bỏ nested Family, loại nguồn trùng tuyệt đối và nguồn chồng vị trí.
-- Progress visibility chỉ đếm các Family đã khớp từ khóa.
+- Progress visibility chỉ đếm các Family đã khớp bộ lọc nguồn.
 - Có progress bar và Cancel. Cancel trong lúc đặt sẽ rollback toàn bộ lần chạy.
 
 Ghi chú về visibility:
@@ -47,7 +48,7 @@ except NameError:
 
 
 startup_notices = []
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 
 
 # ============================================================
@@ -589,7 +590,7 @@ def scan_diagnostics_summary(diagnostics):
         u"FamilyInstance ứng viên: {0}".format(diagnostics.get("candidate_total", 0)),
         u"Bỏ nested Family: {0}".format(diagnostics.get("nested_skipped", 0)),
         u"Bỏ nguồn trùng tuyệt đối: {0}".format(diagnostics.get("exact_source_duplicate_skipped", 0)),
-        u"Khớp Family/Type text: {0}".format(diagnostics.get("text_matched", 0)),
+        u"Khớp bộ lọc nguồn: {0}".format(diagnostics.get("text_matched", 0)),
         u"Không hiển thị trong Active View: {0}".format(diagnostics.get("visibility_skipped", 0)),
         u"Bỏ nguồn chồng vị trí: {0}".format(diagnostics.get("overlap_source_skipped", 0)),
         u"Family nguồn duy nhất sau xử lý: {0}".format(diagnostics.get("final_count", 0))
@@ -727,6 +728,102 @@ def family_matches(family_instance, keywords):
     return False
 
 
+def get_family_name(family_instance):
+    try:
+        return safe_text(family_instance.Symbol.Family.Name).strip()
+    except Exception:
+        return u""
+
+
+def get_family_type_name(family_instance):
+    try:
+        return get_element_name(family_instance.Symbol).strip()
+    except Exception:
+        return u""
+
+
+def family_matches_source_filter(
+        family_instance,
+        keywords,
+        source_mode,
+        picked_family_name,
+        picked_type_name,
+        lock_picked_type):
+    """Khớp Family nguồn theo từ khóa hoặc theo Family đã pick trong Link."""
+    mode = safe_text(source_mode).upper().strip()
+    if mode == "PICK":
+        target_family = safe_text(picked_family_name).strip().lower()
+        if not target_family:
+            return False
+
+        current_family = get_family_name(family_instance).lower()
+        if current_family != target_family:
+            return False
+
+        if lock_picked_type:
+            target_type = safe_text(picked_type_name).strip().lower()
+            current_type = get_family_type_name(family_instance).lower()
+            return bool(target_type) and current_type == target_type
+
+        return True
+
+    return family_matches(family_instance, keywords)
+
+
+def picked_family_filter_signature(source_mode, picked_family_name, picked_type_name, lock_picked_type):
+    mode = safe_text(source_mode).upper().strip() or "KEYWORD"
+    return u"MODE={0}|FAMILY={1}|TYPE={2}|LOCKTYPE={3}".format(
+        mode,
+        safe_text(picked_family_name).strip().lower(),
+        safe_text(picked_type_name).strip().lower(),
+        bool(lock_picked_type)
+    )
+
+
+def pick_linked_family_instance(allowed_link_items):
+    """Pick một FamilyInstance trong một Revit Link đã được chọn ban đầu."""
+    reference = uidoc.Selection.PickObject(
+        ObjectType.LinkedElement,
+        u"Pick một Family trong Revit Link đã chọn"
+    )
+
+    link_instance = doc.GetElement(reference.ElementId)
+    if not isinstance(link_instance, DB.RevitLinkInstance):
+        raise ValueError(u"Đối tượng đã pick không thuộc Revit Link.")
+
+    allowed_map = {}
+    for item in allowed_link_items:
+        try:
+            allowed_map[get_id_value(item.element.Id)] = item
+        except Exception:
+            pass
+
+    link_id_value = get_id_value(link_instance.Id)
+    link_item = allowed_map.get(link_id_value)
+    if link_item is None:
+        raise ValueError(
+            u"Family đã pick thuộc Link không nằm trong danh sách Link đã chọn khi mở tool."
+        )
+
+    link_doc = link_instance.GetLinkDocument()
+    if link_doc is None:
+        raise ValueError(u"Revit Link chứa Family đã pick hiện không được load.")
+
+    try:
+        linked_element_id = reference.LinkedElementId
+    except Exception:
+        linked_element_id = None
+
+    if linked_element_id is None or is_invalid_element_id(linked_element_id):
+        raise ValueError(u"Không đọc được ElementId của phần tử trong Revit Link.")
+
+    linked_element = link_doc.GetElement(linked_element_id)
+    if not isinstance(linked_element, DB.FamilyInstance):
+        raise ValueError(u"Đối tượng đã pick không phải FamilyInstance. Hãy pick đúng Family trong Link.")
+
+    return link_item, linked_element
+
+
 def get_document_cache_key():
     parts = []
 
@@ -831,7 +928,11 @@ def make_scan_signature(
         raw_filter_text,
         ignore_nested,
         source_dedup_enabled,
-        source_overlap_tolerance_text):
+        source_overlap_tolerance_text,
+        source_mode="KEYWORD",
+        picked_family_name=u"",
+        picked_type_name=u"",
+        lock_picked_type=False):
     """Tạo chữ ký cache, bao gồm các thiết lập ảnh hưởng tới danh sách nguồn."""
 
     try:
@@ -869,7 +970,7 @@ def make_scan_signature(
 
     return (
         u"CACHEV={0};DOC={1};VIEW={2};VIEWSTATE={3};LINKS={4};FILTER={5};"
-        u"IGNORE_NESTED={6};SOURCE_DEDUP={7};SOURCE_TOL={8}"
+        u"IGNORE_NESTED={6};SOURCE_DEDUP={7};SOURCE_TOL={8};SOURCE_SELECTOR={9}"
     ).format(
         CACHE_VERSION,
         get_document_cache_key(),
@@ -879,7 +980,13 @@ def make_scan_signature(
         normalized_filter,
         bool(ignore_nested),
         bool(source_dedup_enabled),
-        normalized_tolerance
+        normalized_tolerance,
+        picked_family_filter_signature(
+            source_mode,
+            picked_family_name,
+            picked_type_name,
+            lock_picked_type
+        )
     )
 
 def serialize_scan_cache(signature, work_items, diagnostics=None):
@@ -1470,7 +1577,11 @@ def collect_visible_matching_work_items(
         ignore_nested,
         source_dedup_enabled,
         source_overlap_tolerance_internal,
-        progress_enabled):
+        progress_enabled,
+        source_mode="KEYWORD",
+        picked_family_name=u"",
+        picked_type_name=u"",
+        lock_picked_type=False):
     """Quét, lọc visibility và chuẩn hóa danh sách Family nguồn."""
 
     diagnostics = new_scan_diagnostics()
@@ -1486,7 +1597,13 @@ def collect_visible_matching_work_items(
 
         for family_instance in candidates:
             try:
-                if not family_matches(family_instance, keywords):
+                if not family_matches_source_filter(
+                        family_instance,
+                        keywords,
+                        source_mode,
+                        picked_family_name,
+                        picked_type_name,
+                        lock_picked_type):
                     continue
 
                 diagnostics["text_matched"] += 1
@@ -1554,7 +1671,7 @@ def collect_visible_matching_work_items(
     if progress_enabled and total_matched > 0:
         with forms.ProgressBar(
             title=(
-                u"Đang kiểm tra hiển thị các Family đã khớp... "
+                u"Đang kiểm tra hiển thị các Family đã khớp bộ lọc... "
                 u"{value} / {max_value}"
             ),
             cancellable=True,
@@ -1954,6 +2071,10 @@ class SettingsWindow(forms.WPFWindow):
         self.cached_scan_diagnostics = None
         self.cache_source = None
 
+        self.picked_family_name = u""
+        self.picked_type_name = u""
+        self.picked_link_name = u""
+
         self.active_view_text.Text = u"Active View: {0}".format(
             get_element_name(view) or safe_text(view.ViewType)
         )
@@ -1972,6 +2093,11 @@ class SettingsWindow(forms.WPFWindow):
         self.scan_button.Click += self.scan_clicked
         self.run_button.Click += self.run_clicked
         self.cancel_button.Click += self.cancel_clicked
+        self.pick_family_button.Click += self.pick_family_clicked
+        self.keyword_mode_radio.Checked += self.source_mode_changed
+        self.pick_mode_radio.Checked += self.source_mode_changed
+        self.pick_exact_type_checkbox.Checked += self.scan_setting_changed
+        self.pick_exact_type_checkbox.Unchecked += self.scan_setting_changed
         self.filter_text.TextChanged += self.scan_setting_changed
         self.ignore_nested_checkbox.Checked += self.scan_setting_changed
         self.ignore_nested_checkbox.Unchecked += self.scan_setting_changed
@@ -1981,6 +2107,7 @@ class SettingsWindow(forms.WPFWindow):
         self.test_one_checkbox.Checked += self.test_one_changed
         self.test_one_checkbox.Unchecked += self.test_one_changed
 
+        self.update_source_mode_state()
         self.update_test_index_state()
         self.try_load_persistent_cache()
 
@@ -1994,6 +2121,26 @@ class SettingsWindow(forms.WPFWindow):
         self.filter_text.Text = safe_text(
             getattr(self.config, "family_filter", u"")
         )
+
+        self.picked_family_name = safe_text(
+            getattr(self.config, "picked_family_name", u"")
+        ).strip()
+        self.picked_type_name = safe_text(
+            getattr(self.config, "picked_type_name", u"")
+        ).strip()
+        self.pick_exact_type_checkbox.IsChecked = bool(
+            getattr(self.config, "pick_exact_type", False)
+        )
+
+        source_mode = safe_text(
+            getattr(self.config, "source_filter_mode", u"KEYWORD")
+        ).upper().strip()
+        if source_mode == "PICK" and self.picked_family_name:
+            self.pick_mode_radio.IsChecked = True
+        else:
+            self.keyword_mode_radio.IsChecked = True
+        self.update_picked_family_text()
+
         self.offset_x_text.Text = safe_text(
             getattr(self.config, "offset_x_mm", u"0")
         )
@@ -2074,6 +2221,61 @@ class SettingsWindow(forms.WPFWindow):
             return "RIGHT_BACK"
         return "RIGHT_FRONT"
 
+    def get_source_mode(self):
+        if self.pick_mode_radio.IsChecked is True:
+            return "PICK"
+        return "KEYWORD"
+
+    def update_picked_family_text(self):
+        if not self.picked_family_name:
+            self.picked_family_text.Text = u"Chưa pick Family từ Link."
+            return
+
+        description = u"Family: {0}".format(self.picked_family_name)
+        if self.picked_type_name:
+            description += u"  |  Type: {0}".format(self.picked_type_name)
+        if self.picked_link_name:
+            description += u"  |  Link: {0}".format(self.picked_link_name)
+        self.picked_family_text.Text = description
+
+    def update_source_mode_state(self):
+        pick_mode = self.get_source_mode() == "PICK"
+        self.filter_text.IsEnabled = not pick_mode
+        self.pick_family_button.IsEnabled = pick_mode
+        self.pick_exact_type_checkbox.IsEnabled = pick_mode
+        self.picked_family_text.IsEnabled = pick_mode
+
+    def source_mode_changed(self, sender, args):
+        self.update_source_mode_state()
+        self.scan_setting_changed(sender, args)
+
+    def pick_family_clicked(self, sender, args):
+        try:
+            with forms.WindowToggler(self):
+                link_item, family_instance = pick_linked_family_instance(self.link_items)
+
+            family_name = get_family_name(family_instance)
+            type_name = get_family_type_name(family_instance)
+            if not family_name:
+                raise ValueError(u"Không đọc được Family Name của phần tử đã pick.")
+
+            self.picked_family_name = family_name
+            self.picked_type_name = type_name
+            self.picked_link_name = link_item.display_name
+            self.pick_mode_radio.IsChecked = True
+            self.update_picked_family_text()
+            self.invalidate_scan_cache()
+            self.match_count_text.Text = (
+                u"Đã pick Family '{0}'. Bấm Kiểm tra số lượng hoặc Bắt đầu."
+            ).format(family_name)
+            self.update_test_index_hint()
+        except UI.Exceptions.OperationCanceledException:
+            pass
+        except Exception as ex:
+            self.match_count_text.Text = u"Không thể dùng Family đã pick: {0}".format(
+                safe_text(ex)
+            )
+
     def get_source_overlap_tolerance_mm(self):
         return parse_number(
             self.source_overlap_tolerance_text.Text,
@@ -2088,7 +2290,11 @@ class SettingsWindow(forms.WPFWindow):
             safe_text(self.filter_text.Text),
             self.ignore_nested_checkbox.IsChecked is True,
             self.source_dedup_checkbox.IsChecked is True,
-            safe_text(self.source_overlap_tolerance_text.Text)
+            safe_text(self.source_overlap_tolerance_text.Text),
+            self.get_source_mode(),
+            self.picked_family_name,
+            self.picked_type_name,
+            self.pick_exact_type_checkbox.IsChecked is True
         )
 
     def invalidate_scan_cache(self):
@@ -2165,6 +2371,10 @@ class SettingsWindow(forms.WPFWindow):
         self.update_test_index_hint()
 
     def scan_clicked(self, sender, args):
+        if self.get_source_mode() == "PICK" and not self.picked_family_name:
+            self.match_count_text.Text = u"Chế độ Pick Family: hãy bấm 'Pick Family từ Link' trước."
+            return
+
         try:
             raw_filter_text = safe_text(self.filter_text.Text)
             keywords = split_keywords(raw_filter_text)
@@ -2176,7 +2386,11 @@ class SettingsWindow(forms.WPFWindow):
                 self.ignore_nested_checkbox.IsChecked is True,
                 self.source_dedup_checkbox.IsChecked is True,
                 mm_to_internal(source_tolerance_mm),
-                True
+                True,
+                self.get_source_mode(),
+                self.picked_family_name,
+                self.picked_type_name,
+                self.pick_exact_type_checkbox.IsChecked is True
             )
 
             if cancelled:
@@ -2216,6 +2430,10 @@ class SettingsWindow(forms.WPFWindow):
         group_item = self.get_selected_group_item()
         if group_item is None:
             self.match_count_text.Text = u"Hãy chọn Model Group Type cần đặt."
+            return
+
+        if self.get_source_mode() == "PICK" and not self.picked_family_name:
+            self.match_count_text.Text = u"Chế độ Pick Family: hãy bấm 'Pick Family từ Link' trước."
             return
 
         try:
@@ -2275,6 +2493,10 @@ class SettingsWindow(forms.WPFWindow):
             "link_items": self.link_items,
             "group_item": group_item,
             "filter_text": raw_filter_text,
+            "source_filter_mode": self.get_source_mode(),
+            "picked_family_name": self.picked_family_name,
+            "picked_type_name": self.picked_type_name,
+            "pick_exact_type": self.pick_exact_type_checkbox.IsChecked is True,
             "scan_signature": current_scan_signature,
             "cached_matched_items": cached_items,
             "cached_scan_diagnostics": cached_diagnostics,
@@ -2308,6 +2530,10 @@ class SettingsWindow(forms.WPFWindow):
 def save_user_config(config, settings):
     config.last_group_uid = settings["group_item"].uid
     config.family_filter = settings["filter_text"]
+    config.source_filter_mode = settings.get("source_filter_mode", "KEYWORD")
+    config.picked_family_name = settings.get("picked_family_name", u"")
+    config.picked_type_name = settings.get("picked_type_name", u"")
+    config.pick_exact_type = settings.get("pick_exact_type", False)
     config.anchor_mode = settings["anchor_mode"]
     config.offset_x_mm = safe_text(settings["offset_x_mm"])
     config.offset_y_mm = safe_text(settings["offset_y_mm"])
@@ -2377,6 +2603,10 @@ def defensively_normalize_work_items(
 def run_tool(settings, initial_notices=None):
     group_type = settings["group_item"].element
     keywords = split_keywords(settings["filter_text"])
+    source_mode = safe_text(settings.get("source_filter_mode", "KEYWORD")).upper().strip()
+    picked_family_name = safe_text(settings.get("picked_family_name", u"")).strip()
+    picked_type_name = safe_text(settings.get("picked_type_name", u"")).strip()
+    pick_exact_type = settings.get("pick_exact_type", False) is True
     report_notices = list(initial_notices or [])
 
     source_overlap_tolerance = mm_to_internal(
@@ -2408,7 +2638,18 @@ def run_tool(settings, initial_notices=None):
     ]
 
     filter_display = safe_text(settings["filter_text"]).strip()
-    if filter_display:
+    if source_mode == "PICK":
+        pick_description = u"Family pick chính xác: {0}".format(
+            picked_family_name or u"(chưa xác định)"
+        )
+        if pick_exact_type:
+            pick_description += u" | Type chính xác: {0}".format(
+                picked_type_name or u"(không đọc được)"
+            )
+        else:
+            pick_description += u" | Type: tất cả Type của Family này"
+        context_lines.append(pick_description)
+    elif filter_display:
         context_lines.append(
             u"Từ khóa lọc: {0}".format(
                 filter_display.replace(u"\r", u" ").replace(u"\n", u"; ")
@@ -2427,7 +2668,11 @@ def run_tool(settings, initial_notices=None):
         settings["filter_text"],
         settings["ignore_nested"],
         settings["source_dedup_enabled"],
-        safe_text(settings["source_overlap_tolerance_mm"])
+        safe_text(settings["source_overlap_tolerance_mm"]),
+        source_mode,
+        picked_family_name,
+        picked_type_name,
+        pick_exact_type
     )
 
     cache_is_valid = (
@@ -2455,11 +2700,15 @@ def run_tool(settings, initial_notices=None):
                 settings["ignore_nested"],
                 settings["source_dedup_enabled"],
                 source_overlap_tolerance,
-                True
+                True,
+                source_mode,
+                picked_family_name,
+                picked_type_name,
+                pick_exact_type
             )
         )
         report_notices.append(
-            u"Không có cache hợp lệ nên tool đã quét một lần; progress chỉ đếm các Family đã khớp từ khóa."
+            u"Không có cache hợp lệ nên tool đã quét một lần; progress chỉ đếm các Family đã khớp bộ lọc nguồn."
         )
 
     if scan_cancelled:
@@ -2532,8 +2781,8 @@ def run_tool(settings, initial_notices=None):
                 u"Group đã tạo: 0"
             ],
             notices=report_notices + [
-                u"Kiểm tra từ khóa, nested Family, dung sai nguồn chồng vị trí, "
-                u"Crop/Section Box, View Range và Visibility/Graphics của Revit Link."
+                u"Kiểm tra bộ lọc nguồn (từ khóa hoặc Family đã pick), nested Family, "
+                u"dung sai nguồn chồng vị trí, Crop/Section Box, View Range và Visibility/Graphics của Revit Link."
             ],
             duplicate_source_records=duplicate_source_records
         )

@@ -1,9 +1,0 @@
-Correct Pipes & Fittings V5.2 Universal (Revit 2025/2026)
-
-Selection rules:
-- Fitting thường: max 1 Tee, 1 Elbow, 1 Transition, 1 Cross.
-- Fitting giảm: max 1 Tee, 1 Elbow, 1 Transition.
-- Selecting a second type of the same PartType automatically replaces the previous selection.
-- Normal list only shows supported PartTypes from selected Pipe Type Routing Preferences.
-- Reducing list only shows Tee/Elbow/Transition from loaded Pipe Fitting symbols.
-- The batch is validated before Transaction starts; missing or duplicate required PartTypes are blocked.

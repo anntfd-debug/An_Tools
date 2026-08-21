@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 __title__ = "Correct Pipes & Fittings"
-__doc__ = "V5.8.5 Universal / Revit 2025-2026: System Type Lock + role-aware reducing Tee sizing + isolated fitting fallback; Transition uses native Revit ChangeTypeId; Manual mode uses only fitting types already loaded in the project."
+__doc__ = "V5.8.8 Universal / Revit 2025-2026: Pipe Segment Size Compatibility with source-aware manual mapping keyed by old PipeType + PipeSegment + nominal size; preserves System Type Lock, private-segment mode and nearest-size mode."
 
 import os
 import traceback
@@ -280,7 +280,7 @@ def get_system_type_id(elem):
 
 
 # ============================================================
-# V5.8.5 System Type Lock helpers
+# V5.8.8 System Type Lock helpers
 # ============================================================
 
 def _system_type_snapshot_name(system_value):
@@ -326,7 +326,7 @@ def _pipe_system_record(pipe):
 def snapshot_pipe_systems_from_owner_ids(owner_ids):
     """Snapshot System Type of Pipe owners only.
 
-    V5.8.5 deliberately protects the Pipe System Type, not the transient System
+    V5.8.8 deliberately protects the Pipe System Type, not the transient System
     value exposed by a fitting instance. A fitting can sit on a boundary between
     different systems, while each connected Pipe must retain its own System Type.
     """
@@ -2520,7 +2520,7 @@ def _routing_rule_family_symbol(rule, fitting=None):
     return None
 
 
-def resolve_routing_symbol_for_fitting(pipe_type, fitting):
+def resolve_routing_symbol_for_fitting(pipe_type, fitting, primary_size_override=None):
     """Return (FamilySymbol, info dict) using selected PipeType Routing Preferences.
 
     Revit evaluates routing rules by group, size criterion, then priority/order.
@@ -2547,7 +2547,8 @@ def resolve_routing_symbol_for_fitting(pipe_type, fitting):
         raise Exception(u"Pipe Type '{}' chưa cấu hình Routing Preferences nhóm {}"
                         .format(get_real_name(pipe_type), ROUTING_GROUP_DISPLAY.get(group_name, group_name)))
 
-    primary_size = routing_primary_size_ft(fitting)
+    primary_size = (float(primary_size_override) if primary_size_override is not None
+                    else routing_primary_size_ft(fitting))
     checked = []
     for index in range(count):
         try:
@@ -2628,6 +2629,729 @@ def routing_preferences_summary(pipe_type):
     lines.append(u"Tổng rule đọc được: {}. Fitting sẽ tự lấy rule đầu tiên thỏa Primary Size."
                  .format(total_rules))
     return u"\n".join(lines)
+
+
+# ============================================================
+# V5.8.8 - Pipe Segment Size Compatibility
+# ============================================================
+
+SIZE_SYSTEM_COMPARE_TOLERANCE_FT = max(SIZE_TOLERANCE_FT, 1.0e-7)
+
+
+def _is_pipe_segment(elem):
+    if elem is None:
+        return False
+    try:
+        if isinstance(elem, DB.Plumbing.PipeSegment):
+            return True
+    except Exception:
+        pass
+    try:
+        return safe_text(elem.GetType().Name).lower() == u"pipesegment"
+    except Exception:
+        return False
+
+
+def _mep_size_record(size):
+    if size is None:
+        return None
+    try:
+        nominal = float(size.NominalDiameter)
+        inner = float(size.InnerDiameter)
+        outer = float(size.OuterDiameter)
+    except Exception:
+        return None
+    if nominal <= 0.0:
+        return None
+    try:
+        used_list = bool(size.UsedInSizeLists)
+    except Exception:
+        used_list = True
+    try:
+        used_sizing = bool(size.UsedInSizing)
+    except Exception:
+        used_sizing = True
+    return {
+        'nominal': nominal,
+        'inner': inner,
+        'outer': outer,
+        'used_list': used_list,
+        'used_sizing': used_sizing,
+    }
+
+
+def pipe_segment_size_records(segment, visible_only=True):
+    """Return deterministic MEPSize records for one PipeSegment.
+
+    ``visible_only`` prefers UsedInSizeLists sizes, matching the user-facing
+    Segments and Sizes table.  If no size is flagged for the size list, all
+    records are returned as a defensive fallback for custom project content.
+    """
+    if not _is_pipe_segment(segment):
+        return []
+    records = []
+    try:
+        raw_sizes = list(segment.GetSizes())
+    except Exception:
+        raw_sizes = []
+    for size in raw_sizes:
+        rec = _mep_size_record(size)
+        if rec is not None:
+            records.append(rec)
+    records.sort(key=lambda r: float(r.get('nominal', 0.0)))
+    if visible_only:
+        visible = [r for r in records if bool(r.get('used_list', True))]
+        if visible:
+            return visible
+    return records
+
+
+def _unique_nominal_values(records):
+    values = []
+    for rec in list(records or []):
+        try:
+            value = float(rec.get('nominal'))
+        except Exception:
+            continue
+        if not any(abs(value - x) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT for x in values):
+            values.append(value)
+    values.sort()
+    return values
+
+
+def _nominal_values_equal(a_values, b_values):
+    aa = sorted([float(x) for x in list(a_values or [])])
+    bb = sorted([float(x) for x in list(b_values or [])])
+    if len(aa) != len(bb):
+        return False
+    for a, b in zip(aa, bb):
+        if abs(a - b) > SIZE_SYSTEM_COMPARE_TOLERANCE_FT:
+            return False
+    return True
+
+
+def pipe_segment_size_signature(segment):
+    values = _unique_nominal_values(pipe_segment_size_records(segment, visible_only=True))
+    return tuple([round(float(x), 8) for x in values])
+
+
+def _nominal_exists(values, nominal):
+    try:
+        n = float(nominal)
+    except Exception:
+        return False
+    return any(abs(n - float(x)) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT for x in list(values or []))
+
+
+def _segment_size_text_from_values(values, max_items=40):
+    vals = sorted([float(x) for x in list(values or [])])
+    labels = [format_pipe_size(v) for v in vals[:max_items]]
+    if len(vals) > max_items:
+        labels.append(u"... +{} size".format(len(vals) - max_items))
+    return u", ".join(labels) if labels else u"<không có size>"
+
+
+def pipe_segment_size_text(segment, max_items=40):
+    return _segment_size_text_from_values(
+        _unique_nominal_values(pipe_segment_size_records(segment, visible_only=True)),
+        max_items=max_items)
+
+
+def pipe_type_segment_rules(pipe_type):
+    """Return Segments routing rules with their referenced PipeSegment."""
+    result = []
+    if pipe_type is None:
+        return result
+    group = _routing_group_enum(u"Segments")
+    if group is None:
+        return result
+    try:
+        manager = pipe_type.RoutingPreferenceManager
+        count = int(manager.GetNumberOfRules(group))
+    except Exception:
+        return result
+    for index in range(max(0, count)):
+        try:
+            rule = manager.GetRule(group, index)
+            part = _routing_rule_part(rule)
+            if not _is_pipe_segment(part):
+                continue
+            records = pipe_segment_size_records(part, visible_only=True)
+            result.append({
+                'index': index,
+                'rule': rule,
+                'segment': part,
+                'records': records,
+                'nominals': _unique_nominal_values(records),
+                'range_text': routing_rule_range_text(rule),
+            })
+        except Exception:
+            pass
+    return result
+
+
+def pipe_type_supported_nominal_sizes(pipe_type):
+    values = []
+    for info in pipe_type_segment_rules(pipe_type):
+        for value in info.get('nominals') or []:
+            # A size from a rule is considered usable only when that rule does
+            # not explicitly reject its own nominal value.
+            try:
+                if not routing_rule_matches_size(info.get('rule'), value):
+                    continue
+            except Exception:
+                pass
+            if not _nominal_exists(values, value):
+                values.append(float(value))
+    values.sort()
+    return values
+
+
+def resolve_pipe_segment_rule_for_size(pipe_type, nominal):
+    """Best Segments rule for an existing/desired nominal pipe diameter."""
+    rules = pipe_type_segment_rules(pipe_type)
+    if not rules:
+        return None
+
+    # Best case: routing criterion accepts the size and the segment explicitly
+    # contains the exact nominal diameter.
+    for info in rules:
+        try:
+            if (routing_rule_matches_size(info.get('rule'), nominal) and
+                    _nominal_exists(info.get('nominals'), nominal)):
+                return info
+        except Exception:
+            pass
+
+    # Second choice: the routing criterion accepts the nominal, even if the
+    # target size table itself is missing that size. This is useful diagnostics
+    # for exactly the V5.8.8 mismatch case.
+    for info in rules:
+        try:
+            if routing_rule_matches_size(info.get('rule'), nominal):
+                return info
+        except Exception:
+            pass
+
+    # If a nominal exists in another rule despite unusual criteria, retain that
+    # segment rather than choosing an unrelated first rule.
+    for info in rules:
+        if _nominal_exists(info.get('nominals'), nominal):
+            return info
+    return rules[0]
+
+
+def nearest_supported_pipe_size(pipe_type, current_size):
+    values = pipe_type_supported_nominal_sizes(pipe_type)
+    if not values:
+        return None
+    try:
+        cur = float(current_size)
+    except Exception:
+        return None
+    # Exact match first.  For an equal-distance tie prefer the LARGER nominal
+    # size rather than silently undersizing the pipe.
+    ranked = sorted(values, key=lambda x: (
+        abs(float(x) - cur),
+        0 if float(x) >= cur else 1,
+        -float(x)))
+    return float(ranked[0]) if ranked else None
+
+
+def analyze_pipe_segment_size_compatibility(pipe, target_pipe_type):
+    """Analyze old-vs-target size systems for one Pipe instance."""
+    result = {
+        'ok': False,
+        'pipe_id': None,
+        'current_size': None,
+        'old_pipe_type_id': None,
+        'old_pipe_type_name': u"?",
+        'target_pipe_type_id': None,
+        'target_pipe_type_name': get_real_name(target_pipe_type) if target_pipe_type else u"?",
+        'old_segment_id': None,
+        'target_segment_id': None,
+        'old_segment_name': u"?",
+        'target_segment_name': u"?",
+        'old_nominals': [],
+        'target_nominals': [],
+        'same_size_system': False,
+        'current_supported_by_target': False,
+        'nearest_size': None,
+        'reason': u"",
+    }
+    if pipe is None or not is_pipe(pipe) or target_pipe_type is None:
+        result['reason'] = u"Thiếu Pipe hoặc Pipe Type mới"
+        return result
+    try:
+        result['pipe_id'] = element_id_value(pipe.Id)
+        result['current_size'] = get_pipe_diameter_ft(pipe)
+        result['old_pipe_type_id'] = element_id_value(pipe.GetTypeId())
+        result['target_pipe_type_id'] = element_id_value(target_pipe_type.Id)
+        old_type = doc.GetElement(pipe.GetTypeId())
+        result['old_pipe_type_name'] = get_real_name(old_type)
+    except Exception as ex:
+        result['reason'] = u"Không đọc được Pipe/Type: {}".format(safe_text(ex))
+        return result
+    if result['current_size'] is None:
+        result['reason'] = u"Không đọc được nominal Pipe Size hiện tại"
+        return result
+
+    old_info = resolve_pipe_segment_rule_for_size(old_type, result['current_size'])
+    new_info = resolve_pipe_segment_rule_for_size(target_pipe_type, result['current_size'])
+    if old_info is None:
+        result['reason'] = u"Pipe Type cũ không có Routing Preferences / Pipe Segment hợp lệ"
+        return result
+    if new_info is None:
+        result['reason'] = u"Pipe Type mới không có Routing Preferences / Pipe Segment hợp lệ"
+        return result
+
+    old_segment = old_info.get('segment')
+    new_segment = new_info.get('segment')
+    result['old_segment_id'] = element_id_value(old_segment.Id) if old_segment is not None else None
+    result['target_segment_id'] = element_id_value(new_segment.Id) if new_segment is not None else None
+    result['old_segment_name'] = get_real_name(old_segment)
+    result['target_segment_name'] = get_real_name(new_segment)
+    result['old_nominals'] = list(old_info.get('nominals') or [])
+    result['target_nominals'] = list(new_info.get('nominals') or [])
+    result['same_size_system'] = _nominal_values_equal(
+        result['old_nominals'], result['target_nominals'])
+    result['current_supported_by_target'] = _nominal_exists(
+        pipe_type_supported_nominal_sizes(target_pipe_type), result['current_size'])
+    result['nearest_size'] = nearest_supported_pipe_size(target_pipe_type, result['current_size'])
+    result['ok'] = True
+    return result
+
+
+def _size_compatibility_analysis_text(analysis):
+    if not analysis:
+        return u"không có phân tích"
+    return (u"Pipe {} | {} / {} -> {} / {} | current {} | old sizes [{}] | new sizes [{}]"
+            .format(
+                analysis.get('pipe_id', u'?'),
+                analysis.get('old_pipe_type_name', u'?'),
+                analysis.get('old_segment_name', u'?'),
+                analysis.get('target_pipe_type_name', u'?'),
+                analysis.get('target_segment_name', u'?'),
+                format_pipe_size(analysis.get('current_size')),
+                _segment_size_text_from_values(analysis.get('old_nominals') or []),
+                _segment_size_text_from_values(analysis.get('target_nominals') or [])))
+
+
+def _all_pipe_segments():
+    try:
+        return list(DB.FilteredElementCollector(doc).OfClass(DB.Plumbing.PipeSegment).ToElements())
+    except Exception:
+        result = []
+        try:
+            for elem in DB.FilteredElementCollector(doc).WhereElementIsNotElementType():
+                if _is_pipe_segment(elem):
+                    result.append(elem)
+        except Exception:
+            pass
+        return result
+
+
+def _schedule_size_record(schedule_type_id, nominal, preferred_segment=None):
+    """Find trustworthy MEPSize dimensions for nominal on the TARGET schedule.
+
+    The safe/private Segment strategy never invents OD/ID. Missing target
+    nominal sizes are accepted only when another existing PipeSegment with the
+    SAME PipeScheduleType already contains that nominal size.
+    """
+    candidates = []
+    if preferred_segment is not None:
+        candidates.append(preferred_segment)
+    for seg in _all_pipe_segments():
+        if preferred_segment is not None:
+            try:
+                if same_element_id(seg.Id, preferred_segment.Id):
+                    continue
+            except Exception:
+                pass
+        try:
+            if not same_element_id(seg.ScheduleTypeId, schedule_type_id):
+                continue
+        except Exception:
+            continue
+        candidates.append(seg)
+    for seg in candidates:
+        for rec in pipe_segment_size_records(seg, visible_only=False):
+            try:
+                if abs(float(rec.get('nominal')) - float(nominal)) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT:
+                    return dict(rec)
+            except Exception:
+                pass
+    return None
+
+
+def compatible_private_segment_plan(old_segment, target_segment):
+    """Plan a private target-schedule Segment that also supports old nominals.
+
+    Existing target sizes keep their own MEPSize data.  Missing old nominals are
+    copied ONLY from an existing segment with the same target ScheduleTypeId.
+    This prevents V5.8.8 from fabricating inner/outer diameters.
+    """
+    if not _is_pipe_segment(old_segment) or not _is_pipe_segment(target_segment):
+        return None, [u"Không đọc được PipeSegment cũ/mới"]
+    target_records = pipe_segment_size_records(target_segment, visible_only=False)
+    old_visible = pipe_segment_size_records(old_segment, visible_only=False)
+    if not target_records:
+        return None, [u"Pipe Segment mới không có MEPSize"]
+    desired = [dict(r) for r in target_records]
+    missing = []
+    schedule_id = target_segment.ScheduleTypeId
+    for old_rec in old_visible:
+        nominal = old_rec.get('nominal')
+        if _nominal_exists([r.get('nominal') for r in desired], nominal):
+            continue
+        rec = _schedule_size_record(schedule_id, nominal, preferred_segment=target_segment)
+        if rec is None:
+            missing.append(format_pipe_size(nominal))
+            continue
+        # Added compatibility sizes should be available in size lists and keep
+        # the source schedule's sizing flag.
+        rec['used_list'] = True
+        desired.append(rec)
+    desired.sort(key=lambda r: float(r.get('nominal', 0.0)))
+    return desired, missing
+
+
+def _unique_name_for_elements(base_name, element_class):
+    base = safe_text(base_name).strip() or u"AnTools"
+    existing = set()
+    try:
+        for elem in DB.FilteredElementCollector(doc).OfClass(element_class).ToElements():
+            try:
+                existing.add(safe_text(elem.Name).lower())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if base.lower() not in existing:
+        return base
+    for i in range(1, 10000):
+        name = u"{} ({})".format(base, i)
+        if name.lower() not in existing:
+            return name
+    return u"{}_{}".format(base, element_id_value(DB.ElementId.InvalidElementId) or 99999)
+
+
+def _build_mep_size_collection(records):
+    try:
+        result = List[DB.MEPSize]() if List is not None else None
+    except Exception:
+        result = None
+    if result is None:
+        try:
+            from System.Collections.Generic import List as GenericList
+            result = GenericList[DB.MEPSize]()
+        except Exception:
+            result = []
+    for rec in list(records or []):
+        size = DB.MEPSize(
+            float(rec.get('nominal')),
+            float(rec.get('inner')),
+            float(rec.get('outer')),
+            bool(rec.get('used_list', True)),
+            bool(rec.get('used_sizing', True)))
+        try:
+            result.Add(size)
+        except Exception:
+            result.append(size)
+    return result
+
+
+def create_private_compatible_pipe_type(base_pipe_type, old_segment, target_segment, cache=None):
+    """Create an isolated PipeType + PipeSegment size-compatibility configuration.
+
+    The selected/base PipeType and its original PipeSegment are NEVER modified.
+    A duplicated material is used for the isolated PipeSegment configuration.
+    The duplicated PipeType gets the new segment as its first Segments routing
+    rule. If the batch commits, this dedicated PipeType/Segment remains in the
+    model because the affected Pipes reference it.
+    """
+    if base_pipe_type is None:
+        raise Exception(u"Không có Pipe Type mới")
+    if not _is_pipe_segment(old_segment) or not _is_pipe_segment(target_segment):
+        raise Exception(u"Không có Pipe Segment cũ/mới hợp lệ để tạo config riêng")
+
+    key = (
+        element_id_value(base_pipe_type.Id),
+        element_id_value(target_segment.Id),
+        pipe_segment_size_signature(old_segment),
+    )
+    if cache is not None and key in cache:
+        return cache[key]
+
+    desired_records, missing = compatible_private_segment_plan(old_segment, target_segment)
+    if missing:
+        raise Exception(
+            u"Không thể tạo Pipe Segment riêng an toàn vì target Schedule thiếu dữ liệu MEPSize cho: {}. "
+            u"V5.8.8 không tự bịa Inner/Outer Diameter; hãy dùng chế độ size gần nhất hoặc bổ sung size vào Schedule/Segment chuẩn trước."
+            .format(u", ".join(missing)))
+
+    base_segment_rule_ids_before = []
+    try:
+        base_segment_rule_ids_before = [
+            element_id_value(info.get('segment').Id) for info in pipe_type_segment_rules(base_pipe_type)
+            if info.get('segment') is not None]
+    except Exception:
+        base_segment_rule_ids_before = []
+
+    st = DB.SubTransaction(doc)
+    started = False
+    try:
+        st.Start()
+        started = True
+        target_material = doc.GetElement(target_segment.MaterialId)
+        if target_material is None or not isinstance(target_material, DB.Material):
+            raise Exception(u"Không đọc được Material của Pipe Segment mới")
+        material_name = _unique_name_for_elements(
+            u"{}__AnTools_SizeCompat".format(get_real_name(target_material)), DB.Material)
+        new_material = target_material.Duplicate(material_name)
+        if new_material is None:
+            raise Exception(u"Không duplicate được Material cho Pipe Segment riêng")
+
+        size_collection = _build_mep_size_collection(desired_records)
+        new_segment = DB.Plumbing.PipeSegment.Create(
+            doc, new_material.Id, target_segment.ScheduleTypeId, size_collection)
+        if new_segment is None:
+            raise Exception(u"PipeSegment.Create không trả về segment")
+        try:
+            new_segment.Name = u"{}__AnTools_SizeCompat".format(get_real_name(target_segment))
+        except Exception:
+            pass
+
+        type_name = _unique_name_for_elements(
+            u"{}__AnTools_SizeCompat".format(get_real_name(base_pipe_type)), DB.Plumbing.PipeType)
+        new_type = base_pipe_type.Duplicate(type_name)
+        if new_type is None:
+            raise Exception(u"Không duplicate được Pipe Type mới")
+
+        group = _routing_group_enum(u"Segments")
+        if group is None:
+            raise Exception(u"Revit API không có RoutingPreference group Segments")
+        manager = new_type.RoutingPreferenceManager
+        new_rule = DB.RoutingPreferenceRule(
+            new_segment.Id, u"An-Tools V5.8.8 private compatible Pipe Segment")
+        try:
+            manager.AddRule(group, new_rule, 0)
+        except Exception:
+            # Compatibility fallback: only the DUPLICATED PipeType is altered.
+            try:
+                count = int(manager.GetNumberOfRules(group))
+            except Exception:
+                count = 0
+            for idx in range(count - 1, -1, -1):
+                try:
+                    manager.RemoveRule(group, idx)
+                except Exception:
+                    pass
+            manager.AddRule(group, new_rule)
+
+        doc.Regenerate()
+
+        # Validate the private config and prove that the original target PipeType
+        # routing rules were not modified.
+        private_rules = pipe_type_segment_rules(new_type)
+        if not private_rules or not same_element_id(private_rules[0].get('segment').Id, new_segment.Id):
+            raise Exception(u"Pipe Type copy không ưu tiên Pipe Segment riêng sau AddRule")
+        actual_private_sizes = _unique_nominal_values(
+            pipe_segment_size_records(new_segment, visible_only=False))
+        desired_sizes = _unique_nominal_values(desired_records)
+        if not _nominal_values_equal(actual_private_sizes, desired_sizes):
+            raise Exception(u"Pipe Segment riêng không giữ đúng size set yêu cầu")
+        try:
+            base_segment_rule_ids_after = [
+                element_id_value(info.get('segment').Id) for info in pipe_type_segment_rules(base_pipe_type)
+                if info.get('segment') is not None]
+        except Exception:
+            base_segment_rule_ids_after = []
+        if base_segment_rule_ids_before != base_segment_rule_ids_after:
+            raise Exception(u"Phát hiện Routing Preferences của Pipe Type gốc bị thay đổi; rollback config riêng")
+
+        result = {
+            'pipe_type': new_type,
+            'segment': new_segment,
+            'material': new_material,
+            'key': key,
+            'sizes': _unique_nominal_values(desired_records),
+        }
+        st.Commit()
+        if cache is not None:
+            cache[key] = result
+        return result
+    except Exception:
+        if started:
+            try:
+                st.RollBack()
+            except Exception:
+                pass
+        raise
+
+
+
+def _source_aware_manual_mapping_key(old_pipe_type_id, old_segment_id, old_size):
+    """Stable Option-3 key: old PipeType + old PipeSegment + old nominal size."""
+    try:
+        pt = int(old_pipe_type_id)
+        seg = int(old_segment_id)
+        size = round(float(old_size), 8)
+        return (pt, seg, size)
+    except Exception:
+        return None
+
+
+def _manual_size_mapping_lookup(mapping, old_pipe_type_id, old_segment_id, old_size):
+    """Lookup one source-aware manual mapping without falling back to size-only keys.
+
+    PVC DN100 and HDPE DN100 are intentionally different source keys. Legacy
+    V5.8.7.x size-only mappings are not auto-applied because doing so could map
+    two different Pipe Segments to the same target size without user approval.
+    """
+    wanted = _source_aware_manual_mapping_key(old_pipe_type_id, old_segment_id, old_size)
+    if wanted is None:
+        return None
+    mapping = mapping or {}
+    if wanted in mapping:
+        try:
+            return float(mapping[wanted])
+        except Exception:
+            return None
+    for key, value in mapping.items():
+        try:
+            if not isinstance(key, tuple) or len(key) != 3:
+                continue
+            if int(key[0]) != int(wanted[0]) or int(key[1]) != int(wanted[1]):
+                continue
+            if abs(float(key[2]) - float(wanted[2])) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT:
+                return float(value)
+        except Exception:
+            pass
+    return None
+
+
+def build_pipe_size_compatibility_plan(pipe, target_pipe_type, mode='adaptive', strategy='private_segment', manual_mapping=None):
+    """V5.8.8 planning for one Pipe under one of three explicit size strategies."""
+    analysis = analyze_pipe_segment_size_compatibility(pipe, target_pipe_type)
+    plan = {
+        'pipe_id': analysis.get('pipe_id'),
+        'analysis': analysis,
+        'actionable': False,
+        'skip_reason': u'',
+        'target_type_id': target_pipe_type.Id if target_pipe_type is not None else None,
+        'target_size': analysis.get('current_size'),
+        'requires_private_config': False,
+        'private_key': None,
+        'private_old_segment_id': analysis.get('old_segment_id'),
+        'private_target_segment_id': analysis.get('target_segment_id'),
+        'mapping_changed': False,
+    }
+    if not analysis.get('ok'):
+        plan['skip_reason'] = analysis.get('reason') or u"Không phân tích được Pipe Segment Size Compatibility"
+        return plan
+
+    current_size = analysis.get('current_size')
+    strategy = safe_text(strategy).lower()
+    if strategy not in ('private_segment', 'nearest', 'manual'):
+        strategy = 'private_segment'
+
+    if strategy == 'nearest':
+        nearest = analysis.get('nearest_size')
+        if nearest is None:
+            plan['skip_reason'] = u"OPTION 2 / SIZE GẦN NHẤT: Pipe Type mới không có nominal size nào để map"
+            return plan
+        plan['target_size'] = float(nearest)
+        plan['mapping_changed'] = abs(float(nearest) - float(current_size)) > SIZE_SYSTEM_COMPARE_TOLERANCE_FT
+        plan['actionable'] = True
+        return plan
+
+    if strategy == 'manual':
+        mapped = _manual_size_mapping_lookup(
+            manual_mapping or {}, analysis.get('old_pipe_type_id'),
+            analysis.get('old_segment_id'), current_size)
+        if mapped is None:
+            plan['skip_reason'] = (u"OPTION 3 / MANUAL: chưa cấu hình mapping cho nguồn '{} / {}' tại {}"
+                                   .format(analysis.get('old_pipe_type_name', u'?'),
+                                           analysis.get('old_segment_name', u'?'),
+                                           format_pipe_size(current_size)))
+            return plan
+        supported = pipe_type_supported_nominal_sizes(target_pipe_type)
+        if not _nominal_exists(supported, mapped):
+            plan['skip_reason'] = (
+                u"OPTION 3 / MANUAL: mapping {} / {} / {} -> {} không hợp lệ vì size mới không tồn tại trong Pipe Type mới"
+                .format(analysis.get('old_pipe_type_name', u'?'),
+                        analysis.get('old_segment_name', u'?'),
+                        format_pipe_size(current_size), format_pipe_size(mapped)))
+            return plan
+        plan['target_size'] = float(mapped)
+        plan['mapping_changed'] = abs(float(mapped) - float(current_size)) > SIZE_SYSTEM_COMPARE_TOLERANCE_FT
+        plan['actionable'] = True
+        return plan
+
+    # OPTION 1: preserve the former 2A behavior. Only when the complete
+    # old/new nominal systems match do we use the requested PipeType directly;
+    # otherwise create an isolated compatible PipeType/Segment configuration.
+    if analysis.get('same_size_system') and analysis.get('current_supported_by_target'):
+        plan['actionable'] = True
+        return plan
+
+    old_segment = doc.GetElement(make_element_id(analysis.get('old_segment_id')))
+    target_segment = doc.GetElement(make_element_id(analysis.get('target_segment_id')))
+    desired_records, missing = compatible_private_segment_plan(old_segment, target_segment)
+    if missing:
+        plan['skip_reason'] = (
+            u"OPTION 1 / GIỮ NGUYÊN SIZE: target Schedule không có dữ liệu MEPSize cho {}. "
+            u"Không tạo config vì sẽ phải suy đoán Inner/Outer Diameter."
+            .format(u", ".join(missing)))
+        return plan
+    if not desired_records:
+        plan['skip_reason'] = u"OPTION 1 / GIỮ NGUYÊN SIZE: không xây được Pipe Segment tương thích"
+        return plan
+    if not _nominal_exists([r.get('nominal') for r in desired_records], current_size):
+        plan['skip_reason'] = (u"OPTION 1 / GIỮ NGUYÊN SIZE: {} không có dữ liệu MEPSize hợp lệ để tạo private Segment"
+                               .format(format_pipe_size(current_size)))
+        return plan
+
+    plan['requires_private_config'] = True
+    plan['private_key'] = (
+        element_id_value(target_pipe_type.Id),
+        analysis.get('target_segment_id'),
+        pipe_segment_size_signature(old_segment),
+    )
+    plan['actionable'] = True
+    return plan
+
+
+def override_port_record_sizes_from_partners(old_records, links):
+    """Use live connected partner connector sizes as fitting size authority."""
+    updated = []
+    changes = []
+    for index, old in enumerate(list(old_records or [])):
+        rec = dict(old)
+        link = find_link_for_old_port(old, links)
+        if link is not None:
+            sig = None
+            try:
+                partner = find_partner_connector(link)
+                if partner is not None:
+                    sig = connector_size_signature(partner)
+            except Exception:
+                sig = None
+            if sig is None:
+                sig = link.get('partner_size')
+            if sig is not None:
+                before = rec.get('size')
+                rec['size'] = sig
+                try:
+                    if not size_signatures_match(before, sig):
+                        changes.append(u"PORT {} {} -> {}".format(index + 1, safe_text(before), safe_text(sig)))
+                except Exception:
+                    if safe_text(before) != safe_text(sig):
+                        changes.append(u"PORT {} {} -> {}".format(index + 1, safe_text(before), safe_text(sig)))
+        updated.append(rec)
+    return updated, changes
+
 
 
 def fitting_role_from_symbol(symbol):
@@ -3822,7 +4546,7 @@ def try_match_direct_fitting_size(created_id, old_records, links=None):
     type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records, links)
     if type_ok:
         return True, type_note
-    return False, (u"auto-size V5.8.5 không giải được đồng thời tất cả connector bằng instance parameter; "
+    return False, (u"auto-size V5.8.8 không giải được đồng thời tất cả connector bằng instance parameter; "
                    u"target radius {:.6f} ft; size hiện tại {}; probe [{}]; double params [{}] | {}"
                    .format(target_radius, safe_text(current_sizes), u"; ".join(probe_text),
                            writable_double_parameter_diagnostics(current), type_note))
@@ -3916,7 +4640,7 @@ def _tee_role_target_from_old_records(old_records, links=None):
 
     V5.8.3 compared only the unordered multiset of connector radii. That can
     accept DN160/DN160/DN150 even when DN150 is on a RUN port instead of the
-    BRANCH. V5.8.5 preserves the intrinsic Tee role: the most-collinear pair is
+    BRANCH. V5.8.8 preserves the intrinsic Tee role: the most-collinear pair is
     RUN A/RUN B and the remaining connector is BRANCH.
     """
     records = list(old_records or [])
@@ -4214,7 +4938,7 @@ def _trial_duplicate_symbol_profile(created_id, assignments, target_radii, dupli
 
 
 def try_match_direct_fitting_size_by_type(created_id, old_records, links=None, max_trials=180):
-    """V5.8.5 fallback for content whose connector sizes are TYPE-driven.
+    """V5.8.8 fallback for content whose connector sizes are TYPE-driven.
 
     Strategy:
       1) try every already-loaded sibling FamilySymbol in the SAME Family;
@@ -4247,7 +4971,7 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, links=None, m
             ok2, actual2, err2 = _trial_existing_family_symbol_profile(
                 created_id, fs, target_radii, role_target=role_target, commit_if_match=True)
             if ok2:
-                return True, (u"V5.8.5 type-size: dùng type đã load cùng Family '{}'; "
+                return True, (u"V5.8.8 type-size: dùng type đã load cùng Family '{}'; "
                               u"connector profile {}"
                               .format(get_real_name(fs), safe_text(actual2)) +
                               ((u"; " + _tee_role_profile_text(role_target)) if role_target else u""))
@@ -4256,7 +4980,7 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, links=None, m
 
     type_candidates = _collect_size_driver_candidates(base_symbol, max_items=8)
     if not type_candidates:
-        return False, (u"V5.8.5 type-size: không có type cùng Family khớp profile và không tìm được "
+        return False, (u"V5.8.8 type-size: không có type cùng Family khớp profile và không tìm được "
                        u"TYPE parameter Diameter/DN/Radius/Size có thể ghi; target radii {}; "
                        u"type double params [{}]"
                        .format(safe_text(sorted(target_radii)),
@@ -4302,7 +5026,7 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, links=None, m
                 probe.append((assignments, actual, err))
                 if ok:
                     names = u", ".join([u"{}={:.6f}".format(a[1], a[2]) for a in assignments])
-                    return True, (u"V5.8.5 TYPE auto-size: duplicate '{}' -> '{}'; [{}] ft; "
+                    return True, (u"V5.8.8 TYPE auto-size: duplicate '{}' -> '{}'; [{}] ft; "
                                   u"connector profile {} đúng. Type gốc không bị sửa."
                                   .format(base_name, trial_name, names, safe_text(actual)) +
                                   ((u"; " + _tee_role_profile_text(role_target)) if role_target else u""))
@@ -4316,7 +5040,7 @@ def try_match_direct_fitting_size_by_type(created_id, old_records, links=None, m
         names = u",".join([u"{}={:.4f}".format(a[1], a[2]) for a in assignments])
         probe_text.append(u"[{}]->{}{}".format(names, safe_text(actual),
                                                   (u" ERR=" + safe_text(err)) if err else u""))
-    return False, (u"V5.8.5 TYPE auto-size không giải được profile; target radii {}; "
+    return False, (u"V5.8.8 TYPE auto-size không giải được profile; target radii {}; "
                    u"TYPE size-driver [{}]; thử {} tổ hợp; probe [{}]; type double params [{}]"
                    .format(safe_text(sorted(target_radii)),
                            u", ".join([safe_text(x[1]) for x in type_candidates]),
@@ -4451,7 +5175,7 @@ def try_match_direct_fitting_variable_size(created_id, old_records, links=None):
                         role_target=role_target, commit_if_match=True)
                     if ok:
                         role_suffix = ((u"; " + _tee_role_profile_text(role_target)) if role_target else u"")
-                        return True, (u"auto-size V5.8.5 fitting giảm: '{}'={:.6f} ft; "
+                        return True, (u"auto-size V5.8.8 fitting giảm: '{}'={:.6f} ft; "
                                       u"profile {}/{} đúng{}"
                                       .format(pname, value, m2, t2, role_suffix))
         # Deterministic order: most useful solo result first, but retain every
@@ -4506,7 +5230,7 @@ def try_match_direct_fitting_variable_size(created_id, old_records, links=None):
                 if ok:
                     names = u", ".join([u"{}={:.6f}".format(a[1], a[2]) for a in assignments])
                     role_suffix = ((u"; " + _tee_role_profile_text(role_target)) if role_target else u"")
-                    return True, (u"auto-size V5.8.5 fitting giảm đa cỡ: [{}] ft; "
+                    return True, (u"auto-size V5.8.8 fitting giảm đa cỡ: [{}] ft; "
                                   u"target radii {}; connector {}/{} đúng{}"
                                   .format(names, safe_text(sorted(target_radii)), matched, total, role_suffix))
             if trial_count > max_trials:
@@ -4534,7 +5258,7 @@ def try_match_direct_fitting_variable_size(created_id, old_records, links=None):
                     if ok:
                         names = u", ".join([u"{}={:.6f}".format(r['name'], r['value']) for r in combo])
                         role_suffix = ((u"; " + _tee_role_profile_text(role_target)) if role_target else u"")
-                        return True, (u"auto-size V5.8.5 fitting giảm đa cỡ: [{}] ft; "
+                        return True, (u"auto-size V5.8.8 fitting giảm đa cỡ: [{}] ft; "
                                       u"target radii {}; connector {}/{} đúng{}"
                                       .format(names, safe_text(sorted(target_radii)), matched, total, role_suffix))
                 if trial_count > max_trials:
@@ -4561,7 +5285,7 @@ def try_match_direct_fitting_variable_size(created_id, old_records, links=None):
     type_ok, type_note = try_match_direct_fitting_size_by_type(created_id, old_records, links)
     if type_ok:
         return True, type_note
-    return False, ((u"auto-size V5.8.5 fitting giảm không giải được instance profile đa cỡ; "
+    return False, ((u"auto-size V5.8.8 fitting giảm không giải được instance profile đa cỡ; "
                     u"target radii {}; hiện tại {}; size-driver [{}]; thử {} tổ hợp; "
                     u"probe [{}]; double params [{}] | {}"
                     .format(safe_text(sorted(target_radii)), safe_text(actual),
@@ -5445,11 +6169,59 @@ class SkipWarningsPreprocessor(DB.IFailuresPreprocessor):
 # ============================================================
 
 
+
+def routing_primary_size_from_partner_pipes(fitting):
+    """Primary Size derived from live connected partner connectors.
+
+    Used by V5.8.8 adaptive size mode after Pipes may already have been mapped
+    to a new nominal size. Tee/Wye run identification still comes from actual
+    centerline geometry; only the diameter authority changes to partner Pipes.
+    """
+    try:
+        links = snapshot_fitting_connections(fitting)
+        records = snapshot_port_geometry(fitting)
+        records, _changes = override_port_record_sizes_from_partners(records, links)
+    except Exception:
+        return None
+    sized = []
+    for i, rec in enumerate(records):
+        sig = rec.get('size')
+        if sig is None or len(sig) < 2 or sig[0] != u'round':
+            continue
+        try:
+            sized.append((i, float(sig[1]) * 2.0))
+        except Exception:
+            pass
+    if not sized:
+        return None
+    if len(records) <= 2:
+        return max([x[1] for x in sized])
+    try:
+        axes = target_axes_for_old_ports(records, links)
+        pair, score = _most_collinear_pair_indices(axes)
+        if pair is not None and score is not None and score >= 0.94:
+            run_values = [d for i, d in sized if i in pair]
+            if run_values:
+                return max(run_values)
+    except Exception:
+        pass
+    return max([x[1] for x in sized])
+
+
+
 class ReplaceElementsWindow(forms.WPFWindow):
     def __init__(self, xaml_file_name, preselected_ids):
+        # V5.8.8 UI hotfix: XAML can raise SelectionChanged while WPFWindow is
+        # still loading. Initialize every guard/state referenced by early event
+        # handlers BEFORE LoadComponent parses the XAML.
+        self._loading_choices = True
+        self._updating_size_compat_mode = True
+        self.size_compatibility_mode = 'adaptive'
+        self.size_adaptive_strategy = 'private_segment'
+        self.manual_size_mapping = {}
         forms.WPFWindow.__init__(self, xaml_file_name)
         try:
-            self.Title = u"Correct Pipes & Fittings V5.8.5 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
+            self.Title = u"Correct Pipes & Fittings V5.8.8 Universal - Revit {}".format(REVIT_VERSION if REVIT_VERSION else u"?")
         except Exception:
             pass
         # V4.9: size the dialog against the actual Windows work area.  The XAML
@@ -5477,6 +6249,16 @@ class ReplaceElementsWindow(forms.WPFWindow):
         # 'manual' = user selects at most one FamilySymbol per PartType, like V5.3.
         self.fitting_selection_mode = 'auto'
         self._updating_fitting_mode = False
+        # V5.8.8: Pipe Segment size compatibility has three explicit strategies.
+        # private_segment = preserve current nominal size using an isolated compatible PipeType/Segment.
+        # nearest         = automatically map to the nearest target-supported nominal size.
+        # manual          = user-defined old nominal -> target nominal mapping.
+        self.size_compatibility_mode = 'adaptive'
+        self.size_adaptive_strategy = 'private_segment'
+        self.manual_size_mapping = {}
+        self._updating_size_compat_mode = False
+        self._runtime_pipe_size_plans = {}
+        self._runtime_predict_size_plans = False
 
         # V4.8: freeze the Revit selection at command start. The modal UI never
         # reads UIDocument.Selection again, so accidental selection changes cannot
@@ -5586,7 +6368,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             except Exception:
                 pass
         if log_change:
-            self.log(u"Chế độ Fitting V5.8.5: {}."
+            self.log(u"Chế độ Fitting V5.8.8: {}."
                      .format(u"CHỌN THỦ CÔNG như V5.3" if manual else u"AUTO ROUTING PREFERENCES"))
 
     def fitting_mode_click(self, sender, args):
@@ -5601,6 +6383,647 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 self._set_fitting_selection_mode('auto', True)
         except Exception as ex:
             self.log(u"Không thể đổi chế độ Fitting: {}".format(safe_text(ex)))
+
+    def _is_adaptive_size_mode(self):
+        """V5.8.8 has no legacy legacy Strict mode; all three strategies are compatibility-aware."""
+        return True
+
+    def _size_adaptive_strategy(self):
+        value = safe_text(getattr(self, 'size_adaptive_strategy', 'private_segment')).lower()
+        if value == 'nearest':
+            return 'nearest'
+        if value == 'manual':
+            return 'manual'
+        return 'private_segment'
+
+    def _use_partner_size_authority(self):
+        """V5.8.8 sizes fittings from live connected Pipe connectors after Pipe processing."""
+        return True
+
+    def _set_size_compatibility_mode(self, mode, log_change=False):
+        """Backward-compatible shim for configs from V5.8.6; Strict is removed in V5.8.8."""
+        self.size_compatibility_mode = 'adaptive'
+        self._set_size_adaptive_strategy(self._size_adaptive_strategy(), log_change)
+
+    def _set_size_adaptive_strategy(self, strategy, log_change=False):
+        strategy = safe_text(strategy).lower()
+        if strategy not in ('private_segment', 'nearest', 'manual'):
+            strategy = 'private_segment'
+        self.size_compatibility_mode = 'adaptive'
+        self.size_adaptive_strategy = strategy
+        try:
+            self._updating_size_compat_mode = True
+            self.chk_SizeStrategyPrivate.IsChecked = (strategy == 'private_segment')
+            self.chk_SizeStrategyNearest.IsChecked = (strategy == 'nearest')
+            self.chk_SizeStrategyManual.IsChecked = (strategy == 'manual')
+        except Exception:
+            pass
+        finally:
+            self._updating_size_compat_mode = False
+        self._update_size_compatibility_ui(log_change)
+
+    def _manual_source_key(self, pipe_type_id, segment_id):
+        try:
+            return u"{}|{}".format(int(pipe_type_id), int(segment_id))
+        except Exception:
+            return None
+
+    def _parse_manual_source_key(self, source_key):
+        try:
+            parts = safe_text(source_key).split('|')
+            if len(parts) != 2:
+                return None, None
+            return int(parts[0]), int(parts[1])
+        except Exception:
+            return None, None
+
+    def _manual_mapping_key(self, source_key, old_size):
+        pt_id, seg_id = self._parse_manual_source_key(source_key)
+        return _source_aware_manual_mapping_key(pt_id, seg_id, old_size)
+
+    def _manual_mapping_target(self, source_key, old_size):
+        key = self._manual_mapping_key(source_key, old_size)
+        if key is None:
+            return None
+        mapping = getattr(self, 'manual_size_mapping', {}) or {}
+        if key in mapping:
+            try:
+                return float(mapping[key])
+            except Exception:
+                return None
+        for old_key, target_value in mapping.items():
+            try:
+                if not isinstance(old_key, tuple) or len(old_key) != 3:
+                    continue
+                if int(old_key[0]) != int(key[0]) or int(old_key[1]) != int(key[1]):
+                    continue
+                if abs(float(old_key[2]) - float(key[2])) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT:
+                    return float(target_value)
+            except Exception:
+                pass
+        return None
+
+    def _serialize_manual_size_mapping(self):
+        rows = []
+        mapping = getattr(self, 'manual_size_mapping', {}) or {}
+        def sort_key(item):
+            key = item[0]
+            try:
+                return (int(key[0]), int(key[1]), float(key[2]))
+            except Exception:
+                return (0, 0, 0.0)
+        for key, target in sorted(mapping.items(), key=sort_key):
+            try:
+                if not isinstance(key, tuple) or len(key) != 3:
+                    continue
+                rows.append(u"{}|{}|{:.12f}={:.12f}".format(
+                    int(key[0]), int(key[1]), float(key[2]), float(target)))
+            except Exception:
+                pass
+        return u";".join(rows)
+
+    def _deserialize_manual_size_mapping(self, raw):
+        result = {}
+        legacy_ignored = 0
+        for token in safe_text(raw or u'').split(';'):
+            token = token.strip()
+            if not token or '=' not in token:
+                continue
+            left, right = token.split('=', 1)
+            try:
+                parts = left.split('|')
+                if len(parts) != 3:
+                    # V5.8.7.x stored only old nominal size. Do not auto-migrate
+                    # because PVC DN100 and HDPE DN100 may need different targets.
+                    legacy_ignored += 1
+                    continue
+                key = _source_aware_manual_mapping_key(
+                    int(parts[0]), int(parts[1]), float(parts[2]))
+                if key is not None:
+                    result[key] = float(right)
+            except Exception:
+                pass
+        self._legacy_manual_mapping_ignored = legacy_ignored
+        return result
+
+    def _current_manual_mapping_sources(self):
+        """Distinct old PipeType/PipeSegment sources in the frozen preselection.
+
+        One source can contain several nominal sizes. The selected System Type is
+        respected, but Min/Max is deliberately NOT applied because Option 3 is a
+        configuration UI and should expose every selected source/size pair.
+        """
+        sources = {}
+        try:
+            selected_system = self.cmb_Systems.SelectedItem
+            system_type_id = selected_system.Value if selected_system else None
+        except Exception:
+            system_type_id = None
+
+        for raw_id in list(getattr(self, 'preselected_element_ids', []) or []):
+            try:
+                elem = doc.GetElement(make_element_id(raw_id))
+                if not is_pipe(elem):
+                    continue
+                if system_type_id is not None and not same_element_id(get_system_type_id(elem), system_type_id):
+                    continue
+                size = get_pipe_diameter_ft(elem)
+                if size is None:
+                    continue
+                old_type = doc.GetElement(elem.GetTypeId())
+                if old_type is None:
+                    continue
+                old_info = resolve_pipe_segment_rule_for_size(old_type, size)
+                if old_info is None or old_info.get('segment') is None:
+                    continue
+                segment = old_info.get('segment')
+                pt_id = element_id_value(old_type.Id)
+                seg_id = element_id_value(segment.Id)
+                source_key = self._manual_source_key(pt_id, seg_id)
+                if source_key is None:
+                    continue
+                rec = sources.get(source_key)
+                if rec is None:
+                    rec = {
+                        'key': source_key,
+                        'pipe_type_id': pt_id,
+                        'segment_id': seg_id,
+                        'pipe_type_name': get_real_name(old_type),
+                        'segment_name': get_real_name(segment),
+                        'sizes': [],
+                        'pipe_count': 0,
+                    }
+                    sources[source_key] = rec
+                rec['pipe_count'] += 1
+                value = float(size)
+                if not any(abs(value - x) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT for x in rec['sizes']):
+                    rec['sizes'].append(value)
+            except Exception:
+                pass
+
+        result = list(sources.values())
+        for rec in result:
+            rec['sizes'].sort()
+        result.sort(key=lambda r: (
+            safe_text(r.get('pipe_type_name')).lower(),
+            safe_text(r.get('segment_name')).lower(),
+            int(r.get('pipe_type_id') or -1),
+            int(r.get('segment_id') or -1)))
+        return result
+
+    def _current_manual_mapping_source_sizes(self):
+        """Flatten all source-aware old sizes for Option 1/2 preview text."""
+        values = []
+        for source in self._current_manual_mapping_sources():
+            for size in list(source.get('sizes') or []):
+                try:
+                    value = float(size)
+                    if not any(abs(value - x) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT for x in values):
+                        values.append(value)
+                except Exception:
+                    pass
+        values.sort()
+        return values
+
+    def _current_manual_mapping_target_sizes(self):
+        try:
+            item = self.cmb_PipeTypes.SelectedItem
+            pipe_type = doc.GetElement(item.Value) if item else None
+            return list(pipe_type_supported_nominal_sizes(pipe_type) or [])
+        except Exception:
+            return []
+
+    def _manual_source_record(self, source_key, sources=None):
+        if source_key is None:
+            return None
+        for rec in list(sources if sources is not None else self._current_manual_mapping_sources()):
+            if safe_text(rec.get('key')) == safe_text(source_key):
+                return rec
+        return None
+
+    def _manual_source_label(self, source_key, sources=None):
+        rec = self._manual_source_record(source_key, sources)
+        if rec is not None:
+            return u"{} / {}".format(rec.get('pipe_type_name', u'?'), rec.get('segment_name', u'?'))
+        pt_id, seg_id = self._parse_manual_source_key(source_key)
+        return u"PipeType {} / Segment {}".format(pt_id if pt_id is not None else u'?',
+                                                   seg_id if seg_id is not None else u'?')
+
+    def _select_manual_source_combo_key(self, combo, wanted):
+        if combo is None:
+            return False
+        if wanted is None:
+            combo.SelectedIndex = -1
+            return False
+        found = -1
+        for i in range(combo.Items.Count):
+            try:
+                if safe_text(combo.Items[i].Value) == safe_text(wanted):
+                    found = i
+                    break
+            except Exception:
+                pass
+        combo.SelectedIndex = found
+        return found >= 0
+
+    def _select_manual_combo_value(self, combo, wanted):
+        """Select a nominal-size item without inventing a default choice."""
+        if combo is None:
+            return False
+        if wanted is None:
+            combo.SelectedIndex = -1
+            return False
+        found = -1
+        for i in range(combo.Items.Count):
+            try:
+                if abs(float(combo.Items[i].Value) - float(wanted)) <= SIZE_SYSTEM_COMPARE_TOLERANCE_FT:
+                    found = i
+                    break
+            except Exception:
+                pass
+        combo.SelectedIndex = found
+        return found >= 0
+
+    def _refresh_manual_size_mapping_controls(self):
+        """Refresh source-aware Option 3 controls without auto-selecting New Size."""
+        if not hasattr(self, 'cmb_ManualSource'):
+            return
+        selected_source = None
+        old_selected = None
+        try:
+            if self.cmb_ManualSource.SelectedItem is not None:
+                selected_source = safe_text(self.cmb_ManualSource.SelectedItem.Value)
+        except Exception:
+            pass
+        try:
+            if self.cmb_ManualOldSize.SelectedItem is not None:
+                old_selected = float(self.cmb_ManualOldSize.SelectedItem.Value)
+        except Exception:
+            pass
+
+        sources = self._current_manual_mapping_sources()
+        target_sizes = self._current_manual_mapping_target_sizes()
+        try:
+            self._updating_size_compat_mode = True
+            self.cmb_ManualSource.Items.Clear()
+            self.cmb_ManualOldSize.Items.Clear()
+            self.cmb_ManualNewSize.Items.Clear()
+
+            for source in sources:
+                label = u"{} / {}   ({} Pipe)".format(
+                    source.get('pipe_type_name', u'?'), source.get('segment_name', u'?'),
+                    int(source.get('pipe_count') or 0))
+                self.cmb_ManualSource.Items.Add(CmbItem(label, source.get('key')))
+            for value in target_sizes:
+                self.cmb_ManualNewSize.Items.Add(CmbItem(format_pipe_size(value), float(value)))
+
+            if selected_source is None and self.cmb_ManualSource.Items.Count > 0:
+                selected_source = safe_text(self.cmb_ManualSource.Items[0].Value)
+            self._select_manual_source_combo_key(self.cmb_ManualSource, selected_source)
+
+            source_rec = self._manual_source_record(selected_source, sources)
+            source_sizes = list(source_rec.get('sizes') or []) if source_rec else []
+            for value in source_sizes:
+                self.cmb_ManualOldSize.Items.Add(CmbItem(format_pipe_size(value), float(value)))
+
+            if old_selected is None or not _nominal_exists(source_sizes, old_selected):
+                old_selected = float(source_sizes[0]) if source_sizes else None
+            self._select_manual_combo_value(self.cmb_ManualOldSize, old_selected)
+
+            mapped_target = self._manual_mapping_target(selected_source, old_selected) \
+                if selected_source is not None and old_selected is not None else None
+            self._select_manual_combo_value(self.cmb_ManualNewSize, mapped_target)
+
+            self.lst_ManualSizeMappings.Items.Clear()
+            mapping = getattr(self, 'manual_size_mapping', {}) or {}
+            target_supported = list(target_sizes or [])
+            source_by_pair = {}
+            for rec in sources:
+                source_by_pair[(int(rec.get('pipe_type_id')), int(rec.get('segment_id')))] = rec
+
+            def mapping_sort(item):
+                key = item[0]
+                try:
+                    rec = source_by_pair.get((int(key[0]), int(key[1])))
+                    return (safe_text(rec.get('pipe_type_name') if rec else u'').lower(),
+                            safe_text(rec.get('segment_name') if rec else u'').lower(),
+                            float(key[2]))
+                except Exception:
+                    return (u'', u'', 0.0)
+
+            for map_key, target_value in sorted(mapping.items(), key=mapping_sort):
+                try:
+                    if not isinstance(map_key, tuple) or len(map_key) != 3:
+                        continue
+                    source_rec = source_by_pair.get((int(map_key[0]), int(map_key[1])))
+                    source_label = (u"{} / {}".format(source_rec.get('pipe_type_name'), source_rec.get('segment_name'))
+                                    if source_rec else
+                                    u"PipeType {} / Segment {}".format(map_key[0], map_key[1]))
+                    supported = _nominal_exists(target_supported, target_value)
+                    label = u"{} / {}  ->  {}{}".format(
+                        source_label, format_pipe_size(map_key[2]), format_pipe_size(target_value),
+                        u"" if supported else u"   [KHÔNG CÒN TRONG PIPE TYPE MỚI]")
+                    self.lst_ManualSizeMappings.Items.Add(CmbItem(label, map_key))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        finally:
+            self._updating_size_compat_mode = False
+
+    def _commit_current_manual_size_mapping(self, log_change=False):
+        """Commit Source PipeType/Segment + Old Size -> New Size."""
+        try:
+            source_item = self.cmb_ManualSource.SelectedItem
+            old_item = self.cmb_ManualOldSize.SelectedItem
+            new_item = self.cmb_ManualNewSize.SelectedItem
+            if source_item is None or old_item is None or new_item is None:
+                return False
+            source_key = safe_text(source_item.Value)
+            old_size = float(old_item.Value)
+            new_size = float(new_item.Value)
+            key = self._manual_mapping_key(source_key, old_size)
+            if key is None:
+                return False
+            previous = self.manual_size_mapping.get(key)
+            self.manual_size_mapping[key] = new_size
+            if log_change and (previous is None or abs(float(previous) - new_size) > SIZE_SYSTEM_COMPARE_TOLERANCE_FT):
+                self.log(u"OPTION 3 MANUAL SOURCE-AWARE: {} / {} -> {}".format(
+                    self._manual_source_label(source_key), format_pipe_size(old_size), format_pipe_size(new_size)))
+            return True
+        except Exception as ex:
+            if log_change:
+                self.log(u"Không thể lưu mapping size thủ công theo nguồn: {}".format(safe_text(ex)))
+            return False
+
+    def manual_source_selection_changed(self, sender, args):
+        """Navigate one old PipeType/PipeSegment source; New Size remains source-specific."""
+        if getattr(self, '_loading_choices', True) or getattr(self, '_updating_size_compat_mode', True):
+            return
+        self._refresh_manual_size_mapping_controls()
+        self._update_size_compat_summary()
+
+    def manual_old_size_selection_changed(self, sender, args):
+        """Changing Old Size only navigates the selected source's mappings."""
+        if getattr(self, '_loading_choices', True) or getattr(self, '_updating_size_compat_mode', True):
+            return
+        try:
+            source_item = self.cmb_ManualSource.SelectedItem
+            source_key = safe_text(source_item.Value) if source_item is not None else None
+            old_item = self.cmb_ManualOldSize.SelectedItem
+            old_size = float(old_item.Value) if old_item is not None else None
+            mapped_target = self._manual_mapping_target(source_key, old_size) \
+                if source_key is not None and old_size is not None else None
+            self._updating_size_compat_mode = True
+            self._select_manual_combo_value(self.cmb_ManualNewSize, mapped_target)
+        except Exception as ex:
+            self.log(u"Không thể đọc mapping của Source/Size cũ: {}".format(safe_text(ex)))
+        finally:
+            self._updating_size_compat_mode = False
+        self._update_size_compat_summary()
+
+    def manual_new_size_selection_changed(self, sender, args):
+        """Selecting New Size immediately saves a source-aware mapping."""
+        if getattr(self, '_loading_choices', True) or getattr(self, '_updating_size_compat_mode', True):
+            return
+        if self.cmb_ManualNewSize.SelectedItem is None:
+            return
+        if self._commit_current_manual_size_mapping(log_change=True):
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
+
+    def manual_size_mapping_add_click(self, sender, args):
+        """Legacy compatibility handler; current UI saves immediately."""
+        if getattr(self, '_loading_choices', True):
+            return
+        if self._commit_current_manual_size_mapping(log_change=True):
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
+
+    def manual_size_mapping_remove_click(self, sender, args):
+        try:
+            item = self.lst_ManualSizeMappings.SelectedItem
+            if item is None:
+                return
+            key = item.Value
+            if key in self.manual_size_mapping:
+                del self.manual_size_mapping[key]
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
+        except Exception as ex:
+            self.log(u"Không thể xóa mapping size: {}".format(safe_text(ex)))
+
+    def manual_size_mapping_clear_click(self, sender, args):
+        try:
+            self.manual_size_mapping.clear()
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
+        except Exception as ex:
+            self.log(u"Không thể xóa toàn bộ mapping size: {}".format(safe_text(ex)))
+
+    def _update_size_compatibility_ui(self, log_change=False):
+        strategy = self._size_adaptive_strategy()
+        try:
+            self.panel_SizeManualMapping.Visibility = (System.Windows.Visibility.Visible
+                                                       if strategy == 'manual'
+                                                       else System.Windows.Visibility.Collapsed)
+        except Exception:
+            pass
+        try:
+            if strategy == 'nearest':
+                text = (u"OPTION 2 — SIZE GẦN NHẤT: nếu nominal size hiện tại không có trong Pipe Type mới, "
+                        u"tool tự chọn size hỗ trợ gần nhất; nếu cách đều ưu tiên size lớn hơn. Fitting dùng size thật của Pipe sau khi đổi.")
+            elif strategy == 'manual':
+                text = (u"OPTION 3 — MAP SIZE THỦ CÔNG THEO NGUỒN: tool KHÔNG tự chọn size mới. Người dùng chọn "
+                        u"Pipe Type/Segment cũ + Size cũ -> Size mới; PVC/HDPE cùng DN có thể có mapping riêng.")
+            else:
+                text = (u"OPTION 1 — GIỮ NGUYÊN SIZE: nếu Pipe Type mới thiếu size cũ, tool tạo Pipe Type + Pipe Segment riêng "
+                        u"để giữ nguyên nominal size; không sửa Pipe Type/Segment gốc và không tự suy đoán OD/ID.")
+            self.txt_SizeCompatModeStatus.Text = text
+        except Exception:
+            pass
+        if strategy == 'manual':
+            self._refresh_manual_size_mapping_controls()
+        self._update_size_compat_summary()
+        if log_change:
+            self.log(u"Pipe Segment Size Compatibility V5.8.8: {}."
+                     .format(self._size_compatibility_mode_label()))
+
+    def _size_compatibility_mode_label(self):
+        strategy = self._size_adaptive_strategy()
+        if strategy == 'nearest':
+            return u"OPTION 2 - tự map size gần nhất"
+        if strategy == 'manual':
+            return u"OPTION 3 - map size thủ công theo Pipe Type/Segment"
+        return u"OPTION 1 - giữ nguyên size bằng Pipe Segment riêng khi cần"
+
+    def size_compat_mode_click(self, sender, args):
+        if getattr(self, '_updating_size_compat_mode', True) or getattr(self, '_loading_choices', True):
+            return
+        try:
+            sender_name = safe_text(getattr(sender, 'Name', u''))
+            if sender_name == 'chk_SizeStrategyNearest':
+                strategy = 'nearest'
+            elif sender_name == 'chk_SizeStrategyManual':
+                strategy = 'manual'
+            else:
+                strategy = 'private_segment'
+            self._set_size_adaptive_strategy(strategy, True)
+        except Exception as ex:
+            self.log(u"Không thể đổi chiến lược Pipe Segment Size Compatibility: {}".format(safe_text(ex)))
+
+    def size_strategy_selection_changed(self, sender, args):
+        """Legacy V5.8.6 handler kept harmless for compatibility with stale XAML caches."""
+        return
+
+    def _update_size_compat_summary(self):
+        try:
+            target_item = self.cmb_PipeTypes.SelectedItem
+            target_type = doc.GetElement(target_item.Value) if target_item else None
+            if target_type is None:
+                self.txt_SizeCompatSummary.Text = u"Chưa chọn Pipe Type mới."
+                return
+            strategy = self._size_adaptive_strategy()
+            if strategy == 'manual':
+                self._refresh_manual_size_mapping_controls()
+
+            lines = [u"Target Pipe Type: {}".format(get_real_name(target_type))]
+            rules = pipe_type_segment_rules(target_type)
+            if not rules:
+                lines.append(u"Segments: KHÔNG có Pipe Segment rule hợp lệ.")
+            else:
+                for info in rules:
+                    lines.append(u"Segment #{}: {} | range {} | sizes [{}]".format(
+                        int(info.get('index', 0)) + 1,
+                        get_real_name(info.get('segment')),
+                        info.get('range_text', u"mọi size"),
+                        _segment_size_text_from_values(info.get('nominals') or [], max_items=28)))
+
+            old_sizes = self._current_manual_mapping_source_sizes()
+            target_sizes = self._current_manual_mapping_target_sizes()
+            if old_sizes:
+                lines.append(u"Size cũ trong PRESELECTION / System Type (không lọc Min/Max): [{}]".format(
+                    _segment_size_text_from_values(old_sizes, max_items=30)))
+
+            if strategy == 'manual':
+                map_rows = []
+                missing = []
+                invalid = []
+                sources = self._current_manual_mapping_sources()
+                lines.append(u"Nguồn cũ trong preselection: {} PipeType/Segment.".format(len(sources)))
+                for source in sources:
+                    source_key = source.get('key')
+                    source_label = u"{} / {}".format(
+                        source.get('pipe_type_name', u'?'), source.get('segment_name', u'?'))
+                    for old_size in list(source.get('sizes') or []):
+                        target = self._manual_mapping_target(source_key, old_size)
+                        item_label = u"{} / {}".format(source_label, format_pipe_size(old_size))
+                        if target is None:
+                            missing.append(item_label)
+                        elif not _nominal_exists(target_sizes, target):
+                            invalid.append(u"{} -> {}".format(item_label, format_pipe_size(target)))
+                        else:
+                            map_rows.append(u"{} -> {}".format(item_label, format_pipe_size(target)))
+                lines.append(u"Manual mapping SOURCE-AWARE: {}".format(
+                    u"; ".join(map_rows) if map_rows else u"<chưa cấu hình>"))
+                if missing:
+                    lines.append(u"THIẾU MAPPING: {}".format(u"; ".join(missing[:30])))
+                if invalid:
+                    lines.append(u"MAPPING KHÔNG HỢP LỆ VỚI PIPE TYPE MỚI: {}".format(u"; ".join(invalid[:30])))
+            elif strategy == 'nearest':
+                rows = []
+                for old_size in old_sizes:
+                    nearest = nearest_supported_pipe_size(target_type, old_size)
+                    if nearest is not None:
+                        rows.append(u"{} -> {}".format(format_pipe_size(old_size), format_pipe_size(nearest)))
+                if rows:
+                    lines.append(u"Nearest preview: " + u"; ".join(rows))
+            else:
+                private_fail = []
+                seen = set()
+                for raw_id in list(self.preselected_element_ids or []):
+                    try:
+                        elem = doc.GetElement(make_element_id(raw_id))
+                        if not is_pipe(elem):
+                            continue
+                        analysis = analyze_pipe_segment_size_compatibility(elem, target_type)
+                        if not analysis.get('ok') or analysis.get('same_size_system'):
+                            continue
+                        key = (analysis.get('old_segment_id'), analysis.get('target_segment_id'))
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        old_seg = doc.GetElement(make_element_id(analysis.get('old_segment_id')))
+                        new_seg = doc.GetElement(make_element_id(analysis.get('target_segment_id')))
+                        _records, missing = compatible_private_segment_plan(old_seg, new_seg)
+                        if missing:
+                            private_fail.append(u"{} thiếu target Schedule data: {}".format(
+                                analysis.get('old_pipe_type_name', u'?'), u", ".join(missing)))
+                    except Exception:
+                        pass
+                if private_fail:
+                    lines.append(u"Private Segment chưa thể tạo an toàn: " + u"; ".join(private_fail[:8]))
+                else:
+                    lines.append(u"Private Segment: giữ nguyên nominal size; chỉ tạo config riêng khi thật sự cần.")
+
+            self.txt_SizeCompatSummary.Text = u"\n".join(lines)
+        except Exception as ex:
+            try:
+                self.txt_SizeCompatSummary.Text = u"Không đọc được Size Compatibility: {}".format(safe_text(ex))
+            except Exception:
+                pass
+
+
+    def _adaptive_fitting_size_signatures(self, fitting):
+        """Expected connected sizes after the V5.8.8 Pipe size plan is applied."""
+        if not self._use_partner_size_authority():
+            return fitting_port_size_profile(fitting)
+        result = []
+        plans = getattr(self, '_runtime_pipe_size_plans', {}) or {}
+        try:
+            links = snapshot_fitting_connections(fitting)
+        except Exception:
+            links = []
+        for link in links:
+            sig = None
+            owner_id_value = element_id_value(link.get('partner_owner_id'))
+            plan = plans.get(owner_id_value)
+            predict = bool(getattr(self, '_runtime_predict_size_plans', False))
+            if (plan and plan.get('actionable') and plan.get('target_size') is not None and
+                    (predict or plan.get('applied', False))):
+                try:
+                    owner = doc.GetElement(link.get('partner_owner_id'))
+                    if is_pipe(owner):
+                        sig = (u'round', float(plan.get('target_size')) * 0.5)
+                except Exception:
+                    sig = None
+            if sig is None:
+                try:
+                    partner = find_partner_connector(link)
+                    if partner is not None:
+                        sig = connector_size_signature(partner)
+                except Exception:
+                    sig = None
+            if sig is None:
+                sig = link.get('partner_size')
+            if sig is not None:
+                result.append(sig)
+        if result:
+            return result
+        return fitting_port_size_profile(fitting)
+
+    def _fitting_is_variable_for_current_size_mode(self, fitting):
+        try:
+            return size_profile_is_variable(self._adaptive_fitting_size_signatures(fitting))
+        except Exception:
+            return fitting_has_variable_port_sizes(fitting)
+
+    def _fitting_size_profile_text_for_current_mode(self, fitting):
+        try:
+            return safe_text(self._adaptive_fitting_size_signatures(fitting))
+        except Exception:
+            return fitting_size_profile_text(fitting)
+
 
     def _prefer_unique_preselected_system(self):
         """If the preselection has exactly one System Type, select it automatically."""
@@ -5736,6 +7159,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MinPipeSize.SelectedIndex
                 self._updating_size_range = False
             self._update_pipe_size_range_status()
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
         except Exception:
             self._updating_size_range = False
 
@@ -5750,6 +7175,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 self.cmb_MinPipeSize.SelectedIndex = self.cmb_MaxPipeSize.SelectedIndex
                 self._updating_size_range = False
             self._update_pipe_size_range_status()
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
         except Exception:
             self._updating_size_range = False
 
@@ -5841,8 +7268,19 @@ class ReplaceElementsWindow(forms.WPFWindow):
             return
         try:
             self.update_fittings_for_selected_pipe_type(clear_invalid=True)
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
         except Exception as ex:
-            self.log(u"Không thể đọc Routing Preferences của Pipe Type: {}".format(safe_text(ex)))
+            self.log(u"Không thể đọc Routing Preferences/Size Compatibility của Pipe Type: {}".format(safe_text(ex)))
+
+    def system_selection_changed(self, sender, args):
+        if getattr(self, '_loading_choices', True):
+            return
+        try:
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
+        except Exception as ex:
+            self.log(u"Không thể cập nhật Manual Size Mapping theo System Type: {}".format(safe_text(ex)))
 
     def load_last_choices(self):
         try:
@@ -5898,15 +7336,33 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 pass
 
             saved_mode = safe_text(self._config_get(config, 'fitting_selection_mode', u'auto')).lower()
+            saved_size_mode = safe_text(self._config_get(config, 'size_compatibility_mode', u'strict')).lower()
+            saved_size_strategy = safe_text(self._config_get(config, 'size_adaptive_strategy', u'private_segment')).lower()
+            # Migration rule: anyone who was on the removed Strict mode starts on
+            # the new Option 1. Only an explicitly Adaptive V5.8.6 setup preserves
+            # its former private/nearest strategy.
+            if saved_size_mode != 'adaptive':
+                saved_size_strategy = 'private_segment'
+            if saved_size_strategy not in ('private_segment', 'nearest', 'manual'):
+                saved_size_strategy = 'private_segment'
+            self.manual_size_mapping = self._deserialize_manual_size_mapping(
+                self._config_get(config, 'manual_size_mapping_pairs', u''))
+            if getattr(self, '_legacy_manual_mapping_ignored', 0):
+                self.log(u"V5.8.8: bỏ qua {} mapping V5.8.7.x chỉ-key-theo-DN; Option 3 mới cần cấu hình lại theo Pipe Type/Segment để tránh PVC/HDPE dùng nhầm mapping."
+                         .format(int(self._legacy_manual_mapping_ignored)))
             self._loading_choices = False
             self._set_fitting_selection_mode('manual' if saved_mode == 'manual' else 'auto', False)
+            self._set_size_adaptive_strategy(saved_size_strategy, False)
             self._update_pipe_size_range_status()
             self.update_fittings_for_selected_pipe_type(clear_invalid=False)
-            self.log(u"Đã khôi phục System/Pipe Type, Size Range và chế độ Fitting V5.8.5.")
+            self._refresh_manual_size_mapping_controls()
+            self._update_size_compat_summary()
+            self.log(u"Đã khôi phục System/Pipe Type, Size Range, chế độ Fitting, chiến lược Size Compatibility và Manual Size Mapping V5.8.8.")
         except Exception as ex:
             self._loading_choices = False
             try:
                 self._set_fitting_selection_mode('auto', False)
+                self._set_size_adaptive_strategy('private_segment', False)
                 self.update_fittings_for_selected_pipe_type(clear_invalid=False)
             except Exception:
                 pass
@@ -5928,6 +7384,9 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 safe_text(self.id_value(item.Value)) for item in list(selected_reducing_fitting_items or [])
             ])
             config.fitting_selection_mode = safe_text(self.fitting_selection_mode)
+            config.size_compatibility_mode = u'adaptive'  # legacy compatibility; Strict removed in V5.8.8
+            config.size_adaptive_strategy = safe_text(self.size_adaptive_strategy)
+            config.manual_size_mapping_pairs = self._serialize_manual_size_mapping()
             config.replace_pipes = bool(overwrite_pipes)
             config.replace_fittings = bool(overwrite_fittings)
             config.selected_only = bool(selected_only)
@@ -5952,9 +7411,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def _rebuild_fitting_catalog(self, reason=None, log_stats=True):
         """V5.8 re-scan all currently LOADED Pipe Fitting FamilySymbols.
 
-        This is used both at startup and after the user loads supplemental .RFA
-        files.  The manual selection lists are rebuilt immediately without
-        closing the modal UI.
+        This catalog is built from Pipe Fitting FamilySymbols already loaded in
+        the active project. V5.8.8 does not load or reload external .RFA files.
         """
         before_ids = set()
         before_names = {}
@@ -6047,9 +7505,9 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         if log_stats:
             if reason:
-                self.log(u"--- V5.8.5 FULL FITTING SCAN: {} ---".format(safe_text(reason)))
+                self.log(u"--- V5.8.8 FULL FITTING SCAN: {} ---".format(safe_text(reason)))
             self.log(
-                u"V5.8.5 Full Fitting Scan: direct-category {} | symbol-category {} | "
+                u"V5.8.8 Full Fitting Scan: direct-category {} | symbol-category {} | "
                 u"family-category {} | family-enumeration {} | all-element-types {} | "
                 u"instance-type {} | routing-reference {} | UNIQUE {}."
                 .format(fitting_scan_stats.get('direct_category', 0),
@@ -6082,11 +7540,11 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
     def setup_data(self):
         self.log(u"Đang đọc dữ liệu trong model...")
-        self.log(u"V5.8.5 Universal | Revit {} | ElementId 64-bit Value mode | Transition = Native ChangeTypeId.".format(
+        self.log(u"V5.8.8 Universal | Revit {} | ElementId 64-bit Value mode | Transition = Native ChangeTypeId.".format(
             REVIT_VERSION if REVIT_VERSION else u"không xác định"))
-        self.log(u"V5.8.5 SYSTEM TYPE LOCK: luôn bật; Pipe System Type được snapshot/verify ở cấp phần tử và trước commit toàn batch.")
+        self.log(u"V5.8.8 SYSTEM TYPE LOCK: luôn bật; Pipe System Type được snapshot/verify ở cấp phần tử và trước commit toàn batch.")
         if REVIT_VERSION and REVIT_VERSION not in SUPPORTED_REVIT_VERSIONS:
-            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.8.5 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
+            self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.8.8 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
         pipes, fittings = collect_pipes_and_fittings()
 
         # V5.8: build Min/Max dropdowns from actual Pipe diameters present
@@ -6103,7 +7561,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.cmb_MinPipeSize.SelectedIndex = 0
             self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MaxPipeSize.Items.Count - 1
         self._update_pipe_size_range_status()
-        self.log(u"V5.8.5 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
+        self.log(u"V5.8.8 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
             len(model_pipe_sizes),
             format_pipe_size(model_pipe_sizes[0]) if model_pipe_sizes else u"?",
             format_pipe_size(model_pipe_sizes[-1]) if model_pipe_sizes else u"?"))
@@ -6179,8 +7637,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if self.cmb_PipeTypes.Items.Count > 0:
             self.cmb_PipeTypes.SelectedIndex = 0
 
-        # V5.8: one catalog builder is shared by startup, manual Refresh, and
-        # supplemental .RFA loading so the visible lists cannot diverge.
+        # V5.8.8: build one catalog from fitting types already loaded in the project.
+        # There is no external Family load/reload workflow in Option 2.
         self._rebuild_fitting_catalog(reason=u"Khởi tạo UI", log_stats=True)
         self.log(u"Tìm thấy {} system type, {} pipe type, {} fitting type, {} PartType Pipe Fitting.".format(
             self.cmb_Systems.Items.Count,
@@ -6198,13 +7656,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
             old_symbol = get_symbol_from_instance(fitting)
             old_part_type = get_part_type(old_symbol)
             role = fitting_role_from_part_type_value(old_part_type)
-            variable_size = fitting_has_variable_port_sizes(fitting)
-            size_text = fitting_size_profile_text(fitting)
+            variable_size = self._fitting_is_variable_for_current_size_mode(fitting)
+            size_text = self._fitting_size_profile_text_for_current_mode(fitting)
             allowed_roles = REDUCING_FITTING_ROLES if variable_size else NORMAL_FITTING_ROLES
             source_label = u"Fitting giảm" if variable_size else u"Fitting thường"
             if role not in allowed_roles:
                 raise Exception(
-                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.8.5"
+                    u"PartType '{}' không có trong danh sách Pipe Fitting đã load ở chế độ thủ công V5.8.8"
                     .format(part_type_enum_name(old_symbol)))
             candidates = list(selected_reducing_items or []) if variable_size else list(selected_items or [])
             same_role = []
@@ -6221,7 +7679,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 raise Exception(u"{} đang có {} type PartType '{}'; chỉ được chọn đúng 1"
                                 .format(source_label, len(same_role), fitting_role_display_name(role)))
             chosen = same_role[0]
-            self.log(u"Fitting {}: MANUAL V5.8.5 -> {} {} chọn '{}'.{}"
+            self.log(u"Fitting {}: MANUAL V5.8.8 -> {} {} chọn '{}'.{}"
                      .format(self.id_value(fitting.Id), source_label,
                              fitting_role_display_name(role), chosen.Name,
                              u" Profile giảm {}".format(size_text) if variable_size else u""))
@@ -6231,7 +7689,11 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if not selected_pipe:
             raise Exception(u"Chưa chọn Pipe Type mới")
         pipe_type = doc.GetElement(selected_pipe.Value)
-        symbol, info = resolve_routing_symbol_for_fitting(pipe_type, fitting)
+        primary_override = None
+        if self._use_partner_size_authority():
+            primary_override = routing_primary_size_from_partner_pipes(fitting)
+        symbol, info = resolve_routing_symbol_for_fitting(
+            pipe_type, fitting, primary_size_override=primary_override)
         primary = info.get('primary_size_ft')
         try:
             primary_text = u"{:.1f} mm".format(float(primary) * 304.8) if primary is not None else u"?"
@@ -6478,7 +7940,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return created, restored, note
 
     def create_direct_isolated_single_port_fitting(self, desired_symbol, old_port_records, old_params):
-        """V5.8.5 exact-symbol replacement for an isolated one-port fitting.
+        """V5.8.8 exact-symbol replacement for an isolated one-port fitting.
 
         There is deliberately no ConnectTo attempt. Geometry is restored from
         the old fitting port itself because no external MEP relation exists.
@@ -6538,7 +8000,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 except Exception:
                     pass
         return created, restored, (
-            u"isolated-single V5.8.5; exact FamilySymbol '{}'; {}; KHÔNG ConnectTo; "
+            u"isolated-single V5.8.8; exact FamilySymbol '{}'; {}; KHÔNG ConnectTo; "
             u"bỏ qua {} parameter identity/ElementId"
             .format(get_real_name(desired_symbol), size_note, len(skipped_identity)))
 
@@ -6837,11 +8299,17 @@ class ReplaceElementsWindow(forms.WPFWindow):
         system_lock_snapshot = snapshot_pipe_systems_from_links(links)
         if len(set([rec.get('system_value') for rec in system_lock_snapshot.values()
                     if rec.get('system_value') is not None])) > 1:
-            self.log(u"{}: V5.8.5 SYSTEM TYPE LOCK -> fitting là ranh giới nhiều System Type: {}"
+            self.log(u"{}: V5.8.8 SYSTEM TYPE LOCK -> fitting là ranh giới nhiều System Type: {}"
                      .format(label, fitting_mixed_system_description(fitting)))
         old_params = snapshot_instance_parameters(fitting)
         all_old_ports = physical_connectors(fitting)
         old_port_records = snapshot_port_geometry(fitting)
+        if self._use_partner_size_authority():
+            old_port_records, partner_size_changes = override_port_record_sizes_from_partners(
+                old_port_records, links)
+            if partner_size_changes:
+                self.log(u"{}: V5.8.8 ADAPTIVE SIZE -> fitting target lấy từ Pipe partner: {}"
+                         .format(label, u"; ".join(partner_size_changes)))
         total_port_count = len(all_old_ports)
         open_ports = get_open_physical_fitting_connectors(fitting, links)
 
@@ -6849,7 +8317,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if total_port_count <= 0:
             return False, u"{} | Fitting không có connector vật lý để recreate".format(label)
         if isolated_mode:
-            self.log(u"{}: V5.8.5 ISOLATED FITTING -> không có kết nối vật lý; "
+            self.log(u"{}: V5.8.8 ISOLATED FITTING -> không có kết nối vật lý; "
                      u"recreate exact FamilySymbol theo geometry cũ, KHÔNG ConnectTo/trim pipe."
                      .format(label))
 
@@ -6953,25 +8421,25 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
                 if total_port_count == 1:
                     if isolated_mode:
-                        self.log(u"{}: V5.8.5 topology 1 cổng ISOLATED -> exact FamilySymbol '{}'; không ConnectTo."
+                        self.log(u"{}: V5.8.8 topology 1 cổng ISOLATED -> exact FamilySymbol '{}'; không ConnectTo."
                                  .format(label, get_real_name(desired_symbol)))
                         created, direct_restored_pre, create_note = self.create_direct_isolated_single_port_fitting(
                             desired_symbol, old_port_records, old_params)
                         create_mode = u"direct-isolated-single"
                     else:
-                        self.log(u"{}: V5.8.5 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
+                        self.log(u"{}: V5.8.8 topology 1 cổng -> direct-place exact FamilySymbol '{}'."
                                  .format(label, get_real_name(desired_symbol)))
                         created, direct_restored_pre, create_note = self.create_direct_single_port_fitting(
                             desired_symbol, old_port_records, old_params, links)
                         create_mode = u"direct-single"
                 elif total_port_count == 2 and not port_axes_have_nonparallel_pair(old_port_records):
-                    self.log(u"{}: V5.8.5 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
+                    self.log(u"{}: V5.8.8 topology 2 cổng thẳng -> direct-linear exact FamilySymbol '{}'; không để Routing Preferences đổi Family."
                              .format(label, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_linear_fitting(
                         desired_symbol, old_port_records, old_params, links)
                     create_mode = u"direct-linear"
                 else:
-                    self.log(u"{}: V5.8.5 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
+                    self.log(u"{}: V5.8.8 topology {} cổng/có góc -> direct-place exact FamilySymbol '{}'; khóa theo CENTERLINE THẬT của pipe và cho phép trim/extend đầu ống."
                              .format(label, total_port_count, get_real_name(desired_symbol)))
                     created, direct_restored_pre, create_note = self.create_direct_aligned_fitting(
                         desired_symbol, old_port_records, old_params, links)
@@ -7067,13 +8535,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
             lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
             if not lock_ok:
                 raise Exception(system_lock_failure_text(
-                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
+                    lock_changes, u"V5.8.8 SYSTEM TYPE LOCK ROLLBACK"))
 
             st.Commit()
             if isolated_mode:
-                mode_text = u"isolated-direct V5.8.5 khác Family"
+                mode_text = u"isolated-direct V5.8.8 khác Family"
             else:
-                mode_text = u"recreate khác Family" if create_mode == u"routing" else u"direct-align V5.8.5 khác Family"
+                mode_text = u"recreate khác Family" if create_mode == u"routing" else u"direct-align V5.8.8 khác Family"
             note_text = (u"; " + create_note) if create_note else u""
             return True, (u"OK - {}; topology {} cổng; ngắt {} kết nối thật, "
                           u"dùng {} ống tạm cho cổng hở, nối lại {}/{}; khôi phục {} instance parameter; "
@@ -7104,6 +8572,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
         system_lock_snapshot = snapshot_pipe_systems_from_links(links)
         old_transform = snapshot_transform(fitting)
         old_params = snapshot_instance_parameters(fitting)
+        old_port_records = snapshot_port_geometry(fitting)
+        if self._use_partner_size_authority():
+            old_port_records, partner_size_changes = override_port_record_sizes_from_partners(
+                old_port_records, links)
+            if partner_size_changes:
+                self.log(u"{}: V5.8.8 ADAPTIVE SIZE same-family target: {}"
+                         .format(label, u"; ".join(partner_size_changes)))
 
         st = DB.SubTransaction(doc)
         try:
@@ -7124,6 +8599,16 @@ class ReplaceElementsWindow(forms.WPFWindow):
             restored = restore_instance_parameters(
                 fitting, old_params, protect_system_identity=True)
             doc.Regenerate()
+
+            size_note = u""
+            if self._use_partner_size_authority():
+                size_ok, size_note = try_match_direct_fitting_size(
+                    fitting.Id, old_port_records, links)
+                doc.Regenerate()
+                fitting = doc.GetElement(fitting.Id)
+                if not size_ok:
+                    raise Exception(u"Adaptive size fitting cùng Family không khớp Pipe partner: {}"
+                                    .format(size_note))
 
             if not transform_is_preserved(fitting, old_transform):
                 raise Exception(u"Fitting bị thay đổi vị trí/xoay sau khi đổi type")
@@ -7182,11 +8667,12 @@ class ReplaceElementsWindow(forms.WPFWindow):
             lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
             if not lock_ok:
                 raise Exception(system_lock_failure_text(
-                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
+                    lock_changes, u"V5.8.8 SYSTEM TYPE LOCK ROLLBACK"))
 
             st.Commit()
-            return True, (u"OK - cùng Family, đã ngắt/nối lại {}/{} connector; khôi phục {} instance parameter; SYSTEM TYPE LOCK OK; {}"
-                          .format(reconnected, len(links), restored, orientation_msg))
+            return True, (u"OK - cùng Family, đã ngắt/nối lại {}/{} connector; khôi phục {} instance parameter; SYSTEM TYPE LOCK OK; {}{}"
+                          .format(reconnected, len(links), restored, orientation_msg,
+                                  (u"; adaptive size: " + size_note) if size_note else u""))
         except Exception as ex:
             try:
                 st.RollBack()
@@ -7198,7 +8684,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
     def _is_transition_native_change(self, fitting, new_type_id):
         """True when the old or requested fitting type is a Revit Transition/Reducer.
 
-        V5.8.5 deliberately routes these parts through the native Revit type-change
+        V5.8.8 deliberately routes these parts through the native Revit type-change
         operation.  This avoids the direct-linear reconstruction/rotation solver,
         which is unnecessary for a straight reducer and can fight families whose
         connector sizes are driven internally by Revit/content lookup logic.
@@ -7227,7 +8713,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         return any((u"transition" in name or u"reducer" in name) for name in names)
 
     def change_transition_type_native(self, fitting_id, new_type_id, label):
-        """V5.8.5: let Revit perform a Transition type change natively.
+        """V5.8.8: let Revit perform a Transition type change natively.
 
         No disconnect/recreate, no auto-size probing, no rotation/flip, and no
         pipe trim/extend are performed here.  We only validate that Revit kept
@@ -7259,7 +8745,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         try:
             st.Start()
             self.log(
-                u"{}: V5.8.5 Transition -> NATIVE REVIT ChangeTypeId '{}' -> '{} : {}'; "
+                u"{}: V5.8.8 Transition -> NATIVE REVIT ChangeTypeId '{}' -> '{} : {}'; "
                 u"KHÔNG recreate, KHÔNG auto-size, KHÔNG rotate/flip, KHÔNG trim/extend pipe."
                 .format(label, old_type_name, new_family_name, new_type_name))
 
@@ -7299,6 +8785,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             # not attempt to repair them here because the user explicitly wants
             # Transition handled by Revit's own type-change behavior.
             matched = 0
+            repaired_connections = 0
             size_mismatch = []
             actual_connectors = list(physical_connectors(actual) or [])
             for link in links:
@@ -7317,9 +8804,49 @@ class ReplaceElementsWindow(forms.WPFWindow):
                     except Exception:
                         pass
                 if connected is None:
-                    raise Exception(
-                        u"Native ChangeTypeId làm mất kết nối vật lý với đối tượng ID {}"
-                        .format(element_id_value(link.get('partner_owner_id'))))
+                    # V5.8.8: keep Transition as a NATIVE type change, but allow a
+                    # zero-geometry repair when Revit drops only the physical pair.
+                    # No move/rotate/trim/auto-size is performed.
+                    best_fc = None
+                    best_gap = 1.0e30
+                    for fc in actual_connectors:
+                        try:
+                            if connector_domain_name(fc) != connector_domain_name(partner):
+                                continue
+                            if not connector_sizes_match(fc, partner):
+                                continue
+                            gap = xyz_distance(fc.Origin, partner.Origin)
+                            if gap < best_gap:
+                                best_gap = gap
+                                best_fc = fc
+                        except Exception:
+                            pass
+                    if best_fc is not None and best_gap <= RECONNECT_TOLERANCE_FT:
+                        try:
+                            best_fc.ConnectTo(partner)
+                            doc.Regenerate()
+                        except Exception:
+                            try:
+                                partner.ConnectTo(best_fc)
+                                doc.Regenerate()
+                            except Exception:
+                                pass
+                        actual = doc.GetElement(actual.Id)
+                        partner = find_partner_connector(link)
+                        actual_connectors = list(physical_connectors(actual) or []) if actual is not None else []
+                        for fc in actual_connectors:
+                            try:
+                                if partner is not None and connectors_are_connected(fc, partner):
+                                    connected = fc
+                                    repaired_connections += 1
+                                    break
+                            except Exception:
+                                pass
+                    if connected is None:
+                        raise Exception(
+                            u"Native ChangeTypeId làm mất kết nối vật lý với đối tượng ID {}; "
+                            u"safe reconnect không thể phục hồi mà không move/rotate/trim"
+                            .format(element_id_value(link.get('partner_owner_id'))))
                 matched += 1
                 try:
                     if not connector_sizes_match(connected, partner):
@@ -7335,13 +8862,13 @@ class ReplaceElementsWindow(forms.WPFWindow):
             lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
             if not lock_ok:
                 raise Exception(system_lock_failure_text(
-                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
+                    lock_changes, u"V5.8.8 SYSTEM TYPE LOCK ROLLBACK"))
 
             st.Commit()
             return True, (
                 u"OK - Transition Native Revit ChangeTypeId; type '{} : {}'; giữ {}/{} kết nối; "
-                u"SYSTEM TYPE LOCK OK; không recreate/rotate/auto-size/trim pipe"
-                .format(new_family_name, new_type_name, matched, len(links)))
+                u"safe reconnect {} pair; SYSTEM TYPE LOCK OK; không recreate/rotate/auto-size/trim pipe"
+                .format(new_family_name, new_type_name, matched, len(links), repaired_connections))
         except Exception as ex:
             try:
                 st.RollBack()
@@ -7349,10 +8876,74 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 pass
             return False, u"{} | Transition Native ChangeTypeId lỗi: {}".format(label, safe_text(ex))
 
+    def change_pipe_type_with_size_plan(self, pipe_id, new_type_id, target_size_ft, label, size_note=u""):
+        """V5.8.8 atomic Pipe Type + nominal-size change under System Type Lock."""
+        pipe = doc.GetElement(pipe_id)
+        if pipe is None or not is_pipe(pipe):
+            return False, u"{} | Pipe không còn tồn tại".format(label)
+        old_size = get_pipe_diameter_ft(pipe)
+        system_lock_snapshot = snapshot_pipe_systems_from_owner_ids([pipe.Id])
+        st = DB.SubTransaction(doc)
+        started = False
+        try:
+            st.Start()
+            started = True
+            changed_id = pipe.ChangeTypeId(new_type_id)
+            doc.Regenerate()
+            actual = None
+            try:
+                if changed_id and changed_id != DB.ElementId.InvalidElementId:
+                    actual = doc.GetElement(changed_id)
+            except Exception:
+                actual = None
+            if actual is None:
+                actual = doc.GetElement(pipe_id)
+            if actual is None or not is_pipe(actual):
+                raise Exception(u"Revit không trả lại Pipe sau ChangeTypeId")
+            if not same_element_id(actual.GetTypeId(), new_type_id):
+                raise Exception(u"Pipe Type thực tế '{}' khác type yêu cầu '{}'"
+                                .format(get_real_name(doc.GetElement(actual.GetTypeId())),
+                                        get_real_name(doc.GetElement(new_type_id))))
+
+            if target_size_ft is not None:
+                p = None
+                try:
+                    p = actual.get_Parameter(DB.BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
+                except Exception:
+                    p = None
+                if p is None or p.IsReadOnly or p.StorageType != DB.StorageType.Double:
+                    raise Exception(u"Pipe Diameter parameter không ghi được")
+                p.Set(float(target_size_ft))
+                doc.Regenerate()
+                actual = doc.GetElement(actual.Id)
+                actual_size = get_pipe_diameter_ft(actual)
+                if actual_size is None or abs(float(actual_size) - float(target_size_ft)) > SIZE_SYSTEM_COMPARE_TOLERANCE_FT:
+                    raise Exception(u"Revit không giữ target size {} sau đổi Pipe Type; thực tế {}"
+                                    .format(format_pipe_size(target_size_ft), format_pipe_size(actual_size)))
+            else:
+                actual_size = get_pipe_diameter_ft(actual)
+
+            lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
+            if not lock_ok:
+                raise Exception(system_lock_failure_text(
+                    lock_changes, u"V5.8.8 SYSTEM TYPE LOCK ROLLBACK"))
+            st.Commit()
+            changed_text = u"{} -> {}".format(format_pipe_size(old_size), format_pipe_size(actual_size))
+            return True, (u"OK - Pipe Type + Size Compatibility; size {}; SYSTEM TYPE LOCK OK{}"
+                          .format(changed_text, (u"; " + safe_text(size_note)) if size_note else u""))
+        except Exception as ex:
+            if started:
+                try:
+                    st.RollBack()
+                except Exception:
+                    pass
+            return False, u"{} | Pipe Size Compatibility/ChangeTypeId lỗi: {}".format(label, safe_text(ex))
+
+
     def change_type_safe(self, elem, new_type_id, label, allow_force_reconnect=False):
         """Change one element safely.
 
-        V5.8.5 rules:
+        V5.8.8 rules:
         - Transition/Reducer: always use native Revit ChangeTypeId; no recreate,
           no angle/rotation solver and no pipe trim/extend.
         - Pipe and same-Family non-Transition fitting: ChangeTypeId is allowed.
@@ -7370,7 +8961,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
         elem_id = elem.Id
 
-        # V5.8.5: Transition/Reducer must use Revit's native type change exactly
+        # V5.8.8: Transition/Reducer must use Revit's native type change exactly
         # as requested.  Do this BEFORE the cross-family recreate guard so a
         # different-family reducer never enters direct-linear/rotation/auto-size.
         if is_pipe_fitting(elem) and self._is_transition_native_change(elem, new_type_id):
@@ -7405,7 +8996,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             lock_ok, lock_changes = validate_pipe_system_snapshot(system_lock_snapshot)
             if not lock_ok:
                 raise Exception(system_lock_failure_text(
-                    lock_changes, u"V5.8.5 SYSTEM TYPE LOCK ROLLBACK"))
+                    lock_changes, u"V5.8.8 SYSTEM TYPE LOCK ROLLBACK"))
             st.Commit()
             return True, u"OK - SYSTEM TYPE LOCK giữ nguyên"
         except Exception as ex:
@@ -7703,7 +9294,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             try:
                 sym = get_symbol_from_instance(fit)
                 role = fitting_role_from_symbol(sym)
-                variable = fitting_has_variable_port_sizes(fit)
+                variable = self._fitting_is_variable_for_current_size_mode(fit)
                 fit_id = self.id_value(fit.Id)
                 if variable:
                     if role in REDUCING_FITTING_ROLES:
@@ -7745,7 +9336,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
 
     def replace_click(self, sender, args):
-        """Run one batch against the immutable preselection snapshot."""
+        """Run one V5.8.8 batch against the immutable preselection snapshot."""
         selected_system = self.cmb_Systems.SelectedItem
         selected_pipe_type = self.cmb_PipeTypes.SelectedItem
         selected_fitting_items = self.get_selected_fitting_items()
@@ -7761,6 +9352,16 @@ class ReplaceElementsWindow(forms.WPFWindow):
             skip_mixed_system_fittings = bool(self.chk_SkipMixedSystemFittings.IsChecked)
         except Exception:
             skip_mixed_system_fittings = True
+
+        size_mode = 'adaptive'  # V5.8.8: legacy Strict mode removed
+        size_strategy = self._size_adaptive_strategy()
+        # Defensive UX guard: if a WPF engine delivered the current ComboBox pair
+        # without firing SelectionChanged, treat the visible Old -> New pair as the
+        # user's mapping before planning. Normally it is already committed instantly.
+        if size_strategy == 'manual':
+            self._commit_current_manual_size_mapping(log_change=False)
+        self._runtime_pipe_size_plans = {}
+        self._runtime_predict_size_plans = False
 
         if not overwrite_pipes and not overwrite_fittings:
             forms.alert(u"Vui lòng chọn ít nhất một hạng mục: Thay Pipe hoặc Thay Fitting.", title="Thiếu dữ liệu")
@@ -7783,6 +9384,11 @@ class ReplaceElementsWindow(forms.WPFWindow):
         system_type_id = selected_system.Value
         system_name = selected_system.Name
         new_pipe_type_id = selected_pipe_type.Value
+        target_pipe_type = doc.GetElement(new_pipe_type_id)
+        if target_pipe_type is None:
+            forms.alert(u"Không đọc được Pipe Type mới.", title="Pipe Type không hợp lệ")
+            return
+
         self.txt_Log.Clear()
         self.save_last_choices(selected_system, selected_pipe_type, selected_fitting_items,
                                selected_reducing_fitting_items, overwrite_pipes, overwrite_fittings,
@@ -7791,35 +9397,39 @@ class ReplaceElementsWindow(forms.WPFWindow):
         scope_name = u"các đối tượng đã chọn trước khi mở tool"
         self.log(u"Bắt đầu xử lý System Type: {}".format(system_name))
         self.log(u"Phạm vi xử lý: {}.".format(scope_name))
-        self.log(u"Giới hạn Pipe Size V5.8.5: {} <= Size <= {}.".format(
+        self.log(u"Giới hạn Pipe Size V5.8.8: {} <= Size <= {}.".format(
             format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
-        self.log(u"SYSTEM TYPE LOCK V5.8.5: BẬT BẮT BUỘC; {}.".format(
+        self.log(u"PIPE SEGMENT SIZE COMPATIBILITY V5.8.8: {}."
+                 .format(self._size_compatibility_mode_label()))
+        self.log(u"SYSTEM TYPE LOCK V5.8.8: BẬT BẮT BUỘC; {}.".format(
             u"bỏ qua fitting nối nhiều System Type" if skip_mixed_system_fittings
             else u"cho phép thử mixed-system fitting nhưng rollback nếu bất kỳ Pipe đổi System Type"))
+
         pipes, fittings = collect_pipes_and_fittings(True, self.preselected_element_ids)
         if selected_only and not pipes and not fittings:
             forms.alert(u"Các đối tượng đã chọn trước khi mở tool không còn hợp lệ. Hãy đóng tool, chọn lại Pipe/Fitting rồi chạy lệnh lại.", title="Không có đối tượng hợp lệ")
             return
 
         system_pipes = [p for p in pipes if same_element_id(get_system_type_id(p), system_type_id)] if overwrite_pipes else []
-        # V5.8.5: a boundary fitting may report only one of its connected systems.
-        # Include it when the selected System Type is present on ANY directly connected Pipe.
+        # Boundary fittings are included when the selected System Type exists on
+        # ANY directly connected Pipe; the mixed-system policy is applied below.
         system_fittings = [f for f in fittings if fitting_touches_system_type(f, system_type_id)] if overwrite_fittings else []
 
-        # V5.8: range is inclusive and uses the EXISTING size before any type
-        # replacement.  A fitting is treated atomically: every physical port must
-        # fit inside the selected range, otherwise the whole fitting is skipped.
-        target_pipes = []
+        # ------------------------------------------------------------
+        # 1) Existing Min/Max filter
+        # ------------------------------------------------------------
+        candidate_pipes = []
+        candidate_fittings = []
         range_skipped_lines = []
         system_lock_skipped_lines = []
         mixed_attempt_lines = []
+
         for p in system_pipes:
             try:
                 pipe_id_value = self.id_value(p.Id)
                 diameter = get_pipe_diameter_ft(p)
-                if diameter is not None and pipe_size_in_range(
-                        p, min_pipe_size_ft, max_pipe_size_ft):
-                    target_pipes.append(p)
+                if diameter is not None and pipe_size_in_range(p, min_pipe_size_ft, max_pipe_size_ft):
+                    candidate_pipes.append(p)
                 else:
                     range_skipped_lines.append(
                         u"Pipe ID {}: Bỏ qua do Size {} nằm ngoài range {} -> {}"
@@ -7830,53 +9440,134 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 range_skipped_lines.append(
                     u"Pipe: Bỏ qua do không đọc được Size để kiểm tra range: {}".format(safe_text(ex)))
 
-        target_fittings = []
         for f in system_fittings:
             try:
                 fitting_id_value = self.id_value(f.Id)
-                in_range, port_sizes = fitting_size_in_range(
-                    f, min_pipe_size_ft, max_pipe_size_ft)
-                if in_range:
-                    if fitting_is_mixed_system_boundary(f):
-                        mixed_desc = fitting_mixed_system_description(f)
-                        if skip_mixed_system_fittings:
-                            system_lock_skipped_lines.append(
-                                u"Fitting ID {}: SYSTEM TYPE LOCK - Bỏ qua mixed-system boundary: {}"
-                                .format(fitting_id_value, mixed_desc or u"nhiều System Type"))
-                        else:
-                            target_fittings.append(f)
-                            mixed_attempt_lines.append(
-                                u"Fitting ID {}: mixed-system boundary -> cho phép xử lý thử; "
-                                u"mọi Pipe partner bị đổi System Type sẽ làm rollback. {}"
-                                .format(fitting_id_value, mixed_desc or u""))
-                    else:
-                        target_fittings.append(f)
-                else:
+                in_range, port_sizes = fitting_size_in_range(f, min_pipe_size_ft, max_pipe_size_ft)
+                if not in_range:
                     profile = u", ".join([format_pipe_size(x) for x in port_sizes]) if port_sizes else u"không đọc được"
                     range_skipped_lines.append(
                         u"Fitting ID {}: Bỏ qua do port size [{}] không nằm hoàn toàn trong range {} -> {}"
                         .format(fitting_id_value, profile,
                                 format_pipe_size(min_pipe_size_ft),
                                 format_pipe_size(max_pipe_size_ft)))
+                    continue
+                if fitting_is_mixed_system_boundary(f):
+                    mixed_desc = fitting_mixed_system_description(f)
+                    if skip_mixed_system_fittings:
+                        system_lock_skipped_lines.append(
+                            u"Fitting ID {}: SYSTEM TYPE LOCK - Bỏ qua mixed-system boundary: {}"
+                            .format(fitting_id_value, mixed_desc or u"nhiều System Type"))
+                        continue
+                    mixed_attempt_lines.append(
+                        u"Fitting ID {}: mixed-system boundary -> cho phép xử lý thử; "
+                        u"mọi Pipe partner bị đổi System Type sẽ làm rollback. {}"
+                        .format(fitting_id_value, mixed_desc or u""))
+                candidate_fittings.append(f)
             except Exception as ex:
                 range_skipped_lines.append(
                     u"Fitting: Bỏ qua do không đọc được port size để kiểm tra range: {}".format(safe_text(ex)))
 
+        # ------------------------------------------------------------
+        # 2) V5.8.8 Pipe Segment Size Compatibility planning
+        # ------------------------------------------------------------
+        target_pipes = []
+        pipe_size_plans = {}
+        size_compat_skipped_lines = []
+        size_mapping_preview_lines = []
+        private_required_keys = set()
+
+        for p in candidate_pipes:
+            try:
+                pid_value = self.id_value(p.Id)
+                plan = build_pipe_size_compatibility_plan(
+                    p, target_pipe_type, mode=size_mode, strategy=size_strategy,
+                    manual_mapping=getattr(self, 'manual_size_mapping', {}) or {})
+                pipe_size_plans[pid_value] = plan
+                if not plan.get('actionable'):
+                    analysis = plan.get('analysis') or {}
+                    size_compat_skipped_lines.append(
+                        u"Pipe ID {}: Bỏ qua - {} | {}"
+                        .format(pid_value, plan.get('skip_reason', u"Size Compatibility không hợp lệ"),
+                                _size_compatibility_analysis_text(analysis)))
+                    continue
+                target_pipes.append(p)
+                if plan.get('requires_private_config'):
+                    private_required_keys.add(plan.get('private_key'))
+                if size_strategy in ('nearest', 'manual'):
+                    current_size = (plan.get('analysis') or {}).get('current_size')
+                    target_size = plan.get('target_size')
+                    if current_size is not None and target_size is not None:
+                        if plan.get('mapping_changed'):
+                            size_mapping_preview_lines.append(
+                                u"Pipe ID {}: {} -> {} ({})"
+                                .format(pid_value, format_pipe_size(current_size), format_pipe_size(target_size),
+                                        u'MANUAL' if size_strategy == 'manual' else u'NEAREST'))
+                        else:
+                            size_mapping_preview_lines.append(
+                                u"Pipe ID {}: {} đã tồn tại trong Pipe Type mới"
+                                .format(pid_value, format_pipe_size(current_size)))
+            except Exception as ex:
+                size_compat_skipped_lines.append(
+                    u"Pipe: Bỏ qua - lỗi phân tích Pipe Segment Size Compatibility: {}".format(safe_text(ex)))
+
+        self._runtime_pipe_size_plans = dict(pipe_size_plans)
+        self._runtime_predict_size_plans = True
+
+        # V5.8.8: a fitting must not be changed when one of the selected partner Pipes
+        # that should be converted was rejected by the chosen size strategy.
+        candidate_pipe_ids = set([self.id_value(p.Id) for p in candidate_pipes])
+        target_pipe_ids = set([self.id_value(p.Id) for p in target_pipes])
+        target_fittings = []
+        for f in candidate_fittings:
+            try:
+                blocked = []
+                for link in snapshot_fitting_connections(f):
+                    owner_value = element_id_value(link.get('partner_owner_id'))
+                    if owner_value in candidate_pipe_ids and owner_value not in target_pipe_ids:
+                        blocked.append(owner_value)
+                if blocked:
+                    size_compat_skipped_lines.append(
+                        u"Fitting ID {}: Bỏ qua - Pipe partner {} không vượt qua Size Compatibility Option {}"
+                        .format(self.id_value(f.Id), u', '.join([safe_text(x) for x in sorted(set(blocked))]),
+                                self._size_compatibility_mode_label()))
+                else:
+                    target_fittings.append(f)
+            except Exception as ex:
+                size_compat_skipped_lines.append(
+                    u"Fitting ID {}: Bỏ qua - không kiểm tra được partner Pipe Size Compatibility: {}"
+                    .format(self.id_value(f.Id), safe_text(ex)))
+
+        if size_mapping_preview_lines:
+            self.log(u"--- V5.8.8 PREVIEW MAP SIZE ({}) ---".format(len(size_mapping_preview_lines)))
+            for line in size_mapping_preview_lines[:80]:
+                self.log(line)
+            if len(size_mapping_preview_lines) > 80:
+                self.log(u"... {} mapping khác".format(len(size_mapping_preview_lines) - 80))
+        if private_required_keys:
+            self.log(u"V5.8.8 Private Segment: cần tối đa {} config riêng; chỉ tạo bên trong Transaction và không sửa Pipe Type/Segment gốc."
+                     .format(len(private_required_keys)))
+
         if not target_pipes and not target_fittings:
-            self.log(u"Không có Pipe/Fitting nào trong System Type đã chọn nằm trong Pipe Size range hiện tại.")
+            self.log(u"Không còn Pipe/Fitting hợp lệ sau Size Range + Pipe Segment Size Compatibility + System Type Lock.")
             if range_skipped_lines:
                 self.log(u"--- BỎ QUA DO SIZE RANGE ({}) ---".format(len(range_skipped_lines)))
                 for line in range_skipped_lines:
+                    self.log(line)
+            if size_compat_skipped_lines:
+                self.log(u"--- BỎ QUA DO PIPE SEGMENT SIZE COMPATIBILITY ({}) ---".format(len(size_compat_skipped_lines)))
+                for line in size_compat_skipped_lines:
                     self.log(line)
             if system_lock_skipped_lines:
                 self.log(u"--- BỎ QUA DO SYSTEM TYPE LOCK ({}) ---".format(len(system_lock_skipped_lines)))
                 for line in system_lock_skipped_lines:
                     self.log(line)
+            self._runtime_predict_size_plans = False
             return
 
-        # V5.8 manual mode must have exactly one selected FamilySymbol for every
-        # PartType that will actually be processed in this range. Validate before
-        # opening the main Transaction so the model cannot be changed partially.
+        # Manual validation uses the planned Pipe sizes in adaptive mode, so an
+        # equal-size fitting can correctly become a reducing fitting (or vice versa)
+        # when nearest-size mapping is selected.
         if overwrite_fittings and self._is_manual_fitting_mode() and target_fittings:
             valid_manual, manual_problem = self._validate_fitting_type_selection(
                 target_fittings, selected_fitting_items, selected_reducing_fitting_items)
@@ -7885,6 +9576,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 forms.alert(
                     u"Chế độ Chọn Fitting thủ công chưa đủ type cho batch hiện tại:\n\n{}".format(manual_problem),
                     title="Thiếu Fitting Type")
+                self._runtime_predict_size_plans = False
                 return
 
         self.log(u"Chế độ Fitting: {}.".format(
@@ -7892,21 +9584,23 @@ class ReplaceElementsWindow(forms.WPFWindow):
         for line in mixed_attempt_lines:
             self.log(u"SYSTEM TYPE LOCK: {}".format(line))
 
-        changed, skipped, failed = 0, len(range_skipped_lines) + len(system_lock_skipped_lines), []
+        changed = 0
+        skipped = len(range_skipped_lines) + len(system_lock_skipped_lines) + len(size_compat_skipped_lines)
+        failed = []
         forced_reconnected = 0
-        # V4.9: keep a complete audit trail in the on-screen log.  No final
-        # result popup is shown after a committed batch.
         success_lines = []
-        skipped_lines = list(range_skipped_lines) + list(system_lock_skipped_lines)
+        skipped_lines = (list(range_skipped_lines) + list(size_compat_skipped_lines) +
+                         list(system_lock_skipped_lines))
+        private_created_lines = []
 
-        # V5.8.5 batch-level invariant. This protects all selected Pipes and every
-        # directly connected partner Pipe around fittings, including Pipes outside
-        # the current selection. Per-element SubTransactions also validate this;
-        # this final snapshot is a second safety net before the main commit.
+        # Batch-level System Type invariant remains the final safety net.
         batch_system_lock = batch_pipe_system_lock_snapshot(pipes, system_fittings)
-        self.log(u"SYSTEM TYPE LOCK snapshot: bảo vệ {} Pipe; mixed-system bỏ qua: {}; mixed-system xử lý thử: {}.".format(
-            len(batch_system_lock), len(system_lock_skipped_lines), len(mixed_attempt_lines)))
-        tx = DB.Transaction(doc, u"Replace Pipes and Fittings - System Type Lock")
+        self.log(u"SYSTEM TYPE LOCK snapshot: bảo vệ {} Pipe; mixed-system bỏ qua: {}; mixed-system xử lý thử: {}."
+                 .format(len(batch_system_lock), len(system_lock_skipped_lines), len(mixed_attempt_lines)))
+
+        tx = DB.Transaction(doc, u"Replace Pipes and Fittings - V5.8.8 Size Compatibility + System Type Lock")
+        private_config_cache = {}
+        private_config_failures = {}
         try:
             tx.Start()
             try:
@@ -7916,56 +9610,124 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 tx.SetFailureHandlingOptions(opts)
             except Exception:
                 pass
+
+            # Create isolated compatible PipeType/Segment configurations only
+            # when a planned Pipe actually needs them. Creation is cached by the
+            # old size-system signature so identical Pipes share one private config.
+            if size_strategy == 'private_segment':
+                for p in target_pipes:
+                    key = None
+                    try:
+                        pid_value = self.id_value(p.Id)
+                        plan = pipe_size_plans.get(pid_value) or {}
+                        if not plan.get('requires_private_config'):
+                            continue
+                        key = plan.get('private_key')
+                        if key in private_config_cache or key in private_config_failures:
+                            continue
+                        old_segment = doc.GetElement(make_element_id(plan.get('private_old_segment_id')))
+                        target_segment = doc.GetElement(make_element_id(plan.get('private_target_segment_id')))
+                        created_cfg = create_private_compatible_pipe_type(
+                            target_pipe_type, old_segment, target_segment, cache=private_config_cache)
+                        private_created_lines.append(
+                            u"Tạo Pipe Type '{}' + Pipe Segment '{}' | sizes [{}]"
+                            .format(get_real_name(created_cfg.get('pipe_type')),
+                                    get_real_name(created_cfg.get('segment')),
+                                    _segment_size_text_from_values(created_cfg.get('sizes') or [], max_items=35)))
+                    except Exception as cfg_ex:
+                        try:
+                            if key is not None:
+                                private_config_failures[key] = safe_text(cfg_ex)
+                            else:
+                                self.log(u"V5.8.8 PRIVATE SEGMENT: lỗi trước khi tạo key config: {}".format(safe_text(cfg_ex)))
+                        except Exception:
+                            pass
+
+            for line in private_created_lines:
+                self.log(u"V5.8.8 PRIVATE SEGMENT: {}".format(line))
+
+            # Pipes are processed first. Adaptive fitting sizing later reads the
+            # live partner connector sizes produced here.
             for p in target_pipes:
-                # Cache the ID BEFORE any API operation. Some Revit operations can
-                # invalidate a managed Element wrapper; never read p.Id afterwards.
                 try:
                     pipe_id_value = self.id_value(p.Id)
                 except Exception:
-                    pipe_id_value = u"?"
-                pipe_label = u"Pipe ID {}".format(pipe_id_value)
+                    pipe_id_value = None
+                pipe_label = u"Pipe ID {}".format(pipe_id_value if pipe_id_value is not None else u"?")
+                plan = pipe_size_plans.get(pipe_id_value) or {}
 
-                ok, msg = self.change_type_safe(
-                    p, new_pipe_type_id, pipe_label, False)
+                target_type_id = new_pipe_type_id
+                target_size_ft = plan.get('target_size')
+                size_note = u""
+                if plan.get('requires_private_config'):
+                    key = plan.get('private_key')
+                    if key in private_config_failures:
+                        plan['applied'] = False
+                        skipped += 1
+                        skipped_lines.append(
+                            u"{}: Bỏ qua - không tạo được Pipe Segment riêng: {}"
+                            .format(pipe_label, private_config_failures.get(key)))
+                        continue
+                    cfg = private_config_cache.get(key)
+                    if not cfg:
+                        plan['applied'] = False
+                        skipped += 1
+                        skipped_lines.append(
+                            u"{}: Bỏ qua - Pipe Segment riêng không tồn tại sau bước chuẩn bị".format(pipe_label))
+                        continue
+                    target_type_id = cfg.get('pipe_type').Id
+                    size_note = u"PRIVATE SEGMENT '{}' / PipeType '{}'".format(
+                        get_real_name(cfg.get('segment')), get_real_name(cfg.get('pipe_type')))
+                elif size_strategy in ('nearest', 'manual'):
+                    old_size = (plan.get('analysis') or {}).get('current_size')
+                    size_note = u"{} {} -> {}".format(
+                        u'MANUAL' if size_strategy == 'manual' else u'NEAREST',
+                        format_pipe_size(old_size), format_pipe_size(target_size_ft))
+                else:
+                    size_note = u"OPTION 1 giữ nguyên nominal size; target PipeType hỗ trợ trực tiếp"
+
+                ok, msg = self.change_pipe_type_with_size_plan(
+                    make_element_id(pipe_id_value), target_type_id, target_size_ft,
+                    pipe_label, size_note=size_note)
                 if ok:
+                    plan['applied'] = True
                     changed += 1
                     success_lines.append(u"{}: {}".format(pipe_label, safe_text(msg) or u"OK"))
                 else:
+                    plan['applied'] = False
                     skipped += 1
-                    if safe_text(msg).startswith(u"Bỏ qua"):
-                        skipped_lines.append(u"{}: {}".format(pipe_label, safe_text(msg)))
-                    else:
-                        failed.append(u"{}: {}".format(pipe_label, safe_text(msg)))
+                    failed.append(u"{}: {}".format(pipe_label, safe_text(msg)))
 
+            self._runtime_predict_size_plans = False
+
+            # Fittings are processed after Pipe sizes/types are final. Adaptive
+            # mode uses live Pipe-partner size as the fitting size authority.
             for f in target_fittings:
-                # IMPORTANT: cache ID/label before change_type_safe(). Cross-family
-                # replacement intentionally deletes the original fitting. Even if its
-                # SubTransaction is later rolled back, the old Python/.NET wrapper may
-                # remain invalid, so accessing f.Id here can throw
-                # "referenced object is not valid" and hide the REAL fitting error.
                 try:
                     fitting_id_value = self.id_value(f.Id)
                 except Exception:
-                    fitting_id_value = u"?"
-                fitting_label = u"Fitting ID {}".format(fitting_id_value)
-
+                    fitting_id_value = None
+                fitting_label = u"Fitting ID {}".format(
+                    fitting_id_value if fitting_id_value is not None else u"?")
                 try:
+                    live_fitting = doc.GetElement(make_element_id(fitting_id_value))
+                    if live_fitting is None:
+                        raise Exception(u"Fitting không còn tồn tại sau bước đổi Pipe")
                     new_fit_type_id = self.choose_replacement_fitting_type(
-                        f, selected_fitting_items, selected_reducing_fitting_items)
+                        live_fitting, selected_fitting_items, selected_reducing_fitting_items)
                     ok, msg = self.change_type_safe(
-                        f, new_fit_type_id, fitting_label, force_reconnect_fittings)
+                        live_fitting, new_fit_type_id, fitting_label, force_reconnect_fittings)
                 except Exception as fitting_ex:
                     ok = False
                     msg = u"Lỗi ngoài dự kiến khi xử lý fitting: {}\n{}".format(
                         safe_text(fitting_ex), traceback.format_exc())
 
-                # From this point onward DO NOT access f or f.Id. The original fitting
-                # may have been deleted/recreated, so only use the cached label.
                 if ok:
                     changed += 1
                     success_lines.append(u"{}: {}".format(fitting_label, safe_text(msg) or u"OK"))
                     if (u"ngắt/nối lại" in safe_text(msg) or
-                            u"recreate khác Family" in safe_text(msg)):
+                            u"recreate khác Family" in safe_text(msg) or
+                            u"direct-align" in safe_text(msg)):
                         forced_reconnected += 1
                 else:
                     skipped += 1
@@ -7977,7 +9739,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             batch_lock_ok, batch_lock_changes = validate_pipe_system_snapshot(batch_system_lock)
             if not batch_lock_ok:
                 raise Exception(system_lock_failure_text(
-                    batch_lock_changes, u"V5.8.5 SYSTEM TYPE LOCK CẤP BATCH - ROLLBACK TOÀN BỘ"))
+                    batch_lock_changes, u"V5.8.8 SYSTEM TYPE LOCK CẤP BATCH - ROLLBACK TOÀN BỘ"))
             tx.Commit()
         except Exception as ex:
             try:
@@ -7986,21 +9748,23 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 pass
             forms.alert(u"Lỗi transaction chính, đã rollback toàn bộ:\n{}".format(safe_text(ex)), title="Lỗi")
             self.log(traceback.format_exc())
+            self._runtime_predict_size_plans = False
             return
 
-        # V4.9: everything goes to the persistent UI log.  Do not show the
-        # small completion alert; the user can inspect/copy all details here.
         self.log(u"")
         self.log(u"============================================================")
         self.log(u"KẾT QUẢ XỬ LÝ - System Type: {}".format(system_name))
         self.log(u"Phạm vi: {}".format(scope_name))
         self.log(u"Chế độ Fitting: {}".format(
             u"CHỌN THỦ CÔNG như V5.3" if self._is_manual_fitting_mode() else u"AUTO ROUTING PREFERENCES"))
+        self.log(u"Pipe Segment Size Compatibility: {}".format(self._size_compatibility_mode_label()))
         self.log(u"Pipe Size range: {} -> {} (inclusive)".format(
             format_pipe_size(min_pipe_size_ft), format_pipe_size(max_pipe_size_ft)))
         self.log(u"System Type Lock: OK - mọi Pipe được bảo vệ giữ nguyên System Type trước/sau batch.")
-        self.log(u"Thành công: {} | Fallback/recreate: {} | Bỏ qua không lỗi: {} | Bỏ qua do lỗi: {} | Tổng không thay đổi: {}".format(
-            changed, forced_reconnected, len(skipped_lines), len(failed), skipped))
+        if private_created_lines:
+            self.log(u"Private Pipe Segment config đã tạo: {}".format(len(private_created_lines)))
+        self.log(u"Thành công: {} | Fallback/recreate: {} | Bỏ qua không lỗi: {} | Bỏ qua do lỗi: {} | Tổng không thay đổi: {}"
+                 .format(changed, forced_reconnected, len(skipped_lines), len(failed), skipped))
 
         if success_lines:
             self.log(u"--- THÀNH CÔNG ({}) ---".format(len(success_lines)))
@@ -8025,17 +9789,12 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self.log(u"Đã kết thúc batch. Selection Revit được xóa để tránh dùng lại ID fitting đã recreate.")
         self.log(u"Để xử lý vị trí khác: đóng cửa sổ này, chọn Pipe/Fitting mới trong Revit rồi chạy lệnh lại.")
 
-        # Cross-family replacement can delete/recreate fittings. Clear the Revit
-        # selection after a committed batch so the next invocation MUST start from
-        # a fresh, intentional preselection and can never reuse stale fitting IDs.
         try:
             empty_ids = List[DB.ElementId]() if List is not None else []
             uidoc.Selection.SetElementIds(empty_ids)
         except Exception:
             pass
 
-        # Keep the modal UI open so the result log remains visible.  Disable the
-        # Run button because this window owns an immutable preselection snapshot.
         try:
             self.btn_Replace.IsEnabled = False
             self.btn_Replace.Content = u"Đã hoàn tất — đóng cửa sổ để chọn đối tượng mới"
@@ -8048,7 +9807,6 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.txt_PreselectionStatus.Foreground = System.Windows.Media.Brushes.DarkGreen
         except Exception:
             pass
-
 
 # ============================================================
 # Entry point - require preselection before opening UI (V5.8 Universal / Revit 2025-2026)
@@ -8112,5 +9870,5 @@ else:
             win.show_dialog()
         except Exception as ex:
             forms.alert(
-                u"Không thể mở UI V5.8.5 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
+                u"Không thể mở UI V5.8.8 Universal / Revit 2025-2026:\n{}\n\n{}".format(safe_text(ex), traceback.format_exc()),
                 title="Correct Pipes & Fittings")

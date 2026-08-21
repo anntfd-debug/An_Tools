@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Bluebeam PDF Review V2.5 - NATIVE REVIT MARKUP + BLUEBEAM GROUPS / SINGLE FILE / NO INSTALL
+Bluebeam PDF Review V2.6 - MULTI-PAGE NATIVE REVIT MARKUP + BLUEBEAM GROUPS / SINGLE FILE / NO INSTALL
 ======================================================================
 
 Đầu vào: một PDF Bluebeam có page content gốc + unflattened annotations.
@@ -15,13 +15,15 @@ Workflow:
 5. Tạo native Revit DetailCurve/TextNote.
 6. Markup nào thuộc Bluebeam Group sẽ được gom thành Revit Detail Group (nested group được flatten vào group cha ngoài cùng).
 7. Ẩn BASE. Không tạo MARKUP PDF.
+8. Mỗi PDF page có state độc lập trong cùng Active View: có thể Load/Finish nhiều trang mà không Reset trang trước.
+9. Reset chỉ xóa BASE/markup/group của đúng PDF page đang chọn.
 
 Không cần PyMuPDF, pip hay PYTHONPATH. pypdf pure-Python được embedded trong script.
 
 Giới hạn:
 - Markup phải chưa Flatten.
 - Line/PolyLine/Polygon/Square/Circle/Ink/FreeText được ưu tiên chuyển native.
-- Stamp/image/rich appearance không được rasterize trong V2.5 và có thể được báo Unsupported.
+- Stamp/image/rich appearance không được rasterize trong V2.6 và có thể được báo Unsupported.
 - Hình học cloud/custom appearance được giữ theo geometry cơ bản, không tái tạo 100% style Bluebeam.
 - Bluebeam Group được nhận diện theo quan hệ PDF annotation /IRT + /RT /Group; nested chain được flatten về root group để Revit ổn định.
 """
@@ -4264,7 +4266,7 @@ except Exception:
 # CONSTANTS
 # ============================================================
 
-TOOL_VERSION = "2.5"
+TOOL_VERSION = "2.6.2"
 CONFIG_SECTION = "bluebeam_pdf_review_overlay_v2"
 CACHE_FOLDER_NAME = "PdfReviewCache"
 DEFAULT_SCALE = "1.0"
@@ -4291,6 +4293,8 @@ ACTION_SHOW_BASE = "show_base"
 ACTION_HIDE_BASE = "hide_base"
 ACTION_SHOW_MARKUP = "show_markup"
 ACTION_HIDE_MARKUP = "hide_markup"
+ACTION_PIN_MARKUP = "pin_markup"
+ACTION_UNPIN_MARKUP = "unpin_markup"
 ACTION_RESET = "reset"
 ACTION_CLOSE = "close"
 
@@ -4344,9 +4348,9 @@ def ask_yes_no(message, title=None):
 
 if pypdf is None:
     alert(
-        "Không load được pypdf embedded trong script V2.5.\n\n"
+        "Không load được pypdf embedded trong script V2.6.\n\n"
         "Không cần pip install và không cần folder lib.\n"
-        "Hãy dùng nguyên file script.py V2.5.\n\n"
+        "Hãy dùng nguyên file script.py V2.6.\n\n"
         "Chi tiết import:\n{}\n\nImport source:\n{}".format(
             _PYPDF_IMPORT_ERROR, _PYPDF_IMPORT_SOURCE
         ),
@@ -4374,7 +4378,7 @@ if active_view.IsTemplate:
     alert("Active View hiện tại là View Template.", exitscript=True)
 if active_view.ViewType in [ViewType.Schedule, ViewType.ThreeD]:
     alert(
-        "V2.5 tạo native DetailCurve/TextNote/Detail Group nên không chạy trong Schedule hoặc 3D View.\n"
+        "V2.6 tạo native DetailCurve/TextNote/Detail Group nên không chạy trong Schedule hoặc 3D View.\n"
         "Hãy mở Floor Plan / Ceiling Plan / Section / Elevation / Drafting View.",
         exitscript=True,
         icon=MessageBoxIcon.Warning,
@@ -4553,24 +4557,134 @@ def save_global_config():
     script.save_config()
 
 
+def _persist_review_states():
+    _cfg_set("review_states", json.dumps(review_states, ensure_ascii=False))
+    script.save_config()
+
+
+def normalize_pdf_path(pdf_path):
+    if not pdf_path:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(str(pdf_path)))
+    except Exception:
+        return str(pdf_path)
+
+
+def make_page_state_key(pdf_path, page_number):
+    raw = "{}|PAGE:{}".format(normalize_pdf_path(pdf_path), int(page_number))
+    return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
+
+
+def _looks_like_legacy_single_state(value):
+    return isinstance(value, dict) and (
+        "base_instance_id" in value
+        or ("pdf_path" in value and "page" in value and "pages" not in value)
+    )
+
+
+def get_view_state_bucket(create=False):
+    """Return V2.6 multi-page state bucket for the active view.
+
+    V2.5 stored exactly one page state at review_states[VIEW_KEY].  V2.6
+    migrates that shape in-place to {schema, pages:{page_key: state}} so the
+    already aligned BASE/native output is preserved.
+    """
+    raw = review_states.get(VIEW_KEY)
+
+    if isinstance(raw, dict) and raw.get("_schema") == "multi_page_v2_6":
+        pages = raw.get("pages")
+        if not isinstance(pages, dict):
+            raw["pages"] = {}
+        return raw
+
+    if _looks_like_legacy_single_state(raw):
+        bucket = {"_schema": "multi_page_v2_6", "pages": {}}
+        try:
+            key = make_page_state_key(raw.get("pdf_path", ""), int(raw.get("page", 1)))
+            bucket["pages"][key] = raw
+        except Exception:
+            pass
+        review_states[VIEW_KEY] = bucket
+        # Persist migration immediately so reopening the tool is deterministic.
+        _persist_review_states()
+        return bucket
+
+    if create:
+        bucket = {"_schema": "multi_page_v2_6", "pages": {}}
+        review_states[VIEW_KEY] = bucket
+        return bucket
+    return None
+
+
 def save_review_state(state):
-    review_states[VIEW_KEY] = state
-    _cfg_set("review_states", json.dumps(review_states, ensure_ascii=False))
-    script.save_config()
+    if not isinstance(state, dict):
+        raise Exception("Review state không hợp lệ.")
+    pdf_path = state.get("pdf_path", "")
+    page_number = int(state.get("page", 1))
+    bucket = get_view_state_bucket(create=True)
+    bucket["pages"][make_page_state_key(pdf_path, page_number)] = state
+    _persist_review_states()
 
 
-def remove_review_state():
-    if VIEW_KEY in review_states:
-        del review_states[VIEW_KEY]
-    _cfg_set("review_states", json.dumps(review_states, ensure_ascii=False))
-    script.save_config()
+def remove_review_state(pdf_path, page_number):
+    bucket = get_view_state_bucket(create=False)
+    if not bucket:
+        return
+    key = make_page_state_key(pdf_path, page_number)
+    pages = bucket.get("pages", {})
+    if key in pages:
+        del pages[key]
+    if not pages:
+        try:
+            del review_states[VIEW_KEY]
+        except Exception:
+            pass
+    _persist_review_states()
 
 
-def current_state():
-    state = review_states.get(VIEW_KEY)
+def current_state(pdf_path=None, page_number=None):
+    if pdf_path is None:
+        pdf_path = last_pdf_path
+    if page_number is None:
+        page_number = last_page
+    if not pdf_path:
+        return None
+    bucket = get_view_state_bucket(create=False)
+    if not bucket:
+        return None
+    try:
+        state = bucket.get("pages", {}).get(make_page_state_key(pdf_path, page_number))
+    except Exception:
+        state = None
     if isinstance(state, dict):
         return state
     return None
+
+
+def page_states_for_current_view(pdf_path=None):
+    bucket = get_view_state_bucket(create=False)
+    if not bucket:
+        return []
+    wanted = normalize_pdf_path(pdf_path) if pdf_path else None
+    result = []
+    for state in bucket.get("pages", {}).values():
+        if not isinstance(state, dict):
+            continue
+        if wanted and normalize_pdf_path(state.get("pdf_path", "")) != wanted:
+            continue
+        result.append(state)
+    return result
+
+
+def reviewed_pages_for_pdf(pdf_path):
+    pages = []
+    for state in page_states_for_current_view(pdf_path):
+        try:
+            pages.append(int(state.get("page", 1)))
+        except Exception:
+            pass
+    return sorted(set(pages))
 
 
 # ============================================================
@@ -5001,7 +5115,7 @@ def format_analysis(analysis):
     lines.append("Bluebeam groups: {}".format(analysis.get("bluebeam_group_count", 0)))
     lines.append("Grouped markups: {}".format(analysis.get("grouped_markup_count", 0)))
     if analysis.get("nested_group_relations", 0):
-        lines.append("Nested group relations: {} (V2.5 flattens to outer parent)".format(analysis.get("nested_group_relations", 0)))
+        lines.append("Nested group relations: {} (V2.6 flattens to outer parent)".format(analysis.get("nested_group_relations", 0)))
     if analysis["type_counts"]:
         lines.append("")
         lines.append("Types:")
@@ -5016,7 +5130,7 @@ def format_analysis(analysis):
     if analysis["visible_markups"] <= 0:
         lines.append("Không thấy unflattened markup. Nếu PDF vẫn có markup nhìn thấy, có thể nó đã Flatten.")
     else:
-        lines.append("V2.5 có thể chuyển markup hình học sang native Revit detail elements và giữ Bluebeam Group dưới dạng Detail Group.")
+        lines.append("V2.6 có thể chuyển markup hình học sang native Revit detail elements và giữ Bluebeam Group dưới dạng Detail Group.")
     return "\n".join(lines)
 
 
@@ -5637,7 +5751,7 @@ def convert_one_annotation(annot, geom, frame, style, options, created_ids, text
             create_quad_text_markup(annot, subtype, geom, frame, style, created_ids)
 
     elif subtype == "/Stamp":
-        # Stamp appearance can contain raster/vector/form XObjects. V2.5 deliberately
+        # Stamp appearance can contain raster/vector/form XObjects. V2.6 deliberately
         # does not rasterize it because the goal is native Revit geometry only.
         pass
 
@@ -5919,7 +6033,7 @@ def valid_elements_from_values(values):
 def native_markup_elements(state):
     """Top-level Revit markup outputs used for visibility/status.
 
-    V2.5 stores grouped markup as Group instances and only stores individual
+    V2.6 stores grouped markup as Group instances and only stores individual
     DetailCurve/TextNote IDs for ungrouped markup. V2.4 state remains compatible.
     """
     if not state:
@@ -5967,16 +6081,51 @@ def cleanup_orphan_group_types(group_type_ids):
             pass
 
 
+def set_markup_elements_pinned(elements, pinned):
+    """Set Pinned for top-level markup outputs without opening a Transaction.
+
+    Caller must already be inside a valid Revit Transaction. Detail Group
+    instances are treated as the top-level selectable object; group members are
+    intentionally not modified. Returns counters for logging/UI.
+    """
+    result = {"changed": 0, "already": 0, "failed": []}
+    for elem in elements or []:
+        if elem is None:
+            continue
+        try:
+            current = bool(elem.Pinned)
+            if current == bool(pinned):
+                result["already"] += 1
+                continue
+            elem.Pinned = bool(pinned)
+            result["changed"] += 1
+        except Exception as ex:
+            result["failed"].append(
+                "ID {}: {}".format(get_id_int(elem.Id), str(ex))
+            )
+    return result
+
+
 def delete_native_markup_state(state):
     if not state:
         return
+
+    # V2.6.2: markup is auto-pinned immediately after Create/Rebuild. Always
+    # unpin the top-level outputs before deleting them. This makes Reset Page
+    # and Rebuild deterministic even when the user has left markup pinned.
+    try:
+        set_markup_elements_pinned(native_markup_elements(state), False)
+        doc.Regenerate()
+    except Exception:
+        pass
+
     # Group instances must be removed before attempting to clean their types.
     delete_element_values(state.get("markup_group_ids", []))
     try:
         doc.Regenerate()
     except Exception:
         pass
-    # In V2.5 these are only ungrouped outputs. In V2.4 migration they are all
+    # In V2.6 these are only ungrouped outputs. In V2.4 migration they are all
     # native elements, which remains safe because markup_group_ids is absent.
     delete_element_values(state.get("markup_element_ids", []))
     try:
@@ -6046,10 +6195,10 @@ def set_elements_hidden(document, view, elements, hidden):
         view.UnhideElements(ids)
 
 
-def visibility_action(which, hidden):
-    state = current_state()
+def visibility_action(which, hidden, pdf_path, page_number):
+    state = current_state(pdf_path, page_number)
     if not state:
-        raise Exception("View này chưa có PDF Review.")
+        raise Exception("Trang PDF đang chọn chưa có PDF Review trong view này.")
     if which == "base":
         elem = resolve_base_element(state)
         if elem is None:
@@ -6075,6 +6224,59 @@ def visibility_action(which, hidden):
         raise
 
 
+def pin_markup_action(pinned, pdf_path, page_number):
+    """Pin/unpin top-level markup outputs for only the selected PDF page.
+
+    Revit Detail Groups are pinned as group instances. Ungrouped DetailCurve/
+    TextNote outputs are pinned individually. Group members are intentionally
+    not modified because the Group instance is the selectable top-level object.
+    """
+    state = current_state(pdf_path, page_number)
+    if not state:
+        raise Exception("Trang PDF đang chọn chưa có PDF Review trong view này.")
+
+    elements = native_markup_elements(state)
+    legacy = legacy_markup_element(state)
+    if not elements and legacy is not None:
+        elements = [legacy]
+    if not elements:
+        raise Exception("Không tìm thấy Revit markup elements để Pin/Unpin.")
+
+    t = Transaction(doc, "{} Bluebeam Markup - Page {}".format(
+        "Pin" if pinned else "Unpin", page_number
+    ))
+    t.Start()
+    try:
+        pin_result = set_markup_elements_pinned(elements, pinned)
+        t.Commit()
+    except Exception:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        raise
+
+    changed = int(pin_result.get("changed", 0))
+    already = int(pin_result.get("already", 0))
+    failed = list(pin_result.get("failed", []))
+
+    action_text = "PIN" if pinned else "UNPIN"
+    msg = "{} MARKUP - PDF PAGE {}\n\n".format(action_text, page_number)
+    msg += "Changed: {}\n".format(changed)
+    msg += "Already {}: {}\n".format("pinned" if pinned else "unpinned", already)
+    if failed:
+        msg += "Failed: {}\n".format(len(failed))
+        msg += "\n" + "\n".join(failed[:10])
+        if len(failed) > 10:
+            msg += "\n... +{} more".format(len(failed) - 10)
+    if pinned:
+        msg += (
+            "\n\nLưu ý: Pin ngăn Move/Delete ngoài ý muốn. "
+            "Để không chọn trúng markup khi vẽ, hãy tắt Revit option 'Select Pinned Elements'."
+        )
+    alert(msg, title="Bluebeam PDF Review V{}".format(TOOL_VERSION))
+
+
 def delete_element_value(value):
     eid = to_element_id(value)
     if eid is None:
@@ -6091,23 +6293,38 @@ def delete_element_values(values):
         delete_element_value(value)
 
 
-def build_status_text(state, base, native, legacy):
+def build_status_text(state, base, native, legacy, selected_pdf=None, selected_page=None):
     lines = []
     lines.append("Active View: {}".format(active_view.Name))
     lines.append(
-        "pypdf bundled: {} | V2.5 Native Markup + Groups | no pip install".format(
-            getattr(pypdf, "__version__", "?")
+        "pypdf bundled: {} | V{} Multi-Page Native Markup + Groups + Pin | no pip install".format(
+            getattr(pypdf, "__version__", "?"), TOOL_VERSION
         )
     )
+
+    if selected_pdf:
+        try:
+            pages = reviewed_pages_for_pdf(selected_pdf)
+        except Exception:
+            pages = []
+        if pages:
+            lines.append("Pages đang được quản lý trong view: {}".format(
+                ", ".join(str(v) for v in pages)
+            ))
+        else:
+            lines.append("Pages đang được quản lý trong view: none")
+
     if not state:
         lines.append("")
-        lines.append("Status: Chưa có review trong view này.")
-        lines.append("Chọn 1 PDF Bluebeam rồi bấm Load BASE để dóng.")
+        if selected_page is not None:
+            lines.append("Selected page: {}".format(selected_page))
+        lines.append("Status: Trang đang chọn chưa có review.")
+        lines.append("Bấm Load BASE để tạo review riêng cho trang này.")
         return "\n".join(lines)
 
     lines.append("")
     lines.append("Source: {}".format(state.get("pdf_path", "")))
-    lines.append("Page: {}".format(state.get("page", "?")))
+    lines.append("Selected/State page: {}".format(state.get("page", "?")))
     lines.append("Markup detected: {}".format(state.get("markup_count", "?")))
     lines.append("Bluebeam groups detected: {}".format(state.get("bluebeam_group_count", 0)))
 
@@ -6130,14 +6347,23 @@ def build_status_text(state, base, native, legacy):
                 pass
         group_count = len(valid_elements_from_values(state.get("markup_group_ids", [])))
         ungrouped_count = len(valid_elements_from_values(state.get("markup_element_ids", [])))
+        pinned_count = 0
+        for elem in native:
+            try:
+                if bool(elem.Pinned):
+                    pinned_count += 1
+            except Exception:
+                pass
         lines.append(
-            "REVIT MARKUP OUTPUT: {} top-level | {} hidden".format(len(native), hidden_count)
+            "REVIT MARKUP OUTPUT: {} top-level | {} hidden | {} pinned".format(
+                len(native), hidden_count, pinned_count
+            )
         )
         if group_count:
             lines.append("  Detail Groups: {} | Ungrouped elements: {}".format(group_count, ungrouped_count))
     elif legacy is not None:
         lines.append(
-            "LEGACY MARKUP PDF: ID {} | V2.5 Finish sẽ thay bằng native elements/groups".format(
+            "LEGACY MARKUP PDF: ID {} | V2.6 Finish sẽ thay bằng native elements/groups".format(
                 get_id_int(legacy.Id)
             )
         )
@@ -6146,10 +6372,10 @@ def build_status_text(state, base, native, legacy):
 
     if base is not None and not native:
         lines.append("")
-        lines.append("Bước tiếp theo: dóng BASE rồi bấm Finish + Create Revit Markup.")
+        lines.append("Bước tiếp theo: dóng BASE của page này rồi bấm Finish + Create Revit Markup.")
     elif native:
         lines.append("")
-        lines.append("Review hoàn tất: markup hiện là native Revit DetailCurve/TextNote/Detail Group.")
+        lines.append("Page này hoàn tất. Bạn có thể chọn page khác và Load BASE tiếp.")
     return "\n".join(lines)
 
 
@@ -6161,11 +6387,16 @@ def build_status_text(state, base, native, legacy):
 def start_base_review(pdf_path, page_number, scale_value, placement_mode):
     global last_pdf_path, last_scale, last_page, last_placement_mode
 
-    state = current_state()
-    if state and not state_is_stale(state):
+    state = current_state(pdf_path, page_number)
+    if state and state_is_stale(state):
+        remove_review_state(pdf_path, page_number)
+        state = None
+    if state:
         raise Exception(
-            "View này đã có PDF Review đang tồn tại.\n\n"
-            "Hãy Finish/Rebuild hoặc Reset Current Review trước khi Load BASE mới."
+            "PDF page {} đã có review đang tồn tại trong view này.\n\n"
+            "Bạn có thể chọn page khác để Load BASE tiếp, hoặc Reset đúng page {} nếu muốn tạo lại.".format(
+                page_number, page_number
+            )
         )
 
     analysis = analyze_pdf_page(pdf_path, page_number)
@@ -6185,7 +6416,7 @@ def start_base_review(pdf_path, page_number, scale_value, placement_mode):
     if placement_point is None:
         return False
 
-    t = Transaction(doc, "Bluebeam Review V2.5 - Load BASE")
+    t = Transaction(doc, "Bluebeam Review V2.6 - Load BASE p{}".format(page_number))
     t.Start()
     try:
         base_type, base_instance = create_image_type_and_instance(
@@ -6242,10 +6473,10 @@ def start_base_review(pdf_path, page_number, scale_value, placement_mode):
     return True
 
 
-def finish_alignment(native_options=None, rebuild=False):
-    state = current_state()
+def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
+    state = current_state(pdf_path, page_number)
     if not state:
-        raise Exception("View này chưa có BASE để Finish Alignment.")
+        raise Exception("PDF page {} chưa có BASE để Finish Alignment.".format(page_number))
 
     base = resolve_base_element(state)
     if base is None:
@@ -6286,7 +6517,7 @@ def finish_alignment(native_options=None, rebuild=False):
     }
 
     legacy = legacy_markup_element(state)
-    t = Transaction(doc, "Bluebeam Review V2.5 - Create Native Markup + Groups")
+    t = Transaction(doc, "Bluebeam Review V2.6.2 - Create + Auto Pin Markup p{}".format(page_number))
     t.Start()
     try:
         # Rebuild removes previous native output while preserving the aligned BASE.
@@ -6305,6 +6536,14 @@ def finish_alignment(native_options=None, rebuild=False):
                 "Không tạo được native Revit markup nào.\n\n"
                 "Các markup trên trang có thể chủ yếu là Stamp/image hoặc subtype chưa hỗ trợ."
             )
+
+        # V2.6.2: newly created markup is pinned automatically before Commit.
+        # Only top-level outputs are pinned: Detail Group instances plus
+        # ungrouped DetailCurve/TextNote elements.
+        top_level_markup = valid_elements_from_values(
+            [int(v) for v in group_ids] + [int(v) for v in ungrouped_ids]
+        )
+        auto_pin_result = set_markup_elements_pinned(top_level_markup, True)
 
         set_elements_hidden(doc, active_view, [base], True)
         doc.Regenerate()
@@ -6337,18 +6576,32 @@ def finish_alignment(native_options=None, rebuild=False):
     state["created_elements"] = int(stats["created_elements"])
     state["revit_groups_created"] = int(stats.get("revit_groups_created", 0))
     state["grouped_markups_created"] = int(stats.get("grouped_markups_created", 0))
+    state["auto_pin_enabled"] = True
+    state["auto_pin_changed"] = int(auto_pin_result.get("changed", 0))
+    state["auto_pin_already"] = int(auto_pin_result.get("already", 0))
+    state["auto_pin_failed"] = len(auto_pin_result.get("failed", []))
     save_review_state(state)
 
     msg = []
-    msg.append("V2.5 Native Revit Markup + Bluebeam Groups hoàn tất.")
+    msg.append("V2.6.2 Multi-Page Native Markup + Auto Pin hoàn tất.")
     msg.append("")
-    msg.append("BASE: hidden")
+    msg.append("PDF Page {} | BASE: hidden".format(page_number))
     msg.append("Native member elements created: {}".format(stats["created_elements"]))
     msg.append("Top-level Revit outputs: {}".format(stats.get("output_elements", 0)))
     msg.append("Converted markups: {} / {}".format(stats["converted_markups"], stats["visual_markups"]))
     msg.append("Unsupported / no geometry: {}".format(stats["unsupported_markups"]))
     msg.append("Line weight: {}".format(parse_line_weight(options.get("line_weight"))))
     msg.append("Preserve colors: {}".format("Yes" if options.get("preserve_colors") else "No - Red"))
+    msg.append(
+        "Auto Pin markup: {} / {} top-level".format(
+            int(auto_pin_result.get("changed", 0)) + int(auto_pin_result.get("already", 0)),
+            len(top_level_markup),
+        )
+    )
+    if auto_pin_result.get("failed"):
+        msg.append("Auto Pin failed: {}".format(len(auto_pin_result.get("failed", []))))
+        for error in auto_pin_result.get("failed", [])[:5]:
+            msg.append("  {}".format(error))
     msg.append("")
     msg.append("BLUEBEAM GROUPS")
     msg.append("Detected: {}".format(stats.get("bluebeam_groups_detected", 0)))
@@ -6385,20 +6638,22 @@ def finish_alignment(native_options=None, rebuild=False):
     alert("\n".join(msg))
 
 
-def reset_current_review():
-    state = current_state()
+def reset_current_review(pdf_path, page_number):
+    state = current_state(pdf_path, page_number)
     if not state:
-        alert("View này chưa có review để reset.")
+        alert("PDF page {} chưa có review để reset.".format(page_number))
         return
     if not ask_yes_no(
-        "Reset review hiện tại?\n\n"
-        "Tool sẽ xóa BASE, native Revit markup/Detail Groups và legacy MARKUP PDF do tool tạo trong Active View.\n"
+        "Reset riêng PDF page {}?\n\n"
+        "Tool CHỈ xóa BASE, native Revit markup/Detail Groups và legacy MARKUP PDF của page {}.\n"
+        "Markup của page này sẽ được UNPIN tự động trước khi xóa.\n"
+        "Các page khác trong cùng PDF/View sẽ được giữ nguyên.\n"
         "Các Line Style/Text Type AnTools đã tạo sẽ được giữ lại để tái sử dụng.\n"
-        "Group Type chỉ bị xóa nếu không còn Group instance nào khác đang sử dụng."
+        "Group Type chỉ bị xóa nếu không còn Group instance nào khác đang sử dụng.".format(page_number, page_number)
     ):
         return
 
-    t = Transaction(doc, "Bluebeam Review V2.5 - Reset")
+    t = Transaction(doc, "Bluebeam Review V2.6.2 - Unpin + Reset p{}".format(page_number))
     t.Start()
     try:
         delete_native_markup_state(state)
@@ -6414,8 +6669,8 @@ def reset_current_review():
             pass
         raise
 
-    remove_review_state()
-    alert("Đã reset PDF Review trong Active View.")
+    remove_review_state(pdf_path, page_number)
+    alert("Đã UNPIN và reset riêng PDF page {}. Các page khác được giữ nguyên.".format(page_number))
 
 
 # ============================================================
@@ -6427,13 +6682,14 @@ class ReviewForm(Form):
     def __init__(self, state, base_element, native_elements, legacy_element):
         Form.__init__(self)
 
-        self.Text = "Bluebeam PDF Review V{} - Native Markup + Groups".format(TOOL_VERSION)
-        self.Size = Size(850, 770)
+        self.Text = "Bluebeam PDF Review V{} - Multi-Page Native Markup + Groups".format(TOOL_VERSION)
+        self.Size = Size(850, 825)
         self.StartPosition = FormStartPosition.CenterScreen
         self.FormBorderStyle = FormBorderStyle.FixedDialog
         self.MaximizeBox = False
         self.MinimizeBox = False
 
+        self._suspend_refresh = True
         self.action = ACTION_CLOSE
         self.pdf_path = None
         self.page_number = None
@@ -6442,7 +6698,7 @@ class ReviewForm(Form):
         self.native_options = None
 
         title = Label()
-        title.Text = "BLUEBEAM PDF → BASE ALIGNMENT → NATIVE REVIT MARKUP + DETAIL GROUPS"
+        title.Text = "BLUEBEAM PDF → MULTI-PAGE BASE ALIGNMENT → NATIVE REVIT MARKUP + DETAIL GROUPS"
         title.Font = Font(title.Font, FontStyle.Bold)
         title.Location = Point(15, 12)
         title.Size = Size(760, 22)
@@ -6458,6 +6714,7 @@ class ReviewForm(Form):
         self.txt_path.Text = last_pdf_path if last_pdf_path else ""
         self.txt_path.Location = Point(110, 46)
         self.txt_path.Size = Size(535, 24)
+        self.txt_path.TextChanged += self.path_changed
         self.Controls.Add(self.txt_path)
 
         btn_browse = Button()
@@ -6477,6 +6734,7 @@ class ReviewForm(Form):
         self.cbo_page.Location = Point(110, 84)
         self.cbo_page.Size = Size(90, 24)
         self.cbo_page.DropDownStyle = ComboBoxStyle.DropDownList
+        self.cbo_page.SelectedIndexChanged += self.page_changed
         self.Controls.Add(self.cbo_page)
 
         btn_scan = Button()
@@ -6605,7 +6863,7 @@ class ReviewForm(Form):
         self.Controls.Add(lbl_nested)
 
         status_label = Label()
-        status_label.Text = "CURRENT VIEW STATUS"
+        status_label.Text = "CURRENT PDF PAGE STATUS"
         status_label.Font = Font(status_label.Font, FontStyle.Bold)
         status_label.Location = Point(15, 366)
         status_label.Size = Size(240, 22)
@@ -6617,7 +6875,7 @@ class ReviewForm(Form):
         self.txt_status.ScrollBars = System.Windows.Forms.ScrollBars.Vertical
         self.txt_status.Location = Point(15, 390)
         self.txt_status.Size = Size(795, 135)
-        self.txt_status.Text = build_status_text(state, base_element, native_elements, legacy_element)
+        self.txt_status.Text = "Đang đọc state của PDF page..."
         self.Controls.Add(self.txt_status)
 
         self.btn_load = Button()
@@ -6642,7 +6900,7 @@ class ReviewForm(Form):
         self.Controls.Add(self.btn_rebuild)
 
         self.btn_reset = Button()
-        self.btn_reset.Text = "Reset"
+        self.btn_reset.Text = "Reset Page"
         self.btn_reset.Location = Point(705, 540)
         self.btn_reset.Size = Size(95, 40)
         self.btn_reset.Click += self.reset_click
@@ -6676,18 +6934,38 @@ class ReviewForm(Form):
         self.btn_hide_markup.Click += self.hide_markup_click
         self.Controls.Add(self.btn_hide_markup)
 
+        self.btn_pin_markup = Button()
+        self.btn_pin_markup.Text = "Pin All Markup (Page)"
+        self.btn_pin_markup.Location = Point(15, 638)
+        self.btn_pin_markup.Size = Size(250, 34)
+        self.btn_pin_markup.Click += self.pin_markup_click
+        self.Controls.Add(self.btn_pin_markup)
+
+        self.btn_unpin_markup = Button()
+        self.btn_unpin_markup.Text = "Unpin All Markup (Page)"
+        self.btn_unpin_markup.Location = Point(275, 638)
+        self.btn_unpin_markup.Size = Size(250, 34)
+        self.btn_unpin_markup.Click += self.unpin_markup_click
+        self.Controls.Add(self.btn_unpin_markup)
+
+        lbl_pin_hint = Label()
+        lbl_pin_hint.Text = "Markup mới sẽ tự động Pin. Tip: tắt 'Select Pinned Elements' trong Revit để không click trúng markup khi vẽ."
+        lbl_pin_hint.Location = Point(540, 641)
+        lbl_pin_hint.Size = Size(265, 32)
+        self.Controls.Add(lbl_pin_hint)
+
         note = Label()
         note.Text = (
-            "V2.5 không tạo MARKUP PDF. Bluebeam grouped annotations → Revit Detail Group; "
-            "nested group được flatten về parent. Stamp/image/rich appearance có thể Unsupported."
+            "V2.6.1: mỗi PDF page có BASE/markup state riêng. Pin/Unpin chỉ áp dụng page đang chọn; "
+            "Reset Page chỉ xóa đúng page đang chọn. Bluebeam Group → Revit Detail Group."
         )
-        note.Location = Point(15, 644)
+        note.Location = Point(15, 690)
         note.Size = Size(680, 55)
         self.Controls.Add(note)
 
         btn_close = Button()
         btn_close.Text = "Close"
-        btn_close.Location = Point(710, 658)
+        btn_close.Location = Point(710, 704)
         btn_close.Size = Size(100, 32)
         btn_close.Click += self.close_click
         self.Controls.Add(btn_close)
@@ -6704,7 +6982,82 @@ class ReviewForm(Form):
                 pass
 
         self.populate_pages(preferred_page)
-        self.update_buttons(state, base_element, native_elements, legacy_element)
+        self._suspend_refresh = False
+        self.refresh_selected_state(apply_state_options=True)
+
+    def selected_identity(self):
+        path = self.txt_path.Text.strip()
+        try:
+            page_number = int(str(self.cbo_page.SelectedItem))
+        except Exception:
+            page_number = None
+        return path, page_number
+
+    def apply_state_controls(self, state):
+        if not state:
+            return
+        try:
+            self.txt_scale.Text = str(state.get("scale", self.txt_scale.Text))
+        except Exception:
+            pass
+        try:
+            self.cbo_placement.SelectedIndex = 1 if state.get("placement_mode") == PLACEMENT_PICK else 0
+        except Exception:
+            pass
+        if "native_line_weight" in state:
+            self._select_combo_value(
+                self.cbo_line_weight, state.get("native_line_weight"), DEFAULT_LINE_WEIGHT
+            )
+        try:
+            if "native_preserve_colors" in state:
+                self.chk_colors.Checked = bool(state.get("native_preserve_colors"))
+            if "native_create_text" in state:
+                self.chk_text.Checked = bool(state.get("native_create_text"))
+            if "native_draw_arrows" in state:
+                self.chk_arrows.Checked = bool(state.get("native_draw_arrows"))
+            if "native_convert_text_marks" in state:
+                self.chk_text_marks.Checked = bool(state.get("native_convert_text_marks"))
+            if "native_preserve_groups" in state:
+                self.chk_groups.Checked = bool(state.get("native_preserve_groups"))
+            if "native_group_naming" in state:
+                self._select_combo_value(
+                    self.cbo_group_naming,
+                    state.get("native_group_naming"),
+                    DEFAULT_GROUP_NAMING,
+                )
+        except Exception:
+            pass
+
+    def refresh_selected_state(self, apply_state_options=False):
+        if self._suspend_refresh:
+            return
+        path, page = self.selected_identity()
+        state = None
+        base = None
+        native = []
+        legacy = None
+        if path and page is not None:
+            state = current_state(path, page)
+            if state and state_is_stale(state):
+                remove_review_state(path, page)
+                state = None
+            if state:
+                base = resolve_base_element(state)
+                native = native_markup_elements(state)
+                legacy = legacy_markup_element(state)
+                if apply_state_options:
+                    self.apply_state_controls(state)
+        self.txt_status.Text = build_status_text(
+            state, base, native, legacy, selected_pdf=path, selected_page=page
+        )
+        self.update_buttons(state, base, native, legacy)
+
+    def page_changed(self, sender, args):
+        self.refresh_selected_state(apply_state_options=True)
+
+    def path_changed(self, sender, args):
+        # Do not scan the PDF on every keystroke; only refresh saved-state status.
+        self.refresh_selected_state(apply_state_options=False)
 
     def _select_combo_value(self, combo, value, fallback):
         wanted = str(value or fallback)
@@ -6732,6 +7085,8 @@ class ReviewForm(Form):
         self.btn_hide_base.Enabled = has_base
         self.btn_show_markup.Enabled = has_native or has_legacy
         self.btn_hide_markup.Enabled = has_native or has_legacy
+        self.btn_pin_markup.Enabled = has_native or has_legacy
+        self.btn_unpin_markup.Enabled = has_native or has_legacy
 
     def browse_click(self, sender, args):
         dialog = OpenFileDialog()
@@ -6751,6 +7106,8 @@ class ReviewForm(Form):
         self.populate_pages(1)
 
     def populate_pages(self, preferred_page):
+        old_suspend = self._suspend_refresh
+        self._suspend_refresh = True
         self.cbo_page.Items.Clear()
         path = self.txt_path.Text.strip()
         count = 1
@@ -6764,6 +7121,9 @@ class ReviewForm(Form):
             self.cbo_page.Items.Add(str(i))
         idx = max(0, min(count - 1, int(preferred_page) - 1))
         self.cbo_page.SelectedIndex = idx
+        self._suspend_refresh = old_suspend
+        if not self._suspend_refresh:
+            self.refresh_selected_state(apply_state_options=True)
 
     def read_inputs(self):
         path = self.txt_path.Text.strip()
@@ -6822,39 +7182,109 @@ class ReviewForm(Form):
         self.Close()
 
     def finish_click(self, sender, args):
+        try:
+            path, page, scale, placement = self.read_inputs()
+        except Exception as ex:
+            alert(str(ex), icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
+        self.scale_value = scale
+        self.placement_mode = placement
         self.native_options = self.read_native_options()
         self.action = ACTION_FINISH
         self.DialogResult = DialogResult.OK
         self.Close()
 
     def rebuild_click(self, sender, args):
+        try:
+            path, page, scale, placement = self.read_inputs()
+        except Exception as ex:
+            alert(str(ex), icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
+        self.scale_value = scale
+        self.placement_mode = placement
         self.native_options = self.read_native_options()
         self.action = ACTION_REBUILD
         self.DialogResult = DialogResult.OK
         self.Close()
 
     def reset_click(self, sender, args):
+        path, page = self.selected_identity()
+        if not path or page is None:
+            alert("Vui lòng chọn PDF source và page.", icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
         self.action = ACTION_RESET
         self.DialogResult = DialogResult.OK
         self.Close()
 
     def show_base_click(self, sender, args):
+        path, page = self.selected_identity()
+        if not path or page is None:
+            alert("Vui lòng chọn PDF source và page.", icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
         self.action = ACTION_SHOW_BASE
         self.DialogResult = DialogResult.OK
         self.Close()
 
     def hide_base_click(self, sender, args):
+        path, page = self.selected_identity()
+        if not path or page is None:
+            alert("Vui lòng chọn PDF source và page.", icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
         self.action = ACTION_HIDE_BASE
         self.DialogResult = DialogResult.OK
         self.Close()
 
     def show_markup_click(self, sender, args):
+        path, page = self.selected_identity()
+        if not path or page is None:
+            alert("Vui lòng chọn PDF source và page.", icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
         self.action = ACTION_SHOW_MARKUP
         self.DialogResult = DialogResult.OK
         self.Close()
 
     def hide_markup_click(self, sender, args):
+        path, page = self.selected_identity()
+        if not path or page is None:
+            alert("Vui lòng chọn PDF source và page.", icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
         self.action = ACTION_HIDE_MARKUP
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def pin_markup_click(self, sender, args):
+        path, page = self.selected_identity()
+        if not path or page is None:
+            alert("Vui lòng chọn PDF source và page.", icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
+        self.action = ACTION_PIN_MARKUP
+        self.DialogResult = DialogResult.OK
+        self.Close()
+
+    def unpin_markup_click(self, sender, args):
+        path, page = self.selected_identity()
+        if not path or page is None:
+            alert("Vui lòng chọn PDF source và page.", icon=MessageBoxIcon.Error)
+            return
+        self.pdf_path = path
+        self.page_number = page
+        self.action = ACTION_UNPIN_MARKUP
         self.DialogResult = DialogResult.OK
         self.Close()
 
@@ -6869,9 +7299,10 @@ class ReviewForm(Form):
 # ============================================================
 
 try:
-    state = current_state()
+    # Resolve only the currently selected/default page. Other page states remain intact.
+    state = current_state(last_pdf_path, last_page)
     if state and state_is_stale(state):
-        remove_review_state()
+        remove_review_state(last_pdf_path, last_page)
         state = None
 
     base_element = resolve_base_element(state) if state else None
@@ -6883,6 +7314,16 @@ try:
 
     if result != DialogResult.OK or form.action == ACTION_CLOSE:
         raise SystemExit
+
+    # Remember the selected page for the next run, regardless of action.
+    if form.pdf_path:
+        last_pdf_path = form.pdf_path
+    if form.page_number is not None:
+        last_page = int(form.page_number)
+    if form.scale_value is not None:
+        last_scale = str(form.scale_value)
+    if form.placement_mode:
+        last_placement_mode = form.placement_mode
 
     if form.native_options:
         last_line_weight = str(form.native_options.get("line_weight", last_line_weight))
@@ -6898,26 +7339,34 @@ try:
         last_group_naming = str(
             form.native_options.get("group_naming", last_group_naming)
         )
-        save_global_config()
+    save_global_config()
 
     if form.action == ACTION_LOAD_BASE:
         start_base_review(
             form.pdf_path, form.page_number, form.scale_value, form.placement_mode
         )
     elif form.action == ACTION_FINISH:
-        finish_alignment(form.native_options, rebuild=False)
+        finish_alignment(
+            form.pdf_path, form.page_number, form.native_options, rebuild=False
+        )
     elif form.action == ACTION_REBUILD:
-        finish_alignment(form.native_options, rebuild=True)
+        finish_alignment(
+            form.pdf_path, form.page_number, form.native_options, rebuild=True
+        )
     elif form.action == ACTION_SHOW_BASE:
-        visibility_action("base", False)
+        visibility_action("base", False, form.pdf_path, form.page_number)
     elif form.action == ACTION_HIDE_BASE:
-        visibility_action("base", True)
+        visibility_action("base", True, form.pdf_path, form.page_number)
     elif form.action == ACTION_SHOW_MARKUP:
-        visibility_action("markup", False)
+        visibility_action("markup", False, form.pdf_path, form.page_number)
     elif form.action == ACTION_HIDE_MARKUP:
-        visibility_action("markup", True)
+        visibility_action("markup", True, form.pdf_path, form.page_number)
+    elif form.action == ACTION_PIN_MARKUP:
+        pin_markup_action(True, form.pdf_path, form.page_number)
+    elif form.action == ACTION_UNPIN_MARKUP:
+        pin_markup_action(False, form.pdf_path, form.page_number)
     elif form.action == ACTION_RESET:
-        reset_current_review()
+        reset_current_review(form.pdf_path, form.page_number)
 
 except SystemExit:
     pass
