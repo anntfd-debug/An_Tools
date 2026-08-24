@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Bluebeam PDF Review V2.6 - MULTI-PAGE NATIVE REVIT MARKUP + BLUEBEAM GROUPS / SINGLE FILE / NO INSTALL
+Bluebeam PDF Review V2.8.4 - WORKSHARED-SAFE + COMPACT NATIVE GEOMETRY + AUTO REMOVE BASE LINK + BATCHED RESET / MULTI-PAGE / SINGLE FILE / NO INSTALL
 ======================================================================
 
 Đầu vào: một PDF Bluebeam có page content gốc + unflattened annotations.
@@ -14,9 +14,12 @@ Workflow:
 4. Map tọa độ PDF vào frame BASE đã dóng.
 5. Tạo native Revit DetailCurve/TextNote.
 6. Markup nào thuộc Bluebeam Group sẽ được gom thành Revit Detail Group (nested group được flatten vào group cha ngoài cùng).
-7. Ẩn BASE. Không tạo MARKUP PDF.
-8. Mỗi PDF page có state độc lập trong cùng Active View: có thể Load/Finish nhiều trang mà không Reset trang trước.
-9. Reset chỉ xóa BASE/markup/group của đúng PDF page đang chọn.
+7. Sau khi native markup được tạo và Auto Pin thành công, tool tự động DELETE BASE ImageInstance + ImageType để Remove PDF external link khỏi model.
+8. Frame dóng của BASE được lưu vào Page State, vì vậy Rebuild markup vẫn có thể chạy sau khi BASE link đã bị remove (nếu source PDF vẫn truy cập được).
+9. Mỗi PDF page có state độc lập trong cùng Active View: có thể Load/Finish nhiều trang mà không Reset trang trước.
+10. Reset chỉ xóa markup/group/state của đúng PDF page đang chọn; BASE nếu còn thì xóa, nếu đã auto-remove thì bỏ qua.
+11. V2.8.1 lưu MỖI View + PDF + Page vào một DataStorage riêng để giảm ownership conflict trong Workshared model.
+12. Các thao tác sửa/xóa state hoặc markup có preflight checkout; nếu element đang do user khác sở hữu, tool dừng đúng page đó trước khi thay đổi.
 
 Không cần PyMuPDF, pip hay PYTHONPATH. pypdf pure-Python được embedded trong script.
 
@@ -4212,10 +4215,13 @@ from pyrevit import script
 
 from Autodesk.Revit.DB import (
     Transaction,
+    TransactionGroup,
     XYZ,
     ViewType,
     ElementId,
     Line,
+    Ellipse,
+    HermiteSpline,
     ElementTransformUtils,
     ImageType,
     ImageTypeOptions,
@@ -4232,8 +4238,17 @@ from Autodesk.Revit.DB import (
     SubTransaction,
     Group,
     GroupType,
+    WorksharingUtils,
+    CheckoutStatus,
 )
 from Autodesk.Revit.Exceptions import OperationCanceledException
+from Autodesk.Revit.DB.ExtensibleStorage import (
+    DataStorage,
+    Schema,
+    SchemaBuilder,
+    Entity,
+    AccessLevel,
+)
 
 import System
 from System.Collections.Generic import List
@@ -4266,9 +4281,26 @@ except Exception:
 # CONSTANTS
 # ============================================================
 
-TOOL_VERSION = "2.6.2"
+TOOL_VERSION = "2.8.4"
 CONFIG_SECTION = "bluebeam_pdf_review_overlay_v2"
 CACHE_FOLDER_NAME = "PdfReviewCache"
+
+# V2.8: one persistent DataStorage per View + PDF + Page.
+# This avoids a single shared DataStorage becoming a worksharing bottleneck.
+PAGE_STATE_SCHEMA_GUID = "E5103F92-750B-49F1-9D0E-00C1A9CBD60C"
+PAGE_STATE_SCHEMA_NAME = "AnToolsBluebeamPdfReviewPageState"
+PAGE_STATE_FIELD_KEY = "ReviewUid"
+PAGE_STATE_FIELD_VIEW_UID = "ViewUniqueId"
+PAGE_STATE_FIELD_PDF_NAME = "PdfName"
+PAGE_STATE_FIELD_PAGE = "PageNumber"
+PAGE_STATE_FIELD_JSON = "StateJson"
+PAGE_STATE_FIELD_UPDATED = "UpdatedUtc"
+PAGE_STATE_PAYLOAD_SCHEMA = "bluebeam_pdf_review_page_v2_8"
+
+# V2.7 legacy monolithic storage is READ-ONLY in V2.8 and used only for migration.
+# Never change this GUID: existing projects may contain it.
+LEGACY_MODEL_STATE_SCHEMA_GUID = "4F7C8E1A-7D79-4A8C-A56E-2E0B7A9B1F27"
+LEGACY_MODEL_STATE_FIELD_NAME = "StateJson"
 DEFAULT_SCALE = "1.0"
 DEFAULT_PAGE = 1
 DEFAULT_PLACEMENT = "Center Active View"
@@ -4279,6 +4311,14 @@ DEFAULT_DRAW_ARROWS = True
 DEFAULT_CONVERT_TEXT_MARKS = False
 DEFAULT_PRESERVE_GROUPS = True
 DEFAULT_GROUP_NAMING = "Bluebeam Subject"
+
+# V2.8.3 - Workshared Reset batching.
+# Autodesk warns when a command needs to borrow a very large number of elements.
+# Keep the estimated affected-element budget well below 4000. A Revit Group can
+# represent many member elements, so batching is based on estimated affected
+# count rather than only the number of top-level saved IDs.
+RESET_BATCH_AFFECTED_LIMIT = 1200
+RESET_GROUP_COST_FALLBACK = 50
 
 GROUP_NAMING_SUBJECT = "Bluebeam Subject"
 GROUP_NAMING_SEQUENCE = "BB_Group_001..."
@@ -4305,9 +4345,16 @@ ANNOT_FLAG_NO_VIEW = 32
 NON_VISIBLE_FLAG_MASK = ANNOT_FLAG_INVISIBLE | ANNOT_FLAG_HIDDEN | ANNOT_FLAG_NO_VIEW
 
 GENERIC_MARKUP_RGB = (255, 0, 0)
-MAX_NATIVE_ELEMENTS = 12000
-MAX_POINTS_PER_PATH = 1000
-ELLIPSE_SEGMENTS = 40
+# V2.8.4: hard emergency ceiling only. Geometry is compacted proactively so
+# normal pages should remain far below this value.
+MAX_NATIVE_ELEMENTS = 24000
+MAX_POINTS_PER_PATH = 600
+ELLIPSE_FALLBACK_SEGMENTS = 16
+POLYLINE_SPLINE_THRESHOLD = 120
+CLOSED_SPLINE_THRESHOLD = 260
+MAX_SPLINE_CONTROL_POINTS = 250
+SIMPLIFY_PAPER_TOL_MM = 0.15
+INK_SIMPLIFY_PAPER_TOL_MM = 0.20
 
 GENERATED_IMAGE_SOURCE = ImageTypeSource.Link if ImageTypeSource is not None else None
 
@@ -4348,9 +4395,9 @@ def ask_yes_no(message, title=None):
 
 if pypdf is None:
     alert(
-        "Không load được pypdf embedded trong script V2.6.\n\n"
+        "Không load được pypdf embedded trong script V2.8.\n\n"
         "Không cần pip install và không cần folder lib.\n"
-        "Hãy dùng nguyên file script.py V2.6.\n\n"
+        "Hãy dùng nguyên file script.py V2.8.\n\n"
         "Chi tiết import:\n{}\n\nImport source:\n{}".format(
             _PYPDF_IMPORT_ERROR, _PYPDF_IMPORT_SOURCE
         ),
@@ -4378,7 +4425,7 @@ if active_view.IsTemplate:
     alert("Active View hiện tại là View Template.", exitscript=True)
 if active_view.ViewType in [ViewType.Schedule, ViewType.ThreeD]:
     alert(
-        "V2.6 tạo native DetailCurve/TextNote/Detail Group nên không chạy trong Schedule hoặc 3D View.\n"
+        "V2.8 tạo native DetailCurve/TextNote/Detail Group nên không chạy trong Schedule hoặc 3D View.\n"
         "Hãy mở Floor Plan / Ceiling Plan / Section / Elevation / Drafting View.",
         exitscript=True,
         icon=MessageBoxIcon.Warning,
@@ -4541,6 +4588,578 @@ def get_view_key(document, view):
 VIEW_KEY = get_view_key(doc, active_view)
 
 
+# Early state-key helpers are defined here because V2.7 restores model state
+# during module startup, before the legacy V2.6 helper section below.
+def normalize_pdf_path(pdf_path):
+    if not pdf_path:
+        return ""
+    try:
+        return os.path.normcase(os.path.abspath(str(pdf_path)))
+    except Exception:
+        return str(pdf_path)
+
+
+def make_page_state_key(pdf_path, page_number):
+    raw = "{}|PAGE:{}".format(normalize_pdf_path(pdf_path), int(page_number))
+    return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
+
+
+def _looks_like_legacy_single_state(value):
+    return isinstance(value, dict) and (
+        "base_instance_id" in value
+        or ("pdf_path" in value and "page" in value and "pages" not in value)
+    )
+
+
+# ============================================================
+# V2.8 - WORKSHARED-SAFE PERSISTENT STATE INSIDE RVT
+# ============================================================
+
+
+class WorksharingBusyError(Exception):
+    pass
+
+
+def _is_workshared_document():
+    try:
+        return bool(doc.IsWorkshared)
+    except Exception:
+        return False
+
+
+def _owner_text(elem):
+    if elem is None or not _is_workshared_document():
+        return ""
+    try:
+        info = WorksharingUtils.GetWorksharingTooltipInfo(doc, elem.Id)
+        owner = str(info.Owner or "").strip()
+        if owner:
+            return owner
+    except Exception:
+        pass
+    return ""
+
+
+def _checkout_elements_for_edit(elements, purpose):
+    """Worksharing-safe ownership preflight WITHOUT forcing CheckoutElements().
+
+    V2.8.2 change:
+    ----------------
+    The previous implementation called WorksharingUtils.CheckoutElements()
+    before every edit. On some file-based / server / cloud central models this
+    can throw CentralModelException / RevitServerInternalException even when the
+    elements are otherwise editable by normal Revit automatic borrowing.
+
+    Revit normally borrows an unowned element automatically when the transaction
+    actually modifies it. Therefore V2.8.2:
+      1. Uses cached GetCheckoutStatus() only to block elements that are clearly
+         OwnedByOtherUser.
+      2. Skips an explicit central CheckoutElements() call.
+      3. Lets the real edit transaction perform automatic borrowing.
+      4. Keeps destructive page actions atomic so a failed borrow rolls the
+         transaction back instead of partially deleting markup.
+
+    GetCheckoutStatus() is only an advisory cached preflight; the transaction is
+    still the authoritative edit attempt.
+    """
+    if not _is_workshared_document():
+        return
+
+    unique = []
+    seen = set()
+    for elem in elements or []:
+        if elem is None:
+            continue
+        try:
+            if not elem.IsValidObject:
+                continue
+        except Exception:
+            pass
+        iv = get_id_int(elem.Id)
+        if iv < 0 or iv in seen:
+            continue
+        seen.add(iv)
+        unique.append(elem)
+
+    if not unique:
+        return
+
+    blocked = []
+    status_errors = []
+
+    for elem in unique:
+        iv = get_id_int(elem.Id)
+        try:
+            status = WorksharingUtils.GetCheckoutStatus(doc, elem.Id)
+        except Exception as ex:
+            # Cached status lookup failing should not contact/modify central and
+            # should not by itself prevent the transaction from trying.
+            status_errors.append((iv, str(ex)))
+            continue
+
+        if status == CheckoutStatus.OwnedByOtherUser:
+            owner = _owner_text(elem)
+            blocked.append((iv, owner))
+
+    if blocked:
+        lines = []
+        for iv, owner in blocked[:15]:
+            if owner:
+                lines.append("ID {} — owner: {}".format(iv, owner))
+            else:
+                lines.append("ID {} — owned by another user".format(iv))
+        if len(blocked) > 15:
+            lines.append("... +{} more".format(len(blocked) - 15))
+        raise WorksharingBusyError(
+            "Không thể thực hiện '{}' vì một số element đang do user khác sở hữu.\n\n{}\n\n"
+            "Hãy Sync/Reload Latest nếu cần, hoặc yêu cầu owner Relinquish rồi chạy lại.\n\n"
+            "V2.8.3 không gọi CheckoutElements() trực tiếp; các element NotOwned sẽ "
+            "được Revit tự động borrow khi Transaction thực sự chỉnh sửa."
+            .format(purpose, "\n".join(lines))
+        )
+
+    # No explicit CheckoutElements() here.
+    # Revit will automatically borrow NotOwned elements when the edit transaction
+    # changes them. Any central/ownership failure will occur inside that
+    # transaction, which callers must rollback atomically.
+    return
+
+
+def _page_schema_guid():
+    return System.Guid(PAGE_STATE_SCHEMA_GUID)
+
+
+def _lookup_page_state_schema():
+    try:
+        return Schema.Lookup(_page_schema_guid())
+    except Exception:
+        return None
+
+
+def _ensure_page_state_schema():
+    schema = _lookup_page_state_schema()
+    if schema is not None:
+        return schema
+
+    builder = SchemaBuilder(_page_schema_guid())
+    builder.SetSchemaName(PAGE_STATE_SCHEMA_NAME)
+    builder.SetDocumentation(
+        "An-Tools Bluebeam PDF Review V2.8. One DataStorage element stores one "
+        "View + PDF + Page state to reduce worksharing ownership contention."
+    )
+    builder.SetReadAccessLevel(AccessLevel.Public)
+    builder.SetWriteAccessLevel(AccessLevel.Public)
+    builder.AddSimpleField(PAGE_STATE_FIELD_KEY, System.String)
+    builder.AddSimpleField(PAGE_STATE_FIELD_VIEW_UID, System.String)
+    builder.AddSimpleField(PAGE_STATE_FIELD_PDF_NAME, System.String)
+    builder.AddSimpleField(PAGE_STATE_FIELD_PAGE, System.Int32)
+    builder.AddSimpleField(PAGE_STATE_FIELD_JSON, System.String)
+    builder.AddSimpleField(PAGE_STATE_FIELD_UPDATED, System.String)
+    return builder.Finish()
+
+
+def _legacy_schema():
+    try:
+        return Schema.Lookup(System.Guid(LEGACY_MODEL_STATE_SCHEMA_GUID))
+    except Exception:
+        return None
+
+
+def _iter_data_storages():
+    try:
+        return list(FilteredElementCollector(doc).OfClass(DataStorage))
+    except Exception:
+        return []
+
+
+def _entity_get_string(entity, schema, field_name, default=""):
+    try:
+        field = schema.GetField(field_name)
+        if field is None:
+            return default
+        value = entity.Get[System.String](field)
+        return str(value) if value is not None else default
+    except Exception:
+        return default
+
+
+def _entity_get_int(entity, schema, field_name, default=0):
+    try:
+        field = schema.GetField(field_name)
+        if field is None:
+            return default
+        return int(entity.Get[System.Int32](field))
+    except Exception:
+        return default
+
+
+def _new_review_uid():
+    try:
+        return str(System.Guid.NewGuid().ToString())
+    except Exception:
+        return hashlib.sha1(os.urandom(32)).hexdigest()
+
+
+def _state_review_uid(state):
+    if not isinstance(state, dict):
+        return ""
+    value = str(state.get("review_uid", "") or "").strip()
+    if not value:
+        value = _new_review_uid()
+        state["review_uid"] = value
+    return value
+
+
+def _state_storage_element(state):
+    if not isinstance(state, dict):
+        return None
+    value = state.get("page_storage_id")
+    elem = get_element_by_saved_id(doc, value)
+    if elem is not None and isinstance(elem, DataStorage):
+        schema = _lookup_page_state_schema()
+        if schema is not None:
+            try:
+                entity = elem.GetEntity(schema)
+                if entity is not None and entity.IsValid():
+                    wanted = str(state.get("review_uid", "") or "")
+                    actual = _entity_get_string(entity, schema, PAGE_STATE_FIELD_KEY, "")
+                    if not wanted or not actual or wanted == actual:
+                        return elem
+            except Exception:
+                pass
+
+    wanted_uid = str(state.get("review_uid", "") or "")
+    if not wanted_uid:
+        return None
+    schema = _lookup_page_state_schema()
+    if schema is None:
+        return None
+    for storage in _iter_data_storages():
+        try:
+            entity = storage.GetEntity(schema)
+            if entity is None or not entity.IsValid():
+                continue
+            if _entity_get_string(entity, schema, PAGE_STATE_FIELD_KEY, "") == wanted_uid:
+                state["page_storage_id"] = get_id_int(storage.Id)
+                return storage
+        except Exception:
+            continue
+    return None
+
+
+def _serialize_page_state(state):
+    clean = dict(state or {})
+    clean["version"] = TOOL_VERSION
+    clean["_persistent_schema"] = PAGE_STATE_PAYLOAD_SCHEMA
+    return json.dumps(clean, ensure_ascii=False)
+
+
+def _write_page_state_to_model(state):
+    """Create/update exactly one DataStorage for exactly one PDF page."""
+    if not isinstance(state, dict):
+        raise Exception("Review state không hợp lệ.")
+    try:
+        if doc.IsReadOnly:
+            raise Exception("Document đang Read-Only; không thể lưu persistent review state.")
+    except AttributeError:
+        pass
+
+    review_uid = _state_review_uid(state)
+    storage = _state_storage_element(state)
+
+    # Existing page state is an independent workshared element. Borrow only it.
+    if storage is not None:
+        _checkout_elements_for_edit([storage], "lưu state PDF page {}".format(state.get("page", 1)))
+
+    t = None
+    started_here = False
+    try:
+        try:
+            already_modifiable = bool(doc.IsModifiable)
+        except Exception:
+            already_modifiable = False
+        if not already_modifiable:
+            t = Transaction(doc, "AnTools - Save Bluebeam Page State p{}".format(state.get("page", 1)))
+            t.Start()
+            started_here = True
+
+        schema = _ensure_page_state_schema()
+        if storage is None:
+            storage = DataStorage.Create(doc)
+            state["page_storage_id"] = get_id_int(storage.Id)
+            try:
+                storage.Name = "AnTools BB Review | p{:03d} | {}".format(
+                    int(state.get("page", 1)), safe_filename(os.path.basename(state.get("pdf_path", "PDF")))[:80]
+                )
+            except Exception:
+                pass
+
+        entity = Entity(schema)
+        entity.Set[System.String](schema.GetField(PAGE_STATE_FIELD_KEY), str(review_uid))
+        entity.Set[System.String](schema.GetField(PAGE_STATE_FIELD_VIEW_UID), str(state.get("view_unique_id", active_view.UniqueId)))
+        entity.Set[System.String](schema.GetField(PAGE_STATE_FIELD_PDF_NAME), str(os.path.basename(state.get("pdf_path", ""))))
+        entity.Set[System.Int32](schema.GetField(PAGE_STATE_FIELD_PAGE), System.Int32(int(state.get("page", 1))))
+        entity.Set[System.String](schema.GetField(PAGE_STATE_FIELD_UPDATED), System.DateTime.UtcNow.ToString("o"))
+        entity.Set[System.String](schema.GetField(PAGE_STATE_FIELD_JSON), _serialize_page_state(state))
+        storage.SetEntity(entity)
+
+        if started_here and t is not None:
+            t.Commit()
+        return storage
+    except Exception:
+        try:
+            if started_here and t is not None and t.HasStarted():
+                t.RollBack()
+        except Exception:
+            pass
+        raise
+
+
+def _delete_page_state_storage(state):
+    storage = _state_storage_element(state)
+    if storage is None:
+        return
+    _checkout_elements_for_edit([storage], "xóa state PDF page {}".format(state.get("page", 1)))
+    t = None
+    started_here = False
+    try:
+        try:
+            already_modifiable = bool(doc.IsModifiable)
+        except Exception:
+            already_modifiable = False
+        if not already_modifiable:
+            t = Transaction(doc, "AnTools - Delete Bluebeam Page State p{}".format(state.get("page", 1)))
+            t.Start()
+            started_here = True
+        doc.Delete(storage.Id)
+        if started_here and t is not None:
+            t.Commit()
+    except Exception:
+        try:
+            if started_here and t is not None and t.HasStarted():
+                t.RollBack()
+        except Exception:
+            pass
+        raise
+
+
+def _load_v28_page_bucket_for_active_view():
+    bucket = {"_schema": "multi_page_v2_6", "pages": {}}
+    schema = _lookup_page_state_schema()
+    if schema is None:
+        return bucket
+    view_uid = str(active_view.UniqueId)
+
+    # Duplicate review_uid is possible only after unusual concurrent migration.
+    # Keep the entity with the lexically latest ISO UTC timestamp and report it.
+    by_uid = {}
+    duplicates = []
+    for storage in _iter_data_storages():
+        try:
+            entity = storage.GetEntity(schema)
+            if entity is None or not entity.IsValid():
+                continue
+            if _entity_get_string(entity, schema, PAGE_STATE_FIELD_VIEW_UID, "") != view_uid:
+                continue
+            raw = _entity_get_string(entity, schema, PAGE_STATE_FIELD_JSON, "")
+            if not raw:
+                continue
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                continue
+            state["page_storage_id"] = get_id_int(storage.Id)
+            state.setdefault("review_uid", _entity_get_string(entity, schema, PAGE_STATE_FIELD_KEY, ""))
+            state.setdefault("view_unique_id", view_uid)
+            state.setdefault("page", _entity_get_int(entity, schema, PAGE_STATE_FIELD_PAGE, 1))
+            uid = str(state.get("review_uid", "") or "")
+            updated = _entity_get_string(entity, schema, PAGE_STATE_FIELD_UPDATED, "")
+            prev = by_uid.get(uid)
+            if prev is None or updated >= prev[0]:
+                if prev is not None:
+                    duplicates.append(get_id_int(prev[1].Id))
+                by_uid[uid] = (updated, storage, state)
+            else:
+                duplicates.append(get_id_int(storage.Id))
+        except Exception:
+            continue
+
+    for _, storage, state in by_uid.values():
+        try:
+            key = make_page_state_key(state.get("pdf_path", ""), int(state.get("page", 1)))
+            bucket["pages"][key] = state
+        except Exception:
+            continue
+
+    if duplicates:
+        try:
+            print("[Bluebeam V2.8] Duplicate page-state DataStorage IDs ignored: {}".format(duplicates))
+        except Exception:
+            pass
+    return bucket
+
+
+def _read_legacy_v27_bucket():
+    schema = _legacy_schema()
+    if schema is None:
+        return None
+    view_uid = str(active_view.UniqueId)
+    for storage in _iter_data_storages():
+        try:
+            entity = storage.GetEntity(schema)
+            if entity is None or not entity.IsValid():
+                continue
+            field = schema.GetField(LEGACY_MODEL_STATE_FIELD_NAME)
+            raw = entity.Get[System.String](field)
+            payload = json.loads(str(raw)) if raw else {}
+            views = payload.get("views", {}) if isinstance(payload, dict) else {}
+            bucket = views.get(view_uid)
+            if isinstance(bucket, dict):
+                return bucket
+        except Exception:
+            continue
+    return None
+
+
+def _iter_states_from_bucket(bucket):
+    if isinstance(bucket, dict) and bucket.get("_schema") == "multi_page_v2_6":
+        pages = bucket.get("pages", {})
+        if isinstance(pages, dict):
+            return [v for v in pages.values() if isinstance(v, dict)]
+    if _looks_like_legacy_single_state(bucket):
+        return [bucket]
+    return []
+
+
+def _recover_bucket_from_old_config():
+    recovered = {"_schema": "multi_page_v2_6", "pages": {}}
+    current_view_id = get_id_int(active_view.Id)
+    current_view_uid = str(active_view.UniqueId)
+    current_view_name = str(active_view.Name)
+    current_doc_title = str(doc.Title)
+
+    for raw in list(review_states.values()):
+        for state in _iter_states_from_bucket(raw):
+            try:
+                same_view = False
+                saved_uid = str(state.get("view_unique_id", "") or "")
+                if saved_uid and saved_uid == current_view_uid:
+                    same_view = True
+                elif int(state.get("view_id", -999999)) == int(current_view_id):
+                    saved_doc = str(state.get("doc_title", "") or "")
+                    saved_name = str(state.get("view_name", "") or "")
+                    if (not saved_doc or saved_doc == current_doc_title) and (not saved_name or saved_name == current_view_name):
+                        same_view = True
+                if not same_view:
+                    continue
+                state.setdefault("review_uid", _new_review_uid())
+                pdf_path = state.get("pdf_path", "")
+                page = int(state.get("page", 1))
+                recovered["pages"][make_page_state_key(pdf_path, page)] = state
+            except Exception:
+                continue
+    return recovered if recovered["pages"] else None
+
+
+def _migrate_bucket_to_page_storages(bucket, source_label):
+    migrated = 0
+    failed = []
+    for state in _iter_states_from_bucket(bucket):
+        try:
+            state.setdefault("review_uid", _new_review_uid())
+            state["version"] = TOOL_VERSION
+            state["view_unique_id"] = str(active_view.UniqueId)
+            _write_page_state_to_model(state)
+            migrated += 1
+        except Exception as ex:
+            failed.append("Page {}: {}".format(state.get("page", "?"), str(ex)))
+    if migrated:
+        try:
+            print("[Bluebeam V2.8] Migrated {} page state(s) from {}.".format(migrated, source_label))
+        except Exception:
+            pass
+    if failed:
+        try:
+            print("[Bluebeam V2.8] Migration failures: {}".format(" | ".join(failed)))
+        except Exception:
+            pass
+    return migrated
+
+
+def _merge_persistent_state_into_runtime():
+    # 1) New V2.8 per-page DataStorage is authoritative.
+    page_bucket = _load_v28_page_bucket_for_active_view()
+    if page_bucket.get("pages"):
+        review_states[VIEW_KEY] = page_bucket
+        return "RVT_PAGE"
+
+    # 2) Read-only migration from V2.7 monolithic DataStorage.
+    legacy_bucket = _read_legacy_v27_bucket()
+    if isinstance(legacy_bucket, dict) and _iter_states_from_bucket(legacy_bucket):
+        review_states[VIEW_KEY] = legacy_bucket
+        _migrate_bucket_to_page_storages(legacy_bucket, "V2.7 RVT state")
+        review_states[VIEW_KEY] = _load_v28_page_bucket_for_active_view()
+        return "RVT_V27_MIGRATED"
+
+    # 3) Current/old pyRevit config fallback.
+    existing = review_states.get(VIEW_KEY)
+    if isinstance(existing, dict):
+        if _looks_like_legacy_single_state(existing):
+            migrated_bucket = {"_schema": "multi_page_v2_6", "pages": {}}
+            existing.setdefault("review_uid", _new_review_uid())
+            migrated_bucket["pages"][make_page_state_key(existing.get("pdf_path", ""), int(existing.get("page", 1)))] = existing
+            review_states[VIEW_KEY] = migrated_bucket
+            existing = migrated_bucket
+        if _iter_states_from_bucket(existing):
+            _migrate_bucket_to_page_storages(existing, "pyRevit config")
+            page_bucket = _load_v28_page_bucket_for_active_view()
+            if page_bucket.get("pages"):
+                review_states[VIEW_KEY] = page_bucket
+            return "CONFIG_MIGRATED"
+
+    recovered = _recover_bucket_from_old_config()
+    if recovered is not None:
+        review_states[VIEW_KEY] = recovered
+        _migrate_bucket_to_page_storages(recovered, "recovered V2.6 config")
+        page_bucket = _load_v28_page_bucket_for_active_view()
+        if page_bucket.get("pages"):
+            review_states[VIEW_KEY] = page_bucket
+        return "CONFIG_RECOVERED"
+    return "NONE"
+
+
+_STATE_BOOT_SOURCE = _merge_persistent_state_into_runtime()
+
+
+def _recover_last_selection_from_bucket():
+    global last_pdf_path, last_page
+    bucket = review_states.get(VIEW_KEY)
+    states = _iter_states_from_bucket(bucket)
+    if not states:
+        return
+    try:
+        wanted = make_page_state_key(last_pdf_path, last_page) if last_pdf_path else None
+        if wanted and wanted in bucket.get("pages", {}):
+            return
+    except Exception:
+        pass
+
+    def sort_key(state):
+        try:
+            return (normalize_pdf_path(state.get("pdf_path", "")), int(state.get("page", 1)))
+        except Exception:
+            return ("", 1)
+
+    state = sorted(states, key=sort_key)[0]
+    last_pdf_path = state.get("pdf_path", "") or last_pdf_path
+    try:
+        last_page = int(state.get("page", 1))
+    except Exception:
+        last_page = 1
+
+
+_recover_last_selection_from_bucket()
+
+
 def save_global_config():
     _cfg_set("pdf_path", last_pdf_path if last_pdf_path else "")
     _cfg_set("scale", last_scale)
@@ -4558,6 +5177,8 @@ def save_global_config():
 
 
 def _persist_review_states():
+    # V2.8: config is only a local cache. Model state is persisted per page by
+    # save_review_state/remove_review_state, never by rewriting a global payload.
     _cfg_set("review_states", json.dumps(review_states, ensure_ascii=False))
     script.save_config()
 
@@ -4620,6 +5241,14 @@ def get_view_state_bucket(create=False):
 def save_review_state(state):
     if not isinstance(state, dict):
         raise Exception("Review state không hợp lệ.")
+    state.setdefault("review_uid", _new_review_uid())
+    state["version"] = TOOL_VERSION
+    state["view_unique_id"] = str(active_view.UniqueId)
+
+    # Persist the page element FIRST. If this fails because another user owns
+    # this page state, do not silently update only the local pyRevit cache.
+    _write_page_state_to_model(state)
+
     pdf_path = state.get("pdf_path", "")
     page_number = int(state.get("page", 1))
     bucket = get_view_state_bucket(create=True)
@@ -4633,6 +5262,29 @@ def remove_review_state(pdf_path, page_number):
         return
     key = make_page_state_key(pdf_path, page_number)
     pages = bucket.get("pages", {})
+    state = pages.get(key)
+
+    # Fallback for a different mapped-drive/local PDF path in another user's
+    # workshared session: same page + same PDF filename, only when unambiguous.
+    if not isinstance(state, dict):
+        wanted_name = os.path.basename(str(pdf_path or "")).lower()
+        candidates = []
+        for candidate in pages.values():
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                if int(candidate.get("page", 1)) != int(page_number):
+                    continue
+            except Exception:
+                continue
+            if os.path.basename(str(candidate.get("pdf_path", ""))).lower() == wanted_name:
+                candidates.append(candidate)
+        if len(candidates) == 1:
+            state = candidates[0]
+            key = make_page_state_key(state.get("pdf_path", ""), int(state.get("page", 1)))
+
+    if isinstance(state, dict):
+        _delete_page_state_storage(state)
     if key in pages:
         del pages[key]
     if not pages:
@@ -4653,12 +5305,30 @@ def current_state(pdf_path=None, page_number=None):
     bucket = get_view_state_bucket(create=False)
     if not bucket:
         return None
+    pages = bucket.get("pages", {})
     try:
-        state = bucket.get("pages", {}).get(make_page_state_key(pdf_path, page_number))
+        state = pages.get(make_page_state_key(pdf_path, page_number))
     except Exception:
         state = None
     if isinstance(state, dict):
         return state
+
+    # Workshared users can map the same source folder differently. Allow a
+    # filename+page fallback only when there is exactly one candidate.
+    wanted_name = os.path.basename(str(pdf_path or "")).lower()
+    candidates = []
+    for candidate in pages.values():
+        if not isinstance(candidate, dict):
+            continue
+        try:
+            if int(candidate.get("page", 1)) != int(page_number):
+                continue
+        except Exception:
+            continue
+        if os.path.basename(str(candidate.get("pdf_path", ""))).lower() == wanted_name:
+            candidates.append(candidate)
+    if len(candidates) == 1:
+        return candidates[0]
     return None
 
 
@@ -4702,6 +5372,18 @@ def get_pdf_fingerprint(pdf_path):
         os.path.normcase(os.path.abspath(pdf_path)), int(st.st_size), mtime
     )
     return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
+
+
+def get_pdf_content_hash(pdf_path):
+    """Path-independent SHA1 used by V2.8 across workshared users/mapped drives."""
+    h = hashlib.sha1()
+    with open(pdf_path, "rb") as stream:
+        while True:
+            block = stream.read(4 * 1024 * 1024)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
 
 
 def open_reader_from_stream(stream):
@@ -5275,6 +5957,70 @@ def image_frame(image_instance):
     }
 
 
+def _xyz_to_state(value):
+    if value is None:
+        return None
+    return [float(value.X), float(value.Y), float(value.Z)]
+
+
+def _xyz_from_state(value):
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    try:
+        return XYZ(float(value[0]), float(value[1]), float(value[2]))
+    except Exception:
+        return None
+
+
+def serialize_alignment_frame(frame):
+    if not isinstance(frame, dict):
+        return None
+    result = {
+        "center": _xyz_to_state(frame.get("center")),
+        "bl": _xyz_to_state(frame.get("bl")),
+        "br": _xyz_to_state(frame.get("br")),
+        "tl": _xyz_to_state(frame.get("tl")),
+        "tr": _xyz_to_state(frame.get("tr")),
+        "width": float(frame.get("width", 0.0) or 0.0),
+        "height": float(frame.get("height", 0.0) or 0.0),
+    }
+    if result["bl"] is None or result["br"] is None or result["tl"] is None:
+        return None
+    return result
+
+
+def deserialize_alignment_frame(data):
+    if not isinstance(data, dict):
+        return None
+    frame = {
+        "center": _xyz_from_state(data.get("center")),
+        "bl": _xyz_from_state(data.get("bl")),
+        "br": _xyz_from_state(data.get("br")),
+        "tl": _xyz_from_state(data.get("tl")),
+        "tr": _xyz_from_state(data.get("tr")),
+        "width": float(data.get("width", 0.0) or 0.0),
+        "height": float(data.get("height", 0.0) or 0.0),
+    }
+    if frame["bl"] is None or frame["br"] is None or frame["tl"] is None:
+        return None
+    # center/tr are convenience values only. Reconstruct them when an older
+    # state did not store them.
+    try:
+        if frame["center"] is None:
+            frame["center"] = frame["bl"] + (frame["br"] - frame["bl"]).Multiply(0.5) + (frame["tl"] - frame["bl"]).Multiply(0.5)
+        if frame["tr"] is None:
+            frame["tr"] = frame["br"] + (frame["tl"] - frame["bl"])
+    except Exception:
+        pass
+    return frame
+
+
+def saved_alignment_frame(state):
+    if not isinstance(state, dict):
+        return None
+    return deserialize_alignment_frame(state.get("alignment_frame"))
+
+
 def choose_placement_point(placement_mode):
     if placement_mode == PLACEMENT_PICK:
         try:
@@ -5498,18 +6244,27 @@ def short_curve_tolerance():
         return 1.0e-5
 
 
-def create_detail_segment(p1, p2, style, created_ids):
-    if p1 is None or p2 is None:
-        return False
-    if xyz_distance(p1, p2) <= short_curve_tolerance() * 1.05:
-        return False
+def paper_mm_to_model_ft(mm_value):
+    try:
+        scale = max(float(active_view.Scale), 1.0)
+    except Exception:
+        scale = 1.0
+    return max(float(mm_value) / 304.8 * scale, short_curve_tolerance() * 2.0)
+
+
+def _reserve_native_element(created_ids):
     if len(created_ids) >= MAX_NATIVE_ELEMENTS:
         raise Exception(
-            "Vượt giới hạn {} native elements. Tool rollback để tránh làm Revit quá nặng.".format(
-                MAX_NATIVE_ELEMENTS
-            )
+            "Vượt hard safety limit {} native elements ngay cả sau khi compact geometry. "
+            "Tool rollback để tránh làm Revit quá nặng.".format(MAX_NATIVE_ELEMENTS)
         )
-    curve = doc.Create.NewDetailCurve(active_view, Line.CreateBound(p1, p2))
+
+
+def create_detail_curve_geometry(geometry_curve, style, created_ids):
+    if geometry_curve is None:
+        return False
+    _reserve_native_element(created_ids)
+    curve = doc.Create.NewDetailCurve(active_view, geometry_curve)
     if curve is None:
         return False
     try:
@@ -5520,17 +6275,161 @@ def create_detail_segment(p1, p2, style, created_ids):
     return True
 
 
+def create_detail_segment(p1, p2, style, created_ids):
+    if p1 is None or p2 is None:
+        return False
+    if xyz_distance(p1, p2) <= short_curve_tolerance() * 1.05:
+        return False
+    return create_detail_curve_geometry(Line.CreateBound(p1, p2), style, created_ids)
+
+
+def _point_segment_distance(point, start, end):
+    vec = end - start
+    denom = vec.DotProduct(vec)
+    if denom <= 1.0e-18:
+        return xyz_distance(point, start)
+    t = (point - start).DotProduct(vec) / denom
+    t = clamp(t, 0.0, 1.0)
+    closest = start + vec.Multiply(t)
+    return xyz_distance(point, closest)
+
+
+def _remove_near_duplicate_points(points, tolerance):
+    result = []
+    for point in points or []:
+        if point is None:
+            continue
+        if not result or xyz_distance(point, result[-1]) > tolerance:
+            result.append(point)
+    return result
+
+
+def _douglas_peucker(points, tolerance):
+    if len(points) <= 2:
+        return list(points)
+    first = points[0]
+    last = points[-1]
+    max_distance = -1.0
+    max_index = -1
+    for index in range(1, len(points) - 1):
+        distance = _point_segment_distance(points[index], first, last)
+        if distance > max_distance:
+            max_distance = distance
+            max_index = index
+    if max_distance > tolerance and max_index > 0:
+        left = _douglas_peucker(points[:max_index + 1], tolerance)
+        right = _douglas_peucker(points[max_index:], tolerance)
+        return left[:-1] + right
+    return [first, last]
+
+
+def _remove_near_collinear(points, tolerance, closed=False):
+    if len(points) <= 2:
+        return list(points)
+    work = list(points)
+    result = []
+    count = len(work)
+    for index, point in enumerate(work):
+        if not closed and (index == 0 or index == count - 1):
+            result.append(point)
+            continue
+        prev_point = work[(index - 1) % count]
+        next_point = work[(index + 1) % count]
+        if _point_segment_distance(point, prev_point, next_point) > tolerance:
+            result.append(point)
+    if not closed and len(result) < 2:
+        return [work[0], work[-1]]
+    if closed and len(result) < 3:
+        return work
+    return result
+
+
+def simplify_revit_points(points, tolerance, closed=False):
+    cleaned = _remove_near_duplicate_points(points, tolerance * 0.25)
+    if closed and len(cleaned) > 2 and xyz_distance(cleaned[0], cleaned[-1]) <= tolerance * 0.25:
+        cleaned = cleaned[:-1]
+    cleaned = _remove_near_collinear(cleaned, tolerance, closed)
+    if not closed and len(cleaned) > 2:
+        cleaned = _douglas_peucker(cleaned, tolerance)
+    return cleaned
+
+
+def _limit_revit_points(points, max_points=MAX_SPLINE_CONTROL_POINTS):
+    if len(points) <= max_points:
+        return list(points)
+    if max_points < 2:
+        return [points[0]]
+    result = []
+    last_index = len(points) - 1
+    for i in range(max_points):
+        index = int(round((float(i) / float(max_points - 1)) * last_index))
+        point = points[index]
+        if not result or xyz_distance(point, result[-1]) > short_curve_tolerance():
+            result.append(point)
+    return result
+
+
+def create_detail_spline_revit(revit_points, style, created_ids, periodic=False):
+    points = list(revit_points or [])
+    if periodic and len(points) > 2 and xyz_distance(points[0], points[-1]) <= short_curve_tolerance() * 2.0:
+        points = points[:-1]
+    points = _limit_revit_points(points)
+    if len(points) < 2:
+        return False
+    if len(points) == 2:
+        return create_detail_segment(points[0], points[1], style, created_ids)
+    try:
+        net_points = List[XYZ]()
+        for point in points:
+            net_points.Add(point)
+        spline = HermiteSpline.Create(net_points, bool(periodic))
+        return create_detail_curve_geometry(spline, style, created_ids)
+    except Exception:
+        return False
+
+
 def create_polyline_pdf(points, geom, frame, style, created_ids, closed=False):
     points = decimate_points(points)
     if len(points) < 2:
         return 0
     revit_points = pdf_points_to_revit(points, geom, frame)
+    tolerance = paper_mm_to_model_ft(SIMPLIFY_PAPER_TOL_MM)
+    revit_points = simplify_revit_points(revit_points, tolerance, closed)
+    if len(revit_points) < 2:
+        return 0
+
+    # Long freeform paths are represented by one native DetailNurbSpline rather
+    # than hundreds of DetailLines. For closed paths we keep ordinary segments
+    # unless the path is exceptionally dense.
+    threshold = CLOSED_SPLINE_THRESHOLD if closed else POLYLINE_SPLINE_THRESHOLD
+    if len(revit_points) >= threshold:
+        if create_detail_spline_revit(revit_points, style, created_ids, periodic=closed):
+            return 1
+
     count = 0
     for i in range(len(revit_points) - 1):
         if create_detail_segment(revit_points[i], revit_points[i + 1], style, created_ids):
             count += 1
     if closed and len(revit_points) > 2:
         if create_detail_segment(revit_points[-1], revit_points[0], style, created_ids):
+            count += 1
+    return count
+
+
+def create_ink_path_pdf(points, geom, frame, style, created_ids):
+    if len(points) < 2:
+        return 0
+    revit_points = pdf_points_to_revit(decimate_points(points), geom, frame)
+    tolerance = paper_mm_to_model_ft(INK_SIMPLIFY_PAPER_TOL_MM)
+    revit_points = simplify_revit_points(revit_points, tolerance, False)
+    # Ink is intrinsically freehand. A single HermiteSpline gives a much closer
+    # Revit representation and avoids creating one DetailLine per sampled point.
+    if len(revit_points) >= 3:
+        if create_detail_spline_revit(revit_points, style, created_ids, periodic=False):
+            return 1
+    count = 0
+    for i in range(len(revit_points) - 1):
+        if create_detail_segment(revit_points[i], revit_points[i + 1], style, created_ids):
             count += 1
     return count
 
@@ -5549,10 +6448,46 @@ def create_ellipse_pdf(rect, geom, frame, style, created_ids):
     ry = (y1 - y0) * 0.5
     if rx <= 0 or ry <= 0:
         return 0
+
+    # V2.8.3 approximated every circle/ellipse using 40 DetailLines. V2.8.4
+    # creates two bounded native ellipse arcs instead (NewDetailCurve requires
+    # bound curves, while a full 2*pi Ellipse.CreateCurve becomes unbounded).
+    try:
+        center = pdf_xy_to_revit(cx, cy, geom, frame)
+        x_point = pdf_xy_to_revit(cx + rx, cy, geom, frame)
+        y_point = pdf_xy_to_revit(cx, cy + ry, geom, frame)
+        x_vec = x_point - center
+        y_vec = y_point - center
+        x_radius = x_vec.GetLength()
+        y_radius = y_vec.GetLength()
+        x_axis = normalized(x_vec)
+        y_axis = normalized(y_vec)
+        if (x_axis is not None and y_axis is not None and
+                x_radius > short_curve_tolerance() and y_radius > short_curve_tolerance()):
+            # Numerical protection: the mapped BASE axes should be orthogonal.
+            dot = abs(x_axis.DotProduct(y_axis))
+            if dot < 1.0e-5:
+                count = 0
+                first_half = Ellipse.CreateCurve(
+                    center, x_radius, y_radius, x_axis, y_axis, 0.0, math.pi
+                )
+                second_half = Ellipse.CreateCurve(
+                    center, x_radius, y_radius, x_axis, y_axis, math.pi, 2.0 * math.pi
+                )
+                if create_detail_curve_geometry(first_half, style, created_ids):
+                    count += 1
+                if create_detail_curve_geometry(second_half, style, created_ids):
+                    count += 1
+                if count:
+                    return count
+    except Exception:
+        pass
+
+    # Conservative fallback if a project/API version rejects native ellipse arcs.
     points = []
-    for i in range(ELLIPSE_SEGMENTS):
-        a = (2.0 * math.pi * float(i)) / float(ELLIPSE_SEGMENTS)
-        points.append((cx + rx * math.cos(a), cy + ry * math.sin(a)))
+    for i in range(ELLIPSE_FALLBACK_SEGMENTS):
+        angle = (2.0 * math.pi * float(i)) / float(ELLIPSE_FALLBACK_SEGMENTS)
+        points.append((cx + rx * math.cos(angle), cy + ry * math.sin(angle)))
     return create_polyline_pdf(points, geom, frame, style, created_ids, True)
 
 
@@ -5729,7 +6664,7 @@ def convert_one_annotation(annot, geom, frame, style, options, created_ids, text
         try:
             for path in ink_list:
                 points = pair_points(pdf_number_list(path))
-                create_polyline_pdf(points, geom, frame, style, created_ids, False)
+                create_ink_path_pdf(points, geom, frame, style, created_ids)
         except Exception:
             pass
 
@@ -5915,8 +6850,10 @@ def create_revit_detail_groups(group_info, annotation_created_ids, options):
     return result
 
 
-def convert_pdf_markups_to_native(pdf_path, page_number, base_instance, options):
-    frame = image_frame(base_instance)
+def convert_pdf_markups_to_native(pdf_path, page_number, base_instance, options, frame_override=None):
+    frame = frame_override if frame_override is not None else image_frame(base_instance)
+    if frame is None:
+        raise Exception("Không có alignment frame để map PDF markup vào Revit.")
     line_weight = parse_line_weight(options.get("line_weight", DEFAULT_LINE_WEIGHT))
     preserve_colors = bool(options.get("preserve_colors", True))
     created_ids = []
@@ -6211,6 +7148,11 @@ def visibility_action(which, hidden, pdf_path, page_number):
             elements = [legacy]
         if not elements:
             raise Exception("Không tìm thấy Revit markup elements.")
+    # Hide/Unhide is a view-state edit in a workshared model. Borrow the active
+    # view explicitly so failure is reported before the transaction.
+    _checkout_elements_for_edit([active_view], "{} {} Page {}".format(
+        "Hide" if hidden else "Show", which, page_number
+    ))
     t = Transaction(doc, "Bluebeam Review Visibility")
     t.Start()
     try:
@@ -6241,6 +7183,11 @@ def pin_markup_action(pinned, pdf_path, page_number):
         elements = [legacy]
     if not elements:
         raise Exception("Không tìm thấy Revit markup elements để Pin/Unpin.")
+
+    _checkout_elements_for_edit(
+        elements,
+        "{} markup Page {}".format("Pin" if pinned else "Unpin", page_number),
+    )
 
     t = Transaction(doc, "{} Bluebeam Markup - Page {}".format(
         "Pin" if pinned else "Unpin", page_number
@@ -6296,8 +7243,9 @@ def delete_element_values(values):
 def build_status_text(state, base, native, legacy, selected_pdf=None, selected_page=None):
     lines = []
     lines.append("Active View: {}".format(active_view.Name))
+    lines.append("State storage: 1 DataStorage / PDF Page (Workshared-safe) + pyRevit cache")
     lines.append(
-        "pypdf bundled: {} | V{} Multi-Page Native Markup + Groups + Pin | no pip install".format(
+        "pypdf bundled: {} | V{} Workshared-Safe + AutoRemove BASE + Multi-Page + Groups + AutoPin | no pip install".format(
             getattr(pypdf, "__version__", "?"), TOOL_VERSION
         )
     )
@@ -6313,6 +7261,15 @@ def build_status_text(state, base, native, legacy, selected_pdf=None, selected_p
             ))
         else:
             lines.append("Pages đang được quản lý trong view: none")
+
+    if state:
+        storage = _state_storage_element(state)
+        if storage is not None:
+            owner = _owner_text(storage)
+            lines.append("Page State DataStorage: ID {}{}".format(
+                get_id_int(storage.Id),
+                " | owner: {}".format(owner) if owner else " | available/current user",
+            ))
 
     if not state:
         lines.append("")
@@ -6335,7 +7292,12 @@ def build_status_text(state, base, native, legacy, selected_pdf=None, selected_p
             hidden = False
         lines.append("BASE: ID {} | {}".format(get_id_int(base.Id), "HIDDEN" if hidden else "VISIBLE"))
     else:
-        lines.append("BASE: MISSING")
+        if state.get("base_removed_after_finish") and native:
+            lines.append("BASE: REMOVED after Finish (no external PDF link)")
+            if saved_alignment_frame(state) is not None:
+                lines.append("Alignment frame: SAVED in RVT state")
+        else:
+            lines.append("BASE: MISSING")
 
     if native:
         hidden_count = 0
@@ -6375,7 +7337,7 @@ def build_status_text(state, base, native, legacy, selected_pdf=None, selected_p
         lines.append("Bước tiếp theo: dóng BASE của page này rồi bấm Finish + Create Revit Markup.")
     elif native:
         lines.append("")
-        lines.append("Page này hoàn tất. Bạn có thể chọn page khác và Load BASE tiếp.")
+        lines.append("Page này hoàn tất. BASE link đã được remove; native markup + alignment state vẫn được giữ trong RVT.")
     return "\n".join(lines)
 
 
@@ -6416,7 +7378,7 @@ def start_base_review(pdf_path, page_number, scale_value, placement_mode):
     if placement_point is None:
         return False
 
-    t = Transaction(doc, "Bluebeam Review V2.6 - Load BASE p{}".format(page_number))
+    t = Transaction(doc, "Bluebeam Review V2.8 - Load BASE p{}".format(page_number))
     t.Start()
     try:
         base_type, base_instance = create_image_type_and_instance(
@@ -6433,12 +7395,15 @@ def start_base_review(pdf_path, page_number, scale_value, placement_mode):
 
     state = {
         "version": TOOL_VERSION,
+        "review_uid": _new_review_uid(),
         "doc_title": doc.Title,
         "view_id": get_id_int(active_view.Id),
+        "view_unique_id": str(active_view.UniqueId),
         "view_name": active_view.Name,
         "pdf_path": pdf_path,
         "page": int(page_number),
         "source_fingerprint": fingerprint,
+        "source_content_hash": get_pdf_content_hash(pdf_path),
         "scale": float(scale_value),
         "placement_mode": placement_mode,
         "markup_count": int(analysis["visible_markups"]),
@@ -6453,7 +7418,24 @@ def start_base_review(pdf_path, page_number, scale_value, placement_mode):
         "markup_type_id": None,
         "alignment_completed": False,
     }
-    save_review_state(state)
+    try:
+        save_review_state(state)
+    except Exception:
+        # BASE was already committed. If persistent per-page state cannot be
+        # created, remove the just-created BASE so the model is never left
+        # with an untracked review element.
+        cleanup_t = Transaction(doc, "Bluebeam Review V2.8 - Cleanup Untracked BASE")
+        cleanup_t.Start()
+        try:
+            delete_element_value(get_id_int(base_instance.Id))
+            delete_element_value(get_id_int(base_type.Id))
+            cleanup_t.Commit()
+        except Exception:
+            try:
+                cleanup_t.RollBack()
+            except Exception:
+                pass
+        raise
 
     last_pdf_path = pdf_path
     last_scale = str(scale_value)
@@ -6479,27 +7461,36 @@ def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
         raise Exception("PDF page {} chưa có BASE để Finish Alignment.".format(page_number))
 
     base = resolve_base_element(state)
-    if base is None:
-        raise Exception(
-            "Không tìm thấy BASE instance đã lưu. Có thể element đã bị Delete/Undo.\n"
-            "Hãy Reset Current Review rồi Load BASE lại."
-        )
-
     existing_native = native_markup_elements(state)
+    stored_frame = saved_alignment_frame(state)
+
     if existing_native and not rebuild:
         raise Exception("Native Revit markup đã được tạo. Dùng Rebuild nếu muốn tạo lại.")
+
+    # Initial Finish still needs the live BASE because the user is aligning it.
+    # Rebuild after V2.8.1 Finish is allowed without BASE because the final
+    # alignment frame is persisted in this page's DataStorage.
+    if base is None and not (rebuild and existing_native and stored_frame is not None):
+        raise Exception(
+            "Không tìm thấy BASE instance/alignment frame hợp lệ.\n"
+            "Nếu page chưa từng Finish bằng V2.8.1, hãy Reset Page rồi Load BASE lại."
+        )
 
     source_pdf = state.get("pdf_path")
     page_number = int(state.get("page", 1))
     if not source_pdf or not os.path.exists(source_pdf):
         raise Exception("Không tìm thấy source PDF:\n{}".format(source_pdf))
 
-    current_fingerprint = get_pdf_fingerprint(source_pdf)
-    if current_fingerprint != state.get("source_fingerprint"):
+    saved_content_hash = str(state.get("source_content_hash", "") or "")
+    if saved_content_hash:
+        source_matches = (get_pdf_content_hash(source_pdf) == saved_content_hash)
+    else:
+        source_matches = (get_pdf_fingerprint(source_pdf) == state.get("source_fingerprint"))
+    if not source_matches:
         raise Exception(
             "Source PDF đã thay đổi sau khi BASE được tạo.\n\n"
             "Không thể đảm bảo markup còn khớp với BASE đã dóng.\n"
-            "Hãy Reset Current Review và Load BASE lại từ PDF hiện tại."
+            "Hãy Reset Page và Load BASE lại từ PDF hiện tại."
         )
 
     analysis = analyze_pdf_page(source_pdf, page_number)
@@ -6517,10 +7508,48 @@ def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
     }
 
     legacy = legacy_markup_element(state)
-    t = Transaction(doc, "Bluebeam Review V2.6.2 - Create + Auto Pin Markup p{}".format(page_number))
+
+    # Workshared preflight. Existing page DataStorage is borrowed independently
+    # from every other page. Rebuild additionally borrows only this page's old
+    # native outputs before any destructive transaction starts.
+    page_storage = _state_storage_element(state)
+    state_targets = [active_view]
+    if page_storage is not None:
+        state_targets.append(page_storage)
+
+    # V2.8.1 removes the linked BASE after successful Create. Checkout both
+    # the instance and its unique ImageType before starting the transaction.
+    if base is not None:
+        state_targets.append(base)
+        base_type_elem = get_element_by_saved_id(doc, state.get("base_type_id"))
+        if base_type_elem is not None:
+            state_targets.append(base_type_elem)
+
+    _checkout_elements_for_edit(
+        state_targets,
+        "Finish/Rebuild + Auto Remove BASE Link Page {}".format(page_number),
+    )
+    if rebuild:
+        _checkout_elements_for_edit(
+            native_markup_elements(state) + ([legacy] if legacy is not None else []),
+            "Rebuild markup Page {}".format(page_number),
+        )
+
+    # Capture the final alignment before BASE is removed. On a later Rebuild,
+    # the stored frame is used and the external PDF link is not required.
+    alignment_frame = image_frame(base) if base is not None else stored_frame
+    serialized_frame = serialize_alignment_frame(alignment_frame)
+    if serialized_frame is None:
+        raise Exception("Không đọc/lưu được alignment frame của BASE.")
+
+    base_cache_to_cleanup = str(state.get("base_cache", "") or "")
+    removed_base_link = False
+
+    t = Transaction(doc, "Bluebeam Review V2.8.1 - Create + Pin + Remove BASE Link p{}".format(page_number))
     t.Start()
     try:
-        # Rebuild removes previous native output while preserving the aligned BASE.
+        # Rebuild removes previous native output. V2.8.1 can rebuild from the
+        # persisted alignment frame even though BASE link was removed earlier.
         delete_native_markup_state(state)
 
         # Migrate a V2.3 white-background MARKUP PDF automatically.
@@ -6529,7 +7558,7 @@ def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
             delete_element_value(state.get("markup_type_id"))
 
         ungrouped_ids, group_ids, group_type_ids, stats = convert_pdf_markups_to_native(
-            source_pdf, page_number, base, options
+            source_pdf, page_number, base, options, frame_override=alignment_frame
         )
         if not ungrouped_ids and not group_ids:
             raise Exception(
@@ -6545,8 +7574,31 @@ def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
         )
         auto_pin_result = set_markup_elements_pinned(top_level_markup, True)
 
-        set_elements_hidden(doc, active_view, [base], True)
-        doc.Regenerate()
+        # V2.8.1: BASE is only a temporary alignment reference. Once native
+        # markup exists, remove the ImageInstance and its ImageType so the RVT
+        # no longer carries an external PDF link to this user's local path.
+        if base is not None:
+            base_instance_id_before = state.get("base_instance_id")
+            base_type_id_before = state.get("base_type_id")
+
+            delete_element_value(base_instance_id_before)
+            doc.Regenerate()
+            if get_element_by_saved_id(doc, base_instance_id_before) is not None:
+                raise Exception(
+                    "Không thể remove BASE PDF instance khỏi model. "
+                    "Transaction Create Markup sẽ rollback để không để lại external link ngoài ý muốn."
+                )
+
+            delete_element_value(base_type_id_before)
+            doc.Regenerate()
+            if get_element_by_saved_id(doc, base_type_id_before) is not None:
+                raise Exception(
+                    "Không thể remove BASE PDF ImageType/link khỏi model. "
+                    "Transaction Create Markup sẽ rollback để không để lại external link ngoài ý muốn."
+                )
+
+            removed_base_link = True
+
         t.Commit()
     except Exception:
         try:
@@ -6556,6 +7608,11 @@ def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
         raise
 
     state["version"] = TOOL_VERSION
+    state["alignment_frame"] = serialized_frame
+    state["base_removed_after_finish"] = True
+    state["base_instance_id"] = None
+    state["base_type_id"] = None
+    state["base_cache"] = ""
     state["markup_element_ids"] = [int(v) for v in ungrouped_ids]
     state["markup_group_ids"] = [int(v) for v in group_ids]
     state["markup_group_type_ids"] = [int(v) for v in group_type_ids]
@@ -6582,11 +7639,19 @@ def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
     state["auto_pin_failed"] = len(auto_pin_result.get("failed", []))
     save_review_state(state)
 
+    # The generated BASE cache is no longer referenced by Revit after the
+    # ImageType is deleted. Cleanup is best-effort and does not affect Reset.
+    if removed_base_link and base_cache_to_cleanup:
+        remove_file_if_exists(base_cache_to_cleanup)
+
     msg = []
-    msg.append("V2.6.2 Multi-Page Native Markup + Auto Pin hoàn tất.")
+    msg.append("V2.8.4 Compact Geometry + Workshared-Safe hoàn tất.")
     msg.append("")
-    msg.append("PDF Page {} | BASE: hidden".format(page_number))
+    msg.append("PDF Page {} | BASE PDF link: REMOVED".format(page_number))
+    msg.append("Alignment frame: saved in Page DataStorage")
     msg.append("Native member elements created: {}".format(stats["created_elements"]))
+    msg.append("Compact geometry: native ellipse arcs + spline Ink/long paths")
+    msg.append("Hard safety limit: {} elements".format(MAX_NATIVE_ELEMENTS))
     msg.append("Top-level Revit outputs: {}".format(stats.get("output_elements", 0)))
     msg.append("Converted markups: {} / {}".format(stats["converted_markups"], stats["visual_markups"]))
     msg.append("Unsupported / no geometry: {}".format(stats["unsupported_markups"]))
@@ -6638,29 +7703,203 @@ def finish_alignment(pdf_path, page_number, native_options=None, rebuild=False):
     alert("\n".join(msg))
 
 
-def reset_current_review(pdf_path, page_number):
-    state = current_state(pdf_path, page_number)
-    if not state:
-        alert("PDF page {} chưa có review để reset.".format(page_number))
-        return
-    if not ask_yes_no(
-        "Reset riêng PDF page {}?\n\n"
-        "Tool CHỈ xóa BASE, native Revit markup/Detail Groups và legacy MARKUP PDF của page {}.\n"
-        "Markup của page này sẽ được UNPIN tự động trước khi xóa.\n"
-        "Các page khác trong cùng PDF/View sẽ được giữ nguyên.\n"
-        "Các Line Style/Text Type AnTools đã tạo sẽ được giữ lại để tái sử dụng.\n"
-        "Group Type chỉ bị xóa nếu không còn Group instance nào khác đang sử dụng.".format(page_number, page_number)
-    ):
-        return
+def _reset_element_estimated_cost(elem):
+    """Estimate how many Revit elements a reset edit can affect.
 
-    t = Transaction(doc, "Bluebeam Review V2.6.2 - Unpin + Reset p{}".format(page_number))
+    A Detail Group delete can cause Revit/worksharing to touch all group members,
+    so count the members instead of treating the Group instance as one element.
+    The estimate is intentionally conservative and is only used to keep batches
+    well below Revit's large-borrow warning threshold.
+    """
+    if elem is None:
+        return 0
+    try:
+        if not elem.IsValidObject:
+            return 0
+    except Exception:
+        pass
+    try:
+        if isinstance(elem, Group):
+            try:
+                member_ids = elem.GetMemberIds()
+                return max(1, 1 + int(member_ids.Count))
+            except Exception:
+                return RESET_GROUP_COST_FALLBACK
+    except Exception:
+        pass
+    return 1
+
+
+def _unique_valid_elements(elements):
+    result = []
+    seen = set()
+    for elem in elements or []:
+        if elem is None:
+            continue
+        try:
+            if not elem.IsValidObject:
+                continue
+        except Exception:
+            pass
+        try:
+            iv = get_id_int(elem.Id)
+        except Exception:
+            continue
+        if iv < 0 or iv in seen:
+            continue
+        seen.add(iv)
+        result.append(elem)
+    return result
+
+
+def _build_reset_batches(elements, affected_limit=RESET_BATCH_AFFECTED_LIMIT):
+    """Split top-level reset elements into conservative worksharing batches.
+
+    Returns a list of dicts: {elements, estimated_cost}. A single unusually
+    large Detail Group is put in its own batch because it cannot be safely split
+    without ungrouping/changing the user's group structure first.
+    """
+    batches = []
+    current = []
+    current_cost = 0
+
+    for elem in _unique_valid_elements(elements):
+        cost = max(1, int(_reset_element_estimated_cost(elem)))
+
+        if current and (current_cost + cost > int(affected_limit)):
+            batches.append({"elements": current, "estimated_cost": current_cost})
+            current = []
+            current_cost = 0
+
+        # A single group can itself exceed the batch budget. Keep it isolated;
+        # Revit may still show a warning for that one exceptional group, but the
+        # tool will never combine it with other markup in the same transaction.
+        if cost > int(affected_limit):
+            if current:
+                batches.append({"elements": current, "estimated_cost": current_cost})
+                current = []
+                current_cost = 0
+            batches.append({"elements": [elem], "estimated_cost": cost, "oversize": True})
+            continue
+
+        current.append(elem)
+        current_cost += cost
+
+    if current:
+        batches.append({"elements": current, "estimated_cost": current_cost})
+
+    return batches
+
+
+def _delete_elements_strict(elements):
+    """Delete elements and propagate any Revit/worksharing failure.
+
+    Unlike legacy delete helpers, this must NOT swallow exceptions because the
+    surrounding TransactionGroup needs to rollback the whole Reset Page action.
+    """
+    deleted = 0
+    for elem in _unique_valid_elements(elements):
+        try:
+            current = doc.GetElement(elem.Id)
+        except Exception:
+            current = None
+        if current is None:
+            continue
+        doc.Delete(current.Id)
+        deleted += 1
+    return deleted
+
+
+def _run_reset_delete_batch(batch, page_number, batch_index, batch_total):
+    elements = list(batch.get("elements", []))
+    if not elements:
+        return {"deleted": 0, "unpinned": 0, "estimated_cost": 0}
+
+    t = Transaction(
+        doc,
+        "Bluebeam V2.8.3 Reset p{} batch {}/{}".format(
+            page_number, batch_index, batch_total
+        ),
+    )
     t.Start()
     try:
-        delete_native_markup_state(state)
-        delete_element_value(state.get("markup_instance_id"))
-        delete_element_value(state.get("base_instance_id"))
-        delete_element_value(state.get("markup_type_id"))
-        delete_element_value(state.get("base_type_id"))
+        pin_result = set_markup_elements_pinned(elements, False)
+        try:
+            doc.Regenerate()
+        except Exception:
+            pass
+        deleted = _delete_elements_strict(elements)
+        t.Commit()
+        return {
+            "deleted": deleted,
+            "unpinned": int(pin_result.get("changed", 0)),
+            "estimated_cost": int(batch.get("estimated_cost", 0)),
+            "oversize": bool(batch.get("oversize", False)),
+        }
+    except Exception:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        raise
+
+
+def _cleanup_group_types_batched(group_type_ids, page_number):
+    """Delete only orphan AnTools group types, in a separate small transaction."""
+    orphan_types = []
+    for value in group_type_ids or []:
+        try:
+            ivalue = int(value)
+        except Exception:
+            continue
+        elem = get_element_by_saved_id(doc, ivalue)
+        if elem is None:
+            continue
+        if group_type_is_in_use(ivalue):
+            continue
+        orphan_types.append(elem)
+
+    if not orphan_types:
+        return 0
+
+    t = Transaction(doc, "Bluebeam V2.8.3 Reset p{} - Cleanup Group Types".format(page_number))
+    t.Start()
+    try:
+        deleted = _delete_elements_strict(orphan_types)
+        t.Commit()
+        return deleted
+    except Exception:
+        try:
+            t.RollBack()
+        except Exception:
+            pass
+        raise
+
+
+def _delete_reset_metadata_and_base(state, page_storage, page_number):
+    """Final small reset transaction: legacy/base refs + per-page DataStorage."""
+    final_elements = []
+    legacy = legacy_markup_element(state)
+    if legacy is not None:
+        final_elements.append(legacy)
+    base = resolve_base_element(state)
+    if base is not None:
+        final_elements.append(base)
+    for value in (state.get("markup_type_id"), state.get("base_type_id")):
+        elem = get_element_by_saved_id(doc, value)
+        if elem is not None:
+            final_elements.append(elem)
+
+    t = Transaction(doc, "Bluebeam V2.8.3 Reset p{} - Final State".format(page_number))
+    t.Start()
+    try:
+        _delete_elements_strict(final_elements)
+        if page_storage is not None:
+            try:
+                if page_storage.IsValidObject and doc.GetElement(page_storage.Id) is not None:
+                    doc.Delete(page_storage.Id)
+            except Exception:
+                raise
         t.Commit()
     except Exception:
         try:
@@ -6669,8 +7908,190 @@ def reset_current_review(pdf_path, page_number):
             pass
         raise
 
-    remove_review_state(pdf_path, page_number)
-    alert("Đã UNPIN và reset riêng PDF page {}. Các page khác được giữ nguyên.".format(page_number))
+
+def reset_current_review(pdf_path, page_number):
+    state = current_state(pdf_path, page_number)
+    if not state:
+        alert("PDF page {} chưa có review để reset.".format(page_number))
+        return
+    if not ask_yes_no(
+        "Reset riêng PDF page {}?\n\n"
+        "Tool CHỈ xóa native Revit markup/Detail Groups, state và BASE nếu còn của page {}.\n"
+        "Markup của page này sẽ được UNPIN tự động trước khi xóa.\n"
+        "V2.8.3 chia Reset thành nhiều batch nhỏ để giảm cảnh báo borrow quá nhiều element trong Workshared model.\n"
+        "Các page khác trong cùng PDF/View sẽ được giữ nguyên.\n"
+        "Các Line Style/Text Type AnTools đã tạo sẽ được giữ lại để tái sử dụng.\n"
+        "Group Type chỉ bị xóa nếu không còn Group instance nào khác đang sử dụng."
+        .format(page_number, page_number)
+    ):
+        return
+
+    # ------------------------------------------------------------------
+    # V2.8.3 WORKSHARED BATCHED RESET
+    # ------------------------------------------------------------------
+    # Never call WorksharingUtils.CheckoutElements() explicitly. We use cached
+    # ownership only as an advisory preflight, then let each real Transaction use
+    # normal Revit automatic borrowing.
+    #
+    # All batches live inside ONE TransactionGroup. Each inner transaction stays
+    # below a conservative affected-element budget. If any batch/final cleanup
+    # fails, TransactionGroup.RollBack() restores every committed inner batch.
+    page_storage = _state_storage_element(state)
+    native_outputs = native_markup_elements(state)
+
+    edit_targets = []
+    if page_storage is not None:
+        edit_targets.append(page_storage)
+    edit_targets.extend(native_outputs)
+
+    base_for_edit = resolve_base_element(state)
+    if base_for_edit is not None:
+        edit_targets.append(base_for_edit)
+
+    legacy_for_edit = legacy_markup_element(state)
+    if legacy_for_edit is not None:
+        edit_targets.append(legacy_for_edit)
+
+    for value in (state.get("base_type_id"), state.get("markup_type_id")):
+        elem = get_element_by_saved_id(doc, value)
+        if elem is not None:
+            edit_targets.append(elem)
+
+    _checkout_elements_for_edit(edit_targets, "Reset Page {}".format(page_number))
+
+    # Delete Group instances first, then loose markup. This prevents us from
+    # trying to delete saved member IDs that belong to a still-existing group.
+    group_elements = valid_elements_from_values(state.get("markup_group_ids", []))
+    loose_elements = valid_elements_from_values(state.get("markup_element_ids", []))
+
+    group_batches = _build_reset_batches(group_elements)
+    loose_batches = _build_reset_batches(loose_elements)
+    reset_batches = group_batches + loose_batches
+
+    tg = TransactionGroup(doc, "Bluebeam Review V2.8.3 - Batched Reset p{}".format(page_number))
+    tg.Start()
+
+    batch_results = []
+    current_step = "start"
+    try:
+        total_batches = len(reset_batches)
+        for index, batch in enumerate(reset_batches, 1):
+            current_step = "markup batch {}/{}".format(index, total_batches)
+            result = _run_reset_delete_batch(
+                batch, page_number, index, total_batches
+            )
+            batch_results.append(result)
+
+        # Group instances are gone at this point, so only truly orphan group
+        # types are eligible for cleanup. Keep this separate from markup delete.
+        current_step = "cleanup orphan group types"
+        cleaned_group_types = _cleanup_group_types_batched(
+            state.get("markup_group_type_ids", []), page_number
+        )
+
+        # BASE is normally already removed by Finish in V2.8.1+, but legacy
+        # states can still contain BASE/markup ImageTypes. Page DataStorage is
+        # deleted only after every markup batch has succeeded.
+        current_step = "final BASE/state cleanup"
+        _delete_reset_metadata_and_base(state, page_storage, page_number)
+
+        # Merge the successful batch transactions into one Undo item. More
+        # importantly, until Assimilate succeeds the TransactionGroup can still
+        # rollback all committed inner transactions if a later step fails.
+        tg.Assimilate()
+    except Exception as ex:
+        try:
+            tg.RollBack()
+        except Exception:
+            pass
+
+        owners = []
+        for elem in edit_targets:
+            if elem is None:
+                continue
+            try:
+                status = WorksharingUtils.GetCheckoutStatus(doc, elem.Id) if _is_workshared_document() else None
+            except Exception:
+                status = None
+            if status == CheckoutStatus.OwnedByOtherUser:
+                owner = _owner_text(elem)
+                owners.append(
+                    "ID {}{}".format(
+                        get_id_int(elem.Id),
+                        " — owner: {}".format(owner) if owner else " — owned by another user",
+                    )
+                )
+
+        extra = ""
+        if owners:
+            extra = "\n\nElement đang do user khác sở hữu:\n" + "\n".join(owners[:15])
+
+        raise WorksharingBusyError(
+            "Reset Page {} thất bại tại bước '{}'.\n\n"
+            "{}{}\n\n"
+            "Toàn bộ TransactionGroup đã rollback: các batch đã chạy trước đó cũng được hoàn tác.\n"
+            "Không có markup/state nào của page bị xóa một phần.\n"
+            "Nếu đây là lỗi Central/Server tạm thời, hãy Reload Latest hoặc Sync rồi thử lại."
+            .format(page_number, current_step, str(ex), extra)
+        )
+
+    # Persistent Page DataStorage is already gone. Remove ONLY the local pyRevit
+    # cache after TransactionGroup has successfully assimilated.
+    bucket = get_view_state_bucket(create=False)
+    if bucket:
+        pages = bucket.get("pages", {})
+        key = make_page_state_key(pdf_path, page_number)
+
+        # Same fallback rule used elsewhere for differently mapped PDF paths.
+        if key not in pages:
+            wanted_name = os.path.basename(str(pdf_path or "")).lower()
+            candidate_keys = []
+            for candidate_key, candidate in list(pages.items()):
+                if not isinstance(candidate, dict):
+                    continue
+                try:
+                    if int(candidate.get("page", 1)) != int(page_number):
+                        continue
+                except Exception:
+                    continue
+                if os.path.basename(str(candidate.get("pdf_path", ""))).lower() == wanted_name:
+                    candidate_keys.append(candidate_key)
+            if len(candidate_keys) == 1:
+                key = candidate_keys[0]
+
+        if key in pages:
+            del pages[key]
+        if not pages:
+            try:
+                del review_states[VIEW_KEY]
+            except Exception:
+                pass
+        _persist_review_states()
+
+    estimated_total = sum(int(r.get("estimated_cost", 0)) for r in batch_results)
+    oversize_count = sum(1 for r in batch_results if r.get("oversize"))
+    deleted_top = sum(int(r.get("deleted", 0)) for r in batch_results)
+    unpinned_top = sum(int(r.get("unpinned", 0)) for r in batch_results)
+
+    msg = []
+    msg.append("Đã reset riêng PDF page {}.".format(page_number))
+    msg.append("")
+    msg.append("V2.8.3 Batched Reset")
+    msg.append("Markup batches: {}".format(len(reset_batches)))
+    msg.append("Top-level outputs deleted: {}".format(deleted_top))
+    msg.append("Top-level outputs auto-unpinned: {}".format(unpinned_top))
+    msg.append("Estimated affected elements: {}".format(estimated_total))
+    msg.append("Batch budget: <= {} estimated elements".format(RESET_BATCH_AFFECTED_LIMIT))
+    msg.append("Orphan Group Types deleted: {}".format(cleaned_group_types))
+    if oversize_count:
+        msg.append("")
+        msg.append(
+            "Lưu ý: {} Detail Group riêng lẻ có số member vượt batch budget; "
+            "mỗi group đó đã được xử lý trong một transaction riêng.".format(oversize_count)
+        )
+    msg.append("")
+    msg.append("Các page khác không bị thay đổi.")
+    alert("\n".join(msg))
 
 
 # ============================================================
@@ -6682,7 +8103,7 @@ class ReviewForm(Form):
     def __init__(self, state, base_element, native_elements, legacy_element):
         Form.__init__(self)
 
-        self.Text = "Bluebeam PDF Review V{} - Multi-Page Native Markup + Groups".format(TOOL_VERSION)
+        self.Text = "Bluebeam PDF Review V{} - Workshared-Safe Multi-Page".format(TOOL_VERSION)
         self.Size = Size(850, 825)
         self.StartPosition = FormStartPosition.CenterScreen
         self.FormBorderStyle = FormBorderStyle.FixedDialog
@@ -6956,7 +8377,7 @@ class ReviewForm(Form):
 
         note = Label()
         note.Text = (
-            "V2.6.1: mỗi PDF page có BASE/markup state riêng. Pin/Unpin chỉ áp dụng page đang chọn; "
+            "V2.7: state được lưu trong RVT; mỗi PDF page có BASE/markup state riêng. Pin/Unpin chỉ áp dụng page đang chọn; "
             "Reset Page chỉ xóa đúng page đang chọn. Bluebeam Group → Revit Detail Group."
         )
         note.Location = Point(15, 690)
@@ -7078,8 +8499,9 @@ class ReviewForm(Form):
         has_native = bool(native_elements)
         has_legacy = legacy_element is not None
         self.btn_load.Enabled = not (has_state and (has_base or has_native or has_legacy))
+        has_saved_frame = saved_alignment_frame(state) is not None if has_state else False
         self.btn_finish.Enabled = has_state and has_base and not has_native
-        self.btn_rebuild.Enabled = has_state and has_base and has_native
+        self.btn_rebuild.Enabled = has_state and has_native and (has_base or has_saved_frame)
         self.btn_reset.Enabled = has_state
         self.btn_show_base.Enabled = has_base
         self.btn_hide_base.Enabled = has_base
