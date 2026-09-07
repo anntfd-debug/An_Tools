@@ -8,9 +8,12 @@ cua hai pipe thang, gan song song, khac cao do va tao rolling offset
 voi 2 elbow theo goc 90, 60, 45, 30, 22.5, 15 hoac goc tuy chon.
 Goc duoc ghi nho; Shift+Click de mo lai giao dien thay doi goc.
 
-Gioi han cua phien ban dau:
+Gioi han / nguyen tac:
 - Chi xu ly Pipe trong model hien tai, khong xu ly Revit Link.
-- Pipe goc phai la doan thang va gan nam ngang.
+- Pipe goc phai la doan thang; ho tro pipe ngang va pipe co slope.
+- Khi trim/extend pipe co slope, dau pipe chi duoc di chuyen doc theo centerline 3D goc
+  de GIU NGUYEN DO DOC cua ca hai pipe.
+- Sau khi tao 2 elbow, tool kiem tra lai slope/axis; neu bi thay doi thi rollback cap do.
 - Hai dau can noi phai dang ho.
 - Hai pipe phai cung duong kinh va cung Piping System Type.
 - Moi pipe chi duoc ghep mot lan trong mot lan chay.
@@ -45,11 +48,16 @@ except NameError:
 MAX_PAIR_DISTANCE_MM = 3000.0     # Khoang cach 3D toi da de xem la mot cap
 MAX_ENDPOINT_MOVE_MM = 5000.0    # Moi dau pipe duoc keo dai/rut ngan toi da
 MIN_REMAINING_PIPE_MM = 100.0     # Chieu dai toi thieu cua pipe cu sau khi sua
-PARALLEL_TOLERANCE_DEG = 2.0      # Sai so song song giua hai pipe
-MAX_BASE_PIPE_SLOPE_DEG = 1.0     # Pipe goc phai gan nam ngang
+PARALLEL_TOLERANCE_DEG = 2.0      # Sai so song song 3D giua hai pipe
+MAX_BASE_PIPE_SLOPE_DEG = 10.0    # Ho tro slope den ~17.6%; pipe dung van bo qua
 DIAMETER_TOLERANCE_MM = 0.2
 CONNECTOR_SEARCH_TOLERANCE_MM = 5.0
 MIN_NEW_PIPE_LENGTH_MM = 10.0
+
+# Bao ve slope cua 2 pipe goc.
+# Slope duoc kiem tra tu chinh Location.Curve, khong phu thuoc cach family elbow solve.
+SLOPE_PRESERVE_TOLERANCE_PERCENT = 0.001
+AXIS_PRESERVE_TOLERANCE_DEG = 0.01
 
 
 # -----------------------------------------------------------------------------
@@ -139,6 +147,42 @@ def normalize_xy(vector):
     return DB.XYZ(vector.X / length, vector.Y / length, 0.0)
 
 
+def normalize3d(vector):
+    length = xyz_length(vector)
+    if length < EPS:
+        return None
+    return DB.XYZ(
+        vector.X / length,
+        vector.Y / length,
+        vector.Z / length
+    )
+
+
+def slope_percent_from_vector(vector):
+    horizontal = xy_length(vector)
+    if horizontal < EPS:
+        return None
+    return abs(vector.Z) / horizontal * 100.0
+
+
+def get_pipe_slope_percent(pipe):
+    line = get_pipe_line(pipe)
+    if line is None:
+        return None
+    return slope_percent_from_vector(
+        line.GetEndPoint(1) - line.GetEndPoint(0)
+    )
+
+
+def get_pipe_axis_direction(pipe):
+    line = get_pipe_line(pipe)
+    if line is None:
+        return None
+    return normalize3d(
+        line.GetEndPoint(1) - line.GetEndPoint(0)
+    )
+
+
 def dot3(vector1, vector2):
     return (
         vector1.X * vector2.X +
@@ -167,6 +211,13 @@ def angle_between_deg(vector1, vector2):
 
     cosine = clamp(dot3(vector1, vector2) / (length1 * length2), -1.0, 1.0)
     return rad_to_deg(math.acos(cosine))
+
+
+def undirected_angle_deg(vector1, vector2):
+    angle = angle_between_deg(vector1, vector2)
+    if angle is None:
+        return None
+    return min(angle, abs(180.0 - angle))
 
 
 # -----------------------------------------------------------------------------
@@ -445,12 +496,18 @@ def build_endpoint(pipe, connector):
 
     horizontal_length = xy_length(line_vector)
     if horizontal_length < EPS:
+        # Ban nay chua xu ly pipe dung.
         return None
 
     slope_angle = rad_to_deg(
         math.atan2(abs(line_vector.Z), horizontal_length)
     )
     if slope_angle > MAX_BASE_PIPE_SLOPE_DEG:
+        return None
+
+    slope_percent = slope_percent_from_vector(line_vector)
+    axis_direction = normalize3d(line_vector)
+    if slope_percent is None or axis_direction is None:
         return None
 
     connector_point = connector.Origin
@@ -460,8 +517,14 @@ def build_endpoint(pipe, connector):
 
     endpoint = point0 if endpoint_index == 0 else point1
     far_point = point1 if endpoint_index == 0 else point0
-    outward = normalize_xy(endpoint - far_point)
-    if outward is None:
+
+    # QUAN TRONG:
+    # outward_3d giu nguyen thanh phan Z cua centerline.
+    # Neu dung normalize_xy() o day, khi keo/rut dau pipe thi Z khong di theo,
+    # lam thay doi slope cua pipe goc.
+    outward_3d = normalize3d(endpoint - far_point)
+    outward_xy = normalize_xy(endpoint - far_point)
+    if outward_3d is None or outward_xy is None:
         return None
 
     diameter = get_pipe_diameter(pipe)
@@ -477,7 +540,11 @@ def build_endpoint(pipe, connector):
         "endpoint_index": endpoint_index,
         "point": endpoint,
         "far_point": far_point,
-        "outward": outward,
+        "outward": outward_3d,
+        "outward_xy": outward_xy,
+        "axis_direction": axis_direction,
+        "slope_percent": slope_percent,
+        "slope_angle": slope_angle,
         "length": endpoint.DistanceTo(far_point),
         "diameter": diameter,
         "system_type_id": system_type_id,
@@ -506,8 +573,52 @@ def collect_open_endpoints(pipes):
     return endpoints
 
 
+def validate_pipe_geometry_preserved(endpoint):
+    """Dam bao pipe goc van giu slope va truc sau khi Revit tao fitting."""
+    pipe = endpoint["pipe"]
+
+    current_slope = get_pipe_slope_percent(pipe)
+    if current_slope is None:
+        raise Exception(
+            u"Khong doc duoc slope sau khi noi Pipe {0}."
+            .format(endpoint["pipe_id"])
+        )
+
+    slope_error = abs(current_slope - endpoint["slope_percent"])
+    if slope_error > SLOPE_PRESERVE_TOLERANCE_PERCENT:
+        raise Exception(
+            u"Rollback: slope Pipe {0} bi thay doi "
+            u"tu {1:.6f}% thanh {2:.6f}%."
+            .format(
+                endpoint["pipe_id"],
+                endpoint["slope_percent"],
+                current_slope
+            )
+        )
+
+    current_axis = get_pipe_axis_direction(pipe)
+    if current_axis is None:
+        raise Exception(
+            u"Khong doc duoc centerline sau khi noi Pipe {0}."
+            .format(endpoint["pipe_id"])
+        )
+
+    axis_error = undirected_angle_deg(
+        endpoint["axis_direction"],
+        current_axis
+    )
+    if axis_error is None or axis_error > AXIS_PRESERVE_TOLERANCE_DEG:
+        raise Exception(
+            u"Rollback: centerline Pipe {0} bi xoay {1:.6f} do."
+            .format(
+                endpoint["pipe_id"],
+                axis_error if axis_error is not None else -1.0
+            )
+        )
+
+
 # -----------------------------------------------------------------------------
-# TINH ROLLING OFFSET
+# TINH ROLLING OFFSET - BAO TOAN SLOPE 3D
 # -----------------------------------------------------------------------------
 def calculate_pair(endpoint1, endpoint2, requested_angle):
     if endpoint1["pipe_id"] == endpoint2["pipe_id"]:
@@ -535,9 +646,15 @@ def calculate_pair(endpoint1, endpoint2, requested_angle):
     if abs(delta.Z) < mm_to_ft(1.0):
         return None
 
+    # Day la vector 3D day du, KHONG con bo thanh phan Z.
     outward1 = endpoint1["outward"]
     outward2 = endpoint2["outward"]
+    outward1_xy = endpoint1["outward_xy"]
+    outward2_xy = endpoint2["outward_xy"]
 
+    # Hai pipe phai gan song song trong KHONG GIAN 3D.
+    # Neu chi kiem tra XY, hai pipe co slope khac nhau co the bi ghep nham,
+    # sau do Revit phai xoay/doi slope de tao fitting.
     parallel_error = angle_between_deg(outward1, negate(outward2))
     if parallel_error is None or parallel_error > PARALLEL_TOLERANCE_DEG:
         return None
@@ -545,34 +662,32 @@ def calculate_pair(endpoint1, endpoint2, requested_angle):
     plan_delta = DB.XYZ(delta.X, delta.Y, 0.0)
     plan_distance = xy_length(plan_delta)
 
-    # Khi hai dau khong trung XY, ca hai dau phai gan huong vao nhau.
+    # Chi dung vector XY de kiem tra hai dau co huong vao nhau trong mat bang.
+    # Viec trim/extend va tinh goc ben duoi dung 3D hoan toan.
     if plan_distance > mm_to_ft(1.0):
         plan_direction = normalize_xy(plan_delta)
         if plan_direction is None:
             return None
-        if dot2(plan_direction, outward1) < -0.05:
+        if dot2(plan_direction, outward1_xy) < -0.05:
             return None
-        if dot2(negate(plan_direction), outward2) < -0.05:
+        if dot2(negate(plan_direction), outward2_xy) < -0.05:
             return None
 
-    # Truc trung binh cua hai pipe. outward1 va -outward2 cung chieu.
-    axis = normalize_xy(outward1 - outward2)
+    # Truc trung binh 3D cua hai pipe.
+    # outward1 va -outward2 phai cung chieu khi hai dau huong vao nhau.
+    axis = normalize3d(outward1 - outward2)
     if axis is None:
         axis = outward1
 
-    current_along = dot2(plan_delta, axis)
+    current_along = dot3(delta, axis)
     if current_along < -mm_to_ft(5.0):
         return None
 
-    lateral_x = delta.X - axis.X * current_along
-    lateral_y = delta.Y - axis.Y * current_along
-
-    # Thanh phan vuong goc voi truc pipe gom ca lech ngang va lech cao do.
-    perpendicular = math.sqrt(
-        lateral_x * lateral_x +
-        lateral_y * lateral_y +
-        delta.Z * delta.Z
-    )
+    # Phan lech vuong goc voi true 3D pipe axis.
+    # Day la thay doi then chot de rolling offset khong can sua slope pipe goc.
+    along_vector = axis.Multiply(current_along)
+    perpendicular_vector = delta - along_vector
+    perpendicular = xyz_length(perpendicular_vector)
 
     if requested_angle >= 89.999:
         required_along = 0.0
@@ -582,7 +697,10 @@ def calculate_pair(endpoint1, endpoint2, requested_angle):
         )
 
     # t > 0: keo dai dau pipe ra ngoai.
-    # t < 0: rut ngan pipe de tao them khoang chay cho goc nho.
+    # t < 0: rut ngan pipe.
+    #
+    # QUAN TRONG: move1/move2 la khoang cach DOC THEO CENTERLINE 3D,
+    # khong phai khoang cach trong mat bang.
     total_move = current_along - required_along
 
     max_move = mm_to_ft(MAX_ENDPOINT_MOVE_MM)
@@ -602,6 +720,8 @@ def calculate_pair(endpoint1, endpoint2, requested_angle):
     move1 = clamp(total_move / 2.0, t1_min, t1_max)
     move2 = total_move - move1
 
+    # GIU SLOPE:
+    # endpoint moi nam chinh xac tren centerline 3D cu cua tung pipe.
     new_point1 = point1 + outward1.Multiply(move1)
     new_point2 = point2 + outward2.Multiply(move2)
     new_segment = new_point2 - new_point1
@@ -686,9 +806,14 @@ def connect_pair(pair):
     point1 = pair["new_point1"]
     point2 = pair["new_point2"]
 
+    # Hai diem moi da duoc tinh tren true 3D centerline cua tung pipe.
     set_pipe_endpoint(pipe1, endpoint1["endpoint_index"], point1)
     set_pipe_endpoint(pipe2, endpoint2["endpoint_index"], point2)
     doc.Regenerate()
+
+    # Chan ngay neu viec set endpoint da lam doi slope/axis vi bat ky ly do nao.
+    validate_pipe_geometry_preserved(endpoint1)
+    validate_pipe_geometry_preserved(endpoint2)
 
     connector1, distance1 = get_connector_near(pipe1, point1, True)
     connector2, distance2 = get_connector_near(pipe2, point2, True)
@@ -733,6 +858,11 @@ def connect_pair(pair):
     create_elbow(connector2, new_connector2)
     doc.Regenerate()
 
+    # Revit co the solve/trim khi tao fitting. Kiem tra lan cuoi:
+    # neu slope cua 1 trong 2 pipe goc thay doi -> raise -> transaction rollback.
+    validate_pipe_geometry_preserved(endpoint1)
+    validate_pipe_geometry_preserved(endpoint2)
+
     return new_pipe
 
 
@@ -773,11 +903,16 @@ def main():
             u"Khong tim thay cap pipe phu hop.\n\n"
             u"Kiem tra cac dieu kien:\n"
             u"- Dau pipe dang ho.\n"
-            u"- Hai pipe gan song song va huong vao nhau.\n"
+            u"- Hai pipe gan song song trong 3D va huong vao nhau.\n"
+            u"- Slope pipe khong vuot qua {0:g} do.\n"
             u"- Cung duong kinh va cung Piping System Type.\n"
-            u"- Khoang cach khong vuot qua {0:g} mm.\n"
-            u"- Pipe con du chieu dai de tao goc {1:g} do."
-            .format(MAX_PAIR_DISTANCE_MM, requested_angle),
+            u"- Khoang cach khong vuot qua {1:g} mm.\n"
+            u"- Pipe con du chieu dai de tao goc {2:g} do."
+            .format(
+                MAX_BASE_PIPE_SLOPE_DEG,
+                MAX_PAIR_DISTANCE_MM,
+                requested_angle
+            ),
             warn_icon=True
         )
         return

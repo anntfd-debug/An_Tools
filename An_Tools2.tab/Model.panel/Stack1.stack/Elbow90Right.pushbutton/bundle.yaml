@@ -1,0 +1,5 @@
+title: ElbowRight90
+tooltip: |
+  Normal click: preselect one or many Pipes, then choose slope from Project Pipe Settings.
+  Shift+Click: pick one Pipe and process physically connected Pipes with the same System Name.
+  The tool keeps an anchor fitting fixed where possible and changes geometry from the movable side.

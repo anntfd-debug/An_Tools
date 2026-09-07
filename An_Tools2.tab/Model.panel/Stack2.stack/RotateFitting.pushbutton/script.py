@@ -20,12 +20,20 @@ Axis Pipe may be:
 
 RULE:
 - Success     -> silent
-- Cancel      -> silent
-- Angle = 0   -> silent
+- Cancel      -> silent and exits BEFORE connector scanning
+- Angle = 0   -> silent and exits BEFORE connector scanning
 - Error       -> popup only
+
+PERFORMANCE:
+- Angle dialog is shown before expensive connectivity analysis.
+- Physical connector type checks are cached once per script load.
 
 pyRevit / Revit 2025-2026
 """
+
+# Reuse the pyRevit Python engine between invocations when supported.
+# This reduces repeated script-engine startup overhead.
+__persistentengine__ = True
 
 from pyrevit import revit
 
@@ -251,56 +259,36 @@ def get_connector_manager(elem):
 # PHYSICAL CONNECTORS
 # ============================================================
 
-def is_physical_connector(connector):
-    """
-    AllRefs may contain logical references.
+# Cache connector types once when the script is loaded.
+# The old version rebuilt this list for every connector checked.
+_PHYSICAL_CONNECTOR_TYPES = []
 
-    We only want physical MEP connectivity.
+for _connector_type_name in ("End", "Curve", "Physical"):
+    try:
+        _PHYSICAL_CONNECTOR_TYPES.append(
+            getattr(DB.ConnectorType, _connector_type_name)
+        )
+    except:
+        pass
+
+_PHYSICAL_CONNECTOR_TYPES = tuple(_PHYSICAL_CONNECTOR_TYPES)
+
+
+def is_physical_connector(connector):
+    """Return True only for physical MEP connector types.
+
+    Performance note:
+    ConnectorType values are cached once above instead of rebuilding
+    an allowed list for every connector / AllRefs item.
     """
 
     if connector is None:
         return False
 
     try:
-        connector_type = connector.ConnectorType
+        return connector.ConnectorType in _PHYSICAL_CONNECTOR_TYPES
     except:
         return False
-
-    allowed = []
-
-    # ConnectorType.End
-    try:
-        allowed.append(
-            DB.ConnectorType.End
-        )
-    except:
-        pass
-
-    # ConnectorType.Curve
-    try:
-        allowed.append(
-            DB.ConnectorType.Curve
-        )
-    except:
-        pass
-
-    # ConnectorType.Physical
-    try:
-        allowed.append(
-            DB.ConnectorType.Physical
-        )
-    except:
-        pass
-
-    for item in allowed:
-
-        try:
-            if connector_type == item:
-                return True
-        except:
-            pass
-
-    return False
 
 
 # ============================================================
@@ -1205,89 +1193,57 @@ def set_selection(elements):
 def main():
 
     # ========================================================
-    # 1. READ CURRENT SELECTION
+    # 1. READ CURRENT SELECTION -- CHEAP
     # ========================================================
 
-    selected = (
-        get_preselected_elements()
-    )
+    selected = get_preselected_elements()
 
     if not selected:
-
         show_error(
             "Không có Pipe / Pipe Fitting / "
             "Pipe Accessory hợp lệ trong Selection."
         )
-
         return
 
     # ========================================================
-    # 2. AUTO FIND EXTERNAL CONNECTED PIPE
+    # 2. ASK ANGLE FIRST -- FAST CANCEL PATH
     # ========================================================
+    # IMPORTANT:
+    # Do not scan connectors, build an axis, or inspect Pin state before
+    # the user has actually confirmed the command. This makes Cancel
+    # behave much closer to a native Revit command.
 
-    axis_pipe = (
-        get_automatic_axis_pipe(
-            selected
-        )
-    )
+    angle_deg = ask_angle()
 
-    if axis_pipe is None:
+    # Cancel = immediate / silent
+    if angle_deg is None:
+        return
+
+    # 0 degrees = immediate / silent
+    if abs(angle_deg) < VECTOR_TOL:
         return
 
     # ========================================================
-    # 3. CREATE AXIS FROM THAT PIPE
+    # 3. PINNED CHECK -- CHEAP, ONLY AFTER OK
     # ========================================================
 
-    axis, axis_error = (
-        get_pipe_rotation_axis(
-            axis_pipe
-        )
-    )
-
-    if axis is None:
-
-        if axis_error:
-            show_error(
-                axis_error
-            )
-
-        return
-
-    # ========================================================
-    # 4. PINNED CHECK
-    # ========================================================
-
-    pinned = (
-        get_pinned_elements(
-            selected
-        )
-    )
+    pinned = get_pinned_elements(selected)
 
     if pinned:
-
         ids_text = []
 
         for elem in pinned[:10]:
-
-            value = eid_value(
-                elem.Id
-            )
+            value = eid_value(elem.Id)
 
             if value is not None:
-
-                ids_text.append(
-                    str(value)
-                )
+                ids_text.append(str(value))
 
         message = (
             "Có {} phần tử đang Pin.\n\n"
             "Hãy Unpin trước khi quay."
-        ).format(
-            len(pinned)
-        )
+        ).format(len(pinned))
 
         if ids_text:
-
             message += (
                 "\n\nElementId:\n"
                 + "\n".join(ids_text)
@@ -1297,21 +1253,28 @@ def main():
             message += "\n..."
 
         show_error(message)
-
         return
 
     # ========================================================
-    # 5. ASK ANGLE
+    # 4. HEAVY WORK: AUTO FIND EXTERNAL CONNECTED PIPE
     # ========================================================
+    # ConnectorManager / Connectors / IsConnected / AllRefs are Revit API
+    # calls. They are intentionally deferred until after the user presses OK.
 
-    angle_deg = ask_angle()
+    axis_pipe = get_automatic_axis_pipe(selected)
 
-    # Cancel
-    if angle_deg is None:
+    if axis_pipe is None:
         return
 
-    # 0 degrees
-    if abs(angle_deg) < VECTOR_TOL:
+    # ========================================================
+    # 5. CREATE AXIS FROM THAT PIPE
+    # ========================================================
+
+    axis, axis_error = get_pipe_rotation_axis(axis_pipe)
+
+    if axis is None:
+        if axis_error:
+            show_error(axis_error)
         return
 
     # ========================================================
@@ -1331,9 +1294,7 @@ def main():
     # 7. KEEP ORIGINAL CLUSTER SELECTED
     # ========================================================
 
-    set_selection(
-        selected
-    )
+    set_selection(selected)
 
     # ========================================================
     # SUCCESS = SILENT
