@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 __title__ = "Select All Type"
 __doc__ = (
-    "Pick one sample element and select matching elements in Active View. "
+    "Pick one sample element and scan matching elements in Active View. "
+    "Shows a cancellable progress bar while scanning. "
     "FamilyInstance and family-based Tags: select all Types in the same Family. "
     "Filled Region: select all Filled Region Types in Active View. "
     "Text and other annotations: select the same Type."
@@ -16,12 +17,15 @@ uidoc = revit.uidoc
 doc = revit.doc
 view = revit.active_view
 
+# Updating the UI for every element can slow down large views.
+# Increase this value if the view contains many thousands of elements.
+PROGRESS_STEP = 10
+
 
 def eid_value(eid):
-    """Return ElementId as an integer, compatible with multiple Revit versions."""
+    """Return ElementId as an integer, compatible with Revit 2019-2026."""
     if eid is None:
         return -1
-
     try:
         return eid.IntegerValue
     except:
@@ -32,13 +36,7 @@ def eid_value(eid):
 
 
 def get_family_symbol_type_ids(elem):
-    """
-    Return all TypeIds belonging to the same loadable Family.
-
-    Supported examples:
-    - FamilyInstance: Generic Annotation, Detail Item, Door, Equipment...
-    - IndependentTag whose type is a FamilySymbol.
-    """
+    """Return all TypeIds belonging to the same loadable Family."""
     try:
         if isinstance(elem, FamilyInstance):
             symbol = elem.Symbol
@@ -67,7 +65,6 @@ def same_category(elem_a, elem_b):
             return eid_value(elem_a.Category.Id) == eid_value(elem_b.Category.Id)
     except:
         pass
-
     return False
 
 
@@ -76,36 +73,83 @@ def get_collector_by_sample(sample_elem):
     view_id = view.Id
 
     if isinstance(sample_elem, FamilyInstance):
-        return (
-            FilteredElementCollector(doc, view_id)
-            .OfClass(FamilyInstance)
-            .WhereElementIsNotElementType()
-        )
+        return (FilteredElementCollector(doc, view_id)
+                .OfClass(FamilyInstance)
+                .WhereElementIsNotElementType())
 
     if isinstance(sample_elem, IndependentTag):
-        return (
-            FilteredElementCollector(doc, view_id)
-            .OfClass(IndependentTag)
-            .WhereElementIsNotElementType()
-        )
+        return (FilteredElementCollector(doc, view_id)
+                .OfClass(IndependentTag)
+                .WhereElementIsNotElementType())
 
     if isinstance(sample_elem, TextNote):
-        return (
-            FilteredElementCollector(doc, view_id)
-            .OfClass(TextNote)
-            .WhereElementIsNotElementType()
-        )
+        return (FilteredElementCollector(doc, view_id)
+                .OfClass(TextNote)
+                .WhereElementIsNotElementType())
 
     if isinstance(sample_elem, FilledRegion):
-        return (
-            FilteredElementCollector(doc, view_id)
-            .OfClass(FilledRegion)
-            .WhereElementIsNotElementType()
-        )
+        return (FilteredElementCollector(doc, view_id)
+                .OfClass(FilledRegion)
+                .WhereElementIsNotElementType())
 
-    # Fallback for other view-specific annotations:
-    # Detail Line, Dimension, Revision Cloud, etc.
+    # Fallback for other view-specific annotations.
     return FilteredElementCollector(doc, view_id).WhereElementIsNotElementType()
+
+
+def scan_matching_elements(collector, sample_elem, sample_type_value,
+                           select_all_filled_region_types,
+                           family_type_values):
+    """Scan the collector with a cancellable pyRevit progress bar."""
+    selected_ids = []
+
+    try:
+        total = collector.GetElementCount()
+    except:
+        # Compatibility fallback. Normally not reached in Revit 2019-2026.
+        total = 1
+
+    if total < 1:
+        return selected_ids, False
+
+    cancelled = False
+    title = "Scanning Active View... {value} of {max_value}"
+
+    with forms.ProgressBar(
+        title=title,
+        cancellable=True,
+        step=PROGRESS_STEP
+    ) as progress_bar:
+        for index, elem in enumerate(collector, 1):
+            # Check cancellation before processing the next element.
+            if progress_bar.cancelled:
+                cancelled = True
+                break
+
+            try:
+                # Filled Region: select every type in Active View.
+                if select_all_filled_region_types:
+                    selected_ids.append(elem.Id)
+
+                # FamilyInstance / family-based Tag: all types in same Family.
+                elif family_type_values is not None:
+                    if (same_category(elem, sample_elem)
+                            and eid_value(elem.GetTypeId()) in family_type_values):
+                        selected_ids.append(elem.Id)
+
+                # TextNote and other non-family annotations:
+                # same Category and same Type only.
+                elif (same_category(elem, sample_elem)
+                      and eid_value(elem.GetTypeId()) == sample_type_value):
+                    selected_ids.append(elem.Id)
+            except:
+                # Skip an invalid/inaccessible element and continue scanning.
+                pass
+
+            # Force the last update even when total is not divisible by step.
+            if index % PROGRESS_STEP == 0 or index == total:
+                progress_bar.update_progress(index, total)
+
+    return selected_ids, cancelled
 
 
 def main():
@@ -122,57 +166,44 @@ def main():
     if sample_elem is None:
         return
 
-    selected_ids = []
     sample_type_id = sample_elem.GetTypeId()
     sample_type_value = eid_value(sample_type_id)
 
-    # 2. FilledRegion is a system family and has no loadable Family object.
-    # Therefore, when a FilledRegion is picked, select every FilledRegion
-    # instance of every FilledRegionType in the active view.
+    # 2. FilledRegion: select all FilledRegion types in Active View.
     select_all_filled_region_types = isinstance(sample_elem, FilledRegion)
 
-    # 3. Loadable family elements: collect all TypeIds in the same Family.
+    # 3. Loadable families: collect all TypeIds in the selected Family.
     family_type_ids = None
     family_name = None
-
     if not select_all_filled_region_types:
         family_type_ids, family_name = get_family_symbol_type_ids(sample_elem)
 
     family_type_values = None
     if family_type_ids:
-        family_type_values = set(eid_value(type_id) for type_id in family_type_ids)
+        family_type_values = set(
+            eid_value(type_id) for type_id in family_type_ids
+        )
 
     collector = get_collector_by_sample(sample_elem)
 
-    # 4. Filter matching instances in Active View.
-    for elem in collector:
-        try:
-            # Filled Region: all types in Active View.
-            if select_all_filled_region_types:
-                selected_ids.append(elem.Id)
-                continue
+    # 4. Scan with progress bar and Cancel button.
+    selected_ids, cancelled = scan_matching_elements(
+        collector,
+        sample_elem,
+        sample_type_value,
+        select_all_filled_region_types,
+        family_type_values
+    )
 
-            # FamilyInstance / family-based Tag: all Types in same Family.
-            if family_type_values is not None:
-                if (
-                    same_category(elem, sample_elem)
-                    and eid_value(elem.GetTypeId()) in family_type_values
-                ):
-                    selected_ids.append(elem.Id)
-                continue
+    # Do not apply a partial selection when the user cancels.
+    if cancelled:
+        forms.toast(
+            "Scanning cancelled. The current selection was not changed.",
+            title="pyRevit Cancelled"
+        )
+        return
 
-            # TextNote and other non-family annotation:
-            # same Category and same Type only.
-            if (
-                same_category(elem, sample_elem)
-                and eid_value(elem.GetTypeId()) == sample_type_value
-            ):
-                selected_ids.append(elem.Id)
-
-        except:
-            pass
-
-    # 5. Apply selection.
+    # 5. Apply selection after a complete scan.
     if not selected_ids:
         forms.alert(
             "No matching elements found in Active View.",

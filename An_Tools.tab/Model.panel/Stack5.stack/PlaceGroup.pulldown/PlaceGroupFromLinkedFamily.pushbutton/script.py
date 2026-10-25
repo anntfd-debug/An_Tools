@@ -1,10 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-Place Group From Linked Families
+Place Group From Linked / Host Families
 IronPython 2.7 / pyRevit
-
 Chức năng:
-- Pick nhiều RevitLinkInstance trước khi mở giao diện.
+- Nguồn Family có 2 lựa chọn:
+  + Family trong Revit Link (pick nhiều RevitLinkInstance ngay trong giao diện,
+    chỉ khi cần dùng Link mới phải pick; không cần Link thì dùng Pick Family
+    hoặc Lọc từ khóa / Chọn theo Type trực tiếp).
+  + Family trong Model hiện tại (host model).
+- Cách chọn Family nguồn: lọc từ khóa, pick trực tiếp, hoặc chọn theo từng
+  Family Type từ danh sách (Category | Family : Type) đang hiển thị trong Active View.
+- Chế độ Model hiện tại có tùy chọn bỏ Family đang là thành viên Model Group
+  (tránh đặt Group lặp lên Family nằm trong Group đã tạo trước đó).
 - Chỉ xử lý Link và Family đang hiển thị trong Active View.
 - Lọc FamilyInstance theo Family Name hoặc Type Name bằng ô nhập nhiều dòng.
 - Hoặc pick trực tiếp một FamilyInstance trong Revit Link và chỉ quét đúng Family đó; có thể khóa đúng Type đã pick.
@@ -17,7 +24,6 @@ Chức năng:
 - Bỏ nested Family, loại nguồn trùng tuyệt đối và nguồn chồng vị trí.
 - Progress visibility chỉ đếm các Family đã khớp bộ lọc nguồn.
 - Có progress bar và Cancel. Cancel trong lúc đặt sẽ rollback toàn bộ lần chạy.
-
 Ghi chú về visibility:
 - Nếu Link hiển thị By Linked View (Revit 2024+), tool dùng linked view để
   thu hẹp tập ứng viên nhưng vẫn bắt buộc kiểm tra lại View Range của Active View
@@ -25,36 +31,31 @@ Ghi chú về visibility:
 - Nếu Link hiển thị By Host View, tool lọc theo: Link hiện trong Active View,
   category không bị ẩn, Crop/Section Box và View Range của Active View.
 """
-
 import json
 import math
 import os
 import re
 import traceback
-
+import clr
+clr.AddReference("PresentationFramework")
+from System.Windows.Controls import ListBoxItem
 from pyrevit import revit, DB, UI, forms, script
 from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
-
-
+from Autodesk.Revit.Exceptions import OperationCanceledException
 doc = revit.doc
 uidoc = revit.uidoc
 active_view = revit.active_view
 output = script.get_output()
-
 try:
     text_type = unicode
 except NameError:
     text_type = str
-
-
 startup_notices = []
-CACHE_VERSION = 4
-
-
+CACHE_VERSION = 5
+HOST_SOURCE_UID = u"__HOST_MODEL__"
 # ============================================================
 # TIỆN ÍCH CHUNG
 # ============================================================
-
 def safe_text(value):
     if value is None:
         return u""
@@ -65,19 +66,15 @@ def safe_text(value):
             return text_type(str(value), "utf-8", "ignore")
         except Exception:
             return u""
-
-
 def get_element_name(element):
     if element is None:
         return u""
-
     try:
         name = element.Name
         if name:
             return safe_text(name)
     except Exception:
         pass
-
     for bip in (
         DB.BuiltInParameter.SYMBOL_NAME_PARAM,
         DB.BuiltInParameter.ALL_MODEL_TYPE_NAME,
@@ -91,17 +88,12 @@ def get_element_name(element):
                     return safe_text(value)
         except Exception:
             pass
-
     return u""
-
-
 def get_id_value(element_id):
     try:
         return int(element_id.Value)
     except Exception:
         return int(element_id.IntegerValue)
-
-
 def is_invalid_element_id(element_id):
     if element_id is None:
         return True
@@ -109,8 +101,6 @@ def is_invalid_element_id(element_id):
         return get_id_value(element_id) == get_id_value(DB.ElementId.InvalidElementId)
     except Exception:
         return True
-
-
 def mm_to_internal(mm_value):
     try:
         return DB.UnitUtils.ConvertToInternalUnits(
@@ -122,8 +112,6 @@ def mm_to_internal(mm_value):
             float(mm_value),
             DB.DisplayUnitType.DUT_MILLIMETERS
         )
-
-
 def internal_to_mm(internal_value):
     try:
         return DB.UnitUtils.ConvertFromInternalUnits(
@@ -135,15 +123,11 @@ def internal_to_mm(internal_value):
             float(internal_value),
             DB.DisplayUnitType.DUT_MILLIMETERS
         )
-
-
 def format_mm(internal_value):
     try:
         return u"{0:.1f}".format(internal_to_mm(internal_value))
     except Exception:
         return u"-"
-
-
 def format_angle_degrees(angle_radians):
     try:
         value = math.degrees(angle_radians)
@@ -154,8 +138,6 @@ def format_angle_degrees(angle_radians):
         return u"{0:.2f}".format(value)
     except Exception:
         return u"-"
-
-
 def show_output_report(
         status_title,
         summary_lines=None,
@@ -165,31 +147,25 @@ def show_output_report(
         duplicate_source_records=None,
         traceback_text=None):
     """In toàn bộ thông báo vào cửa sổ output của pyRevit."""
-
     summary_lines = summary_lines or []
     notices = notices or []
     failed_items = failed_items or []
     created_records = created_records or []
     duplicate_source_records = duplicate_source_records or []
-
     try:
-        output.set_title(u"Place Group From Linked Families")
+        output.set_title(u"Place Group From Families")
     except Exception:
         pass
-
-    output.print_md(u"# Place Group From Linked Families")
+    output.print_md(u"# Place Group From Families")
     output.print_md(u"## {0}".format(safe_text(status_title)))
-
     if summary_lines:
         output.print_md(u"### Tóm tắt")
         for line in summary_lines:
             output.print_md(u"- {0}".format(safe_text(line)))
-
     if notices:
         output.print_md(u"### Thông báo và lưu ý")
         for notice in notices:
             output.print_md(u"- {0}".format(safe_text(notice)))
-
     if duplicate_source_records:
         output.print_md(u"### Các nguồn Family bị loại vì trùng")
         output.print_md(
@@ -211,8 +187,8 @@ def show_output_report(
             output.print_table(
                 table_data=duplicate_table,
                 columns=[
-                    u"STT", u"Lý do", u"Link giữ lại", u"Family giữ lại",
-                    u"Link bị loại", u"Family bị loại", u"Khoảng cách (mm)"
+                    u"STT", u"Lý do", u"Nguồn giữ lại", u"Family giữ lại",
+                    u"Nguồn bị loại", u"Family bị loại", u"Khoảng cách (mm)"
                 ]
             )
         except Exception:
@@ -220,13 +196,11 @@ def show_output_report(
                 output.print_md(
                     u"{0}. {1} | Giữ: {2} - {3} | Loại: {4} - {5} | {6} mm".format(*row)
                 )
-
     if created_records:
         output.print_md(u"### Các Group đã tạo")
         output.print_md(
             u"Bấm vào tên Group để chọn phần tử; bấm biểu tượng **Show** bên cạnh liên kết để Revit zoom tới vị trí Group."
         )
-
         table_data = []
         for index, record in enumerate(created_records):
             group_id = record.get("group_id")
@@ -238,7 +212,6 @@ def show_output_report(
                 )
             except Exception:
                 zoom_link = u"Group {0}".format(group_id_value)
-
             point = record.get("point")
             if point is not None:
                 x_text = format_mm(point.X)
@@ -246,7 +219,6 @@ def show_output_report(
                 z_text = format_mm(point.Z)
             else:
                 x_text = y_text = z_text = u"-"
-
             source_point = record.get("source_point")
             if source_point is not None:
                 source_xyz = u"{0}; {1}; {2}".format(
@@ -256,13 +228,13 @@ def show_output_report(
                 )
             else:
                 source_xyz = u"-"
-
-            geometry_source = u"Solid"
-            if not record.get("used_solid", False):
-                geometry_source = u"BoundingBox"
-
+            if safe_text(record.get("placement_mode", u"ANCHOR")).upper() == u"SAMPLE":
+                geometry_source = u"Theo mẫu Group"
+                anchor_display = u"Offset từ gốc Family"
+            else:
+                geometry_source = u"Solid" if record.get("used_solid", False) else u"BoundingBox"
+                anchor_display = safe_text(record.get("anchor_mode", u""))
             mirror_text = u"Có" if record.get("mirrored", False) else u"Không"
-
             table_data.append([
                 index + 1,
                 zoom_link,
@@ -277,19 +249,17 @@ def show_output_report(
                 y_text,
                 z_text,
                 safe_text(record.get("angle_deg", u"-")),
-                safe_text(record.get("anchor_mode", u"")),
+                anchor_display,
                 geometry_source,
                 mirror_text
             ])
-
         columns = [
             u"STT", u"Chọn / Zoom", u"Group Type", u"Family nguồn",
-            u"Revit Link", u"Link ID", u"Family ID", u"SuperComponent ID",
+            u"Nguồn (Link/Host)", u"Link ID", u"Family ID", u"SuperComponent ID",
             u"Điểm nguồn X;Y;Z (mm)", u"Group X (mm)", u"Group Y (mm)",
             u"Group Z (mm)", u"Góc (°)", u"Điểm đặt", u"Hình học",
             u"Family Mirror"
         ]
-
         try:
             output.print_table(table_data=table_data, columns=columns)
         except Exception:
@@ -298,27 +268,23 @@ def show_output_report(
                     u"{0}. {1} | {2} | {3} | Link={4}; FamilyID={6}; "
                     u"X={9} mm; Y={10} mm; Z={11} mm; Góc={12}°".format(*row)
                 )
-
     if failed_items:
         output.print_md(u"### Các Family không xử lý được")
         output.print_md(u"Tổng số lỗi: **{0}**".format(len(failed_items)))
         for item in failed_items:
             output.print_md(u"- {0}".format(safe_text(item)))
-
     if traceback_text:
         output.print_md(u"### Chi tiết kỹ thuật")
         try:
             output.print_code(safe_text(traceback_text))
         except Exception:
             output.print_md(u"```\n{0}\n```".format(safe_text(traceback_text)))
-
     output.print_md(u"---")
     output.print_md(
         u"Active View: **{0}**".format(
             get_element_name(active_view) if active_view is not None else u"Không xác định"
         )
     )
-
 def parse_number(raw_value, field_name, minimum=None):
     text = safe_text(raw_value).strip().replace(u",", u".")
     if not text:
@@ -328,14 +294,11 @@ def parse_number(raw_value, field_name, minimum=None):
             value = float(text)
         except Exception:
             raise ValueError(u"'{0}' phải là một số hợp lệ.".format(field_name))
-
     if minimum is not None and value < minimum:
         raise ValueError(
             u"'{0}' phải lớn hơn hoặc bằng {1}.".format(field_name, minimum)
         )
     return value
-
-
 def parse_integer(raw_value, field_name, minimum=None, maximum=None):
     text = safe_text(raw_value).strip()
     if not text:
@@ -348,49 +311,34 @@ def parse_integer(raw_value, field_name, minimum=None, maximum=None):
                 raise ValueError()
         except Exception:
             raise ValueError(u"'{0}' phải là số nguyên hợp lệ.".format(field_name))
-
     if minimum is not None and value < minimum:
         raise ValueError(
             u"'{0}' phải lớn hơn hoặc bằng {1}.".format(field_name, minimum)
         )
-
     if maximum is not None and value > maximum:
         raise ValueError(
             u"'{0}' phải nhỏ hơn hoặc bằng {1}.".format(field_name, maximum)
         )
-
     return value
-
-
 def normalize_xy(vector):
     if vector is None:
         return None
-
     vector_xy = DB.XYZ(vector.X, vector.Y, 0.0)
     if vector_xy.GetLength() < 0.0000001:
         return None
-
     return vector_xy.Normalize()
-
-
 def vector_angle_xy(vector):
     vector_xy = normalize_xy(vector)
     if vector_xy is None:
         return 0.0
     return math.atan2(vector_xy.Y, vector_xy.X)
-
-
 def points_distance_3d(point_a, point_b):
     return (point_a - point_b).GetLength()
-
-
 def bbox_local_corners(bbox):
     if bbox is None:
         return []
-
     min_pt = bbox.Min
     max_pt = bbox.Max
-
     return [
         DB.XYZ(min_pt.X, min_pt.Y, min_pt.Z),
         DB.XYZ(max_pt.X, min_pt.Y, min_pt.Z),
@@ -401,17 +349,13 @@ def bbox_local_corners(bbox):
         DB.XYZ(min_pt.X, max_pt.Y, max_pt.Z),
         DB.XYZ(max_pt.X, max_pt.Y, max_pt.Z)
     ]
-
-
 def bbox_model_corners(bbox):
     if bbox is None:
         return []
-
     try:
         transform = bbox.Transform
     except Exception:
         transform = DB.Transform.Identity
-
     result = []
     for point in bbox_local_corners(bbox):
         try:
@@ -419,78 +363,98 @@ def bbox_model_corners(bbox):
         except Exception:
             result.append(point)
     return result
-
-
 def ranges_overlap(min_a, max_a, min_b, max_b, tolerance=0.000001):
     return not (
         max_a < min_b - tolerance or
         min_a > max_b + tolerance
     )
-
-
 # ============================================================
 # PICK NHIỀU REVIT LINK
 # ============================================================
-
 class RevitLinkSelectionFilter(ISelectionFilter):
     def AllowElement(self, element):
         try:
             return isinstance(element, DB.RevitLinkInstance)
         except Exception:
             return False
-
     def AllowReference(self, reference, position):
         return False
-
-
 class LinkItem(object):
+    is_host = False
     def __init__(self, link_instance):
         self.element = link_instance
         self.link_doc = link_instance.GetLinkDocument()
         self.uid = safe_text(link_instance.UniqueId)
         self.transform = link_instance.GetTotalTransform()
-
         instance_name = get_element_name(link_instance)
         document_name = u""
         try:
             document_name = safe_text(self.link_doc.Title)
         except Exception:
             pass
-
         if document_name and document_name.lower() not in instance_name.lower():
             self.display_name = u"{0}  |  {1}".format(instance_name, document_name)
         else:
             self.display_name = instance_name or document_name or u"Revit Link"
-
-
+class HostModelItem(object):
+    """
+    Nguồn giả lập cho Model hiện tại để tái sử dụng toàn bộ pipeline của Link:
+    link_doc = doc, transform = Identity, element = None.
+    """
+    is_host = True
+    def __init__(self, host_doc):
+        self.element = None
+        self.link_doc = host_doc
+        self.uid = HOST_SOURCE_UID
+        self.transform = DB.Transform.Identity
+        title = u""
+        try:
+            title = safe_text(host_doc.Title)
+        except Exception:
+            pass
+        self.display_name = u"Model hiện tại: {0}".format(title or u"Host")
+def is_host_source(source_item):
+    return bool(getattr(source_item, "is_host", False))
+class FamilyInstanceSelectionFilter(ISelectionFilter):
+    def AllowElement(self, element):
+        try:
+            return isinstance(element, DB.FamilyInstance)
+        except Exception:
+            return False
+    def AllowReference(self, reference, position):
+        return False
+class ModelGroupSelectionFilter(ISelectionFilter):
+    def AllowElement(self, element):
+        # Chấp nhận chính Group hoặc phần tử thành viên của Group; sau đó
+        # pick_sample_group() sẽ quy về đúng Group.
+        try:
+            if isinstance(element, DB.Group):
+                return True
+            return not is_invalid_element_id(element.GroupId)
+        except Exception:
+            return False
+    def AllowReference(self, reference, position):
+        return False
 class GroupTypeItem(object):
     def __init__(self, group_type):
         self.element = group_type
         self.uid = safe_text(group_type.UniqueId)
         self.display_name = get_element_name(group_type) or u"Unnamed Group Type"
-
-
 def get_family_unique_id(family_instance):
     try:
         return safe_text(family_instance.UniqueId)
     except Exception:
         return u""
-
-
 def get_family_id_value(family_instance):
     try:
         return get_id_value(family_instance.Id)
     except Exception:
         return -1
-
-
 def get_super_component(family_instance):
     try:
         return family_instance.SuperComponent
     except Exception:
         return None
-
-
 def get_super_component_id_value(family_instance):
     super_component = get_super_component(family_instance)
     if super_component is None:
@@ -499,8 +463,6 @@ def get_super_component_id_value(family_instance):
         return get_id_value(super_component.Id)
     except Exception:
         return None
-
-
 def family_source_key(link_item, family_instance):
     family_uid = get_family_unique_id(family_instance)
     if family_uid:
@@ -509,32 +471,24 @@ def family_source_key(link_item, family_instance):
         safe_text(link_item.uid),
         get_family_id_value(family_instance)
     )
-
-
 def family_semantic_key(family_instance):
     category_id = -1
     family_name = u""
     type_name = u""
-
     try:
         if family_instance.Category is not None:
             category_id = get_id_value(family_instance.Category.Id)
     except Exception:
         pass
-
     try:
         family_name = safe_text(family_instance.Symbol.Family.Name).strip().lower()
     except Exception:
         pass
-
     try:
         type_name = get_element_name(family_instance.Symbol).strip().lower()
     except Exception:
         pass
-
     return u"{0}|{1}|{2}".format(category_id, family_name, type_name)
-
-
 class FamilyWorkItem(object):
     def __init__(self, link_item, family_instance):
         self.link_item = link_item
@@ -542,7 +496,6 @@ class FamilyWorkItem(object):
         self.source_key = family_source_key(link_item, family_instance)
         self.semantic_key = family_semantic_key(family_instance)
         self.source_point = None
-
     def get_source_point(self):
         if self.source_point is None:
             host_points = get_family_host_bbox_points(
@@ -556,12 +509,11 @@ class FamilyWorkItem(object):
                 host_points
             )
         return self.source_point
-
-
 def new_scan_diagnostics():
     return {
         "candidate_total": 0,
         "nested_skipped": 0,
+        "group_member_skipped": 0,
         "exact_source_duplicate_skipped": 0,
         "text_matched": 0,
         "visibility_skipped": 0,
@@ -569,33 +521,20 @@ def new_scan_diagnostics():
         "final_count": 0,
         "duplicate_source_records": []
     }
-
-
-def merge_scan_diagnostics(base, addition):
-    result = new_scan_diagnostics()
-    for key in result.keys():
-        if key == "duplicate_source_records":
-            result[key] = list((base or {}).get(key, [])) + list((addition or {}).get(key, []))
-        else:
-            try:
-                result[key] = int((base or {}).get(key, 0)) + int((addition or {}).get(key, 0))
-            except Exception:
-                result[key] = 0
-    return result
-
-
 def scan_diagnostics_summary(diagnostics):
     diagnostics = diagnostics or new_scan_diagnostics()
     return [
         u"FamilyInstance ứng viên: {0}".format(diagnostics.get("candidate_total", 0)),
         u"Bỏ nested Family: {0}".format(diagnostics.get("nested_skipped", 0)),
+        u"Bỏ Family nằm trong Model Group (Model hiện tại): {0}".format(
+            diagnostics.get("group_member_skipped", 0)
+        ),
         u"Bỏ nguồn trùng tuyệt đối: {0}".format(diagnostics.get("exact_source_duplicate_skipped", 0)),
         u"Khớp bộ lọc nguồn: {0}".format(diagnostics.get("text_matched", 0)),
         u"Không hiển thị trong Active View: {0}".format(diagnostics.get("visibility_skipped", 0)),
         u"Bỏ nguồn chồng vị trí: {0}".format(diagnostics.get("overlap_source_skipped", 0)),
         u"Family nguồn duy nhất sau xử lý: {0}".format(diagnostics.get("final_count", 0))
     ]
-
 def pick_link_items():
     try:
         references = uidoc.Selection.PickObjects(
@@ -603,12 +542,10 @@ def pick_link_items():
             RevitLinkSelectionFilter(),
             u"Chọn một hoặc nhiều Revit Link, sau đó bấm Finish"
         )
-    except UI.Exceptions.OperationCanceledException:
+    except OperationCanceledException:
         return []
-
     result = []
     used_ids = set()
-
     for reference in references:
         try:
             link_instance = doc.GetElement(reference.ElementId)
@@ -616,19 +553,14 @@ def pick_link_items():
                 continue
             if link_instance.GetLinkDocument() is None:
                 continue
-
             id_value = get_id_value(link_instance.Id)
             if id_value in used_ids:
                 continue
-
             used_ids.add(id_value)
             result.append(LinkItem(link_instance))
         except Exception:
             pass
-
     return result
-
-
 def is_model_group_type(group_type):
     try:
         category = group_type.Category
@@ -637,20 +569,14 @@ def is_model_group_type(group_type):
         return get_id_value(category.Id) == int(DB.BuiltInCategory.OST_IOSModelGroups)
     except Exception:
         return False
-
-
 def collect_model_group_types():
     items = []
     collector = DB.FilteredElementCollector(doc).OfClass(DB.GroupType)
-
     for group_type in collector:
         if is_model_group_type(group_type):
             items.append(GroupTypeItem(group_type))
-
     items.sort(key=lambda item: item.display_name.lower())
     return items
-
-
 def get_link_ids_visible_in_active_view(view):
     result = set()
     try:
@@ -666,31 +592,23 @@ def get_link_ids_visible_in_active_view(view):
         # báo rõ thay vì quét nhầm toàn bộ model.
         pass
     return result
-
-
 def keep_only_links_visible_in_active_view(link_items, view):
     visible_ids = get_link_ids_visible_in_active_view(view)
     visible_items = []
     hidden_items = []
-
     for item in link_items:
         if get_id_value(item.element.Id) in visible_ids:
             visible_items.append(item)
         else:
             hidden_items.append(item)
-
     return visible_items, hidden_items
-
-
 # ============================================================
 # LỌC FAMILY THEO TEXT
 # ============================================================
-
 def split_keywords(raw_text):
     text = safe_text(raw_text).strip().lower()
     if not text:
         return []
-
     parts = re.split(u"[;,\r\n]+", text)
     keywords = []
     for part in parts:
@@ -698,157 +616,443 @@ def split_keywords(raw_text):
         if keyword and keyword not in keywords:
             keywords.append(keyword)
     return keywords
-
-
 def family_identity_text(family_instance):
     family_name = u""
     type_name = u""
-
     try:
         family_name = safe_text(family_instance.Symbol.Family.Name)
     except Exception:
         pass
-
     try:
         type_name = get_element_name(family_instance.Symbol)
     except Exception:
         pass
-
     return u"{0} {1}".format(family_name, type_name).lower()
-
-
 def family_matches(family_instance, keywords):
     if not keywords:
         return True
-
     search_text = family_identity_text(family_instance)
     for keyword in keywords:
         if keyword in search_text:
             return True
     return False
-
-
 def get_family_name(family_instance):
     try:
         return safe_text(family_instance.Symbol.Family.Name).strip()
     except Exception:
         return u""
-
-
 def get_family_type_name(family_instance):
     try:
         return get_element_name(family_instance.Symbol).strip()
     except Exception:
         return u""
-
-
 def family_matches_source_filter(
         family_instance,
         keywords,
         source_mode,
         picked_family_name,
         picked_type_name,
-        lock_picked_type):
-    """Khớp Family nguồn theo từ khóa hoặc theo Family đã pick trong Link."""
+        lock_picked_type,
+        selected_type_keys=None):
+    """Khớp Family nguồn theo từ khóa, Family đã pick hoặc danh sách Type đã chọn."""
     mode = safe_text(source_mode).upper().strip()
+    if mode == "TYPES":
+        if not selected_type_keys:
+            return False
+        return family_semantic_key(family_instance) in selected_type_keys
     if mode == "PICK":
         target_family = safe_text(picked_family_name).strip().lower()
         if not target_family:
             return False
-
         current_family = get_family_name(family_instance).lower()
         if current_family != target_family:
             return False
-
         if lock_picked_type:
             target_type = safe_text(picked_type_name).strip().lower()
             current_type = get_family_type_name(family_instance).lower()
             return bool(target_type) and current_type == target_type
-
         return True
-
     return family_matches(family_instance, keywords)
-
-
-def picked_family_filter_signature(source_mode, picked_family_name, picked_type_name, lock_picked_type):
+def normalize_type_keys(type_keys):
+    result = []
+    for key in type_keys or []:
+        text = safe_text(key).strip().lower()
+        if text and text not in result:
+            result.append(text)
+    result.sort()
+    return result
+def picked_family_filter_signature(
+        source_mode,
+        picked_family_name,
+        picked_type_name,
+        lock_picked_type,
+        selected_type_keys=None):
     mode = safe_text(source_mode).upper().strip() or "KEYWORD"
-    return u"MODE={0}|FAMILY={1}|TYPE={2}|LOCKTYPE={3}".format(
+    type_keys_text = u""
+    if mode == "TYPES":
+        type_keys_text = u"#".join(normalize_type_keys(selected_type_keys))
+    return u"MODE={0}|FAMILY={1}|TYPE={2}|LOCKTYPE={3}|TYPEKEYS={4}".format(
         mode,
         safe_text(picked_family_name).strip().lower(),
         safe_text(picked_type_name).strip().lower(),
-        bool(lock_picked_type)
+        bool(lock_picked_type),
+        type_keys_text
     )
+def is_group_member(family_instance):
+    try:
+        return not is_invalid_element_id(family_instance.GroupId)
+    except Exception:
+        return False
+def family_type_display(family_instance):
+    category_name = u""
+    try:
+        if family_instance.Category is not None:
+            category_name = safe_text(family_instance.Category.Name)
+    except Exception:
+        pass
+    return u"{0}  |  {1} : {2}".format(
+        category_name or u"(No Category)",
+        get_family_name(family_instance) or u"(No Family)",
+        get_family_type_name(family_instance) or u"(No Type)"
+    )
+def pick_host_family_instance():
+    """Pick một FamilyInstance trong Model hiện tại."""
+    reference = uidoc.Selection.PickObject(
+        ObjectType.Element,
+        FamilyInstanceSelectionFilter(),
+        u"Pick một Family trong Model hiện tại"
+    )
+    element = doc.GetElement(reference.ElementId)
+    if not isinstance(element, DB.FamilyInstance):
+        raise ValueError(u"Đối tượng đã pick không phải FamilyInstance.")
+    return element
+def pick_sample_group():
+    """Pick một Model Group đã đặt đúng vị trí mẫu trong Model hiện tại."""
+    reference = uidoc.Selection.PickObject(
+        ObjectType.Element,
+        ModelGroupSelectionFilter(),
+        u"Pick Model Group mẫu đã đặt đúng vị trí và cao độ"
+    )
+    element = doc.GetElement(reference.ElementId)
+    if not isinstance(element, DB.Group):
+        try:
+            if not is_invalid_element_id(element.GroupId):
+                element = doc.GetElement(element.GroupId)
+        except Exception:
+            pass
+    if not isinstance(element, DB.Group):
+        raise ValueError(u"Đối tượng đã pick không phải Model Group.")
+    return element
+def normalize_angle_pi(angle):
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle <= -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+def group_member_vectors(group, origin):
+    """
+    Với mỗi phần tử trong Group: (khóa loại, dx, dy, khoảng cách) - vector nằm ngang
+    từ điểm gốc Group tới vị trí phần tử. Dùng để đo góc xoay Group, vì Revit KHÔNG
+    cho đọc góc xoay của Group (Location.Rotation không hỗ trợ, không có GetTransform).
+    """
+    result = []
+    try:
+        member_ids = list(group.GetMemberIds())
+    except Exception:
+        return result
+    min_distance = mm_to_internal(2.0)
+    for member_id in member_ids:
+        try:
+            element = doc.GetElement(member_id)
+            if element is None:
+                continue
+            point = None
+            location = element.Location
+            if isinstance(location, DB.LocationPoint):
+                point = location.Point
+            elif isinstance(location, DB.LocationCurve):
+                curve = location.Curve
+                if curve is not None:
+                    point = curve.Evaluate(0.5, True)
+            if point is None:
+                continue
+            dx = point.X - origin.X
+            dy = point.Y - origin.Y
+            distance = math.sqrt(dx * dx + dy * dy)
+            if distance < min_distance:
+                continue
+            try:
+                category_id = get_id_value(element.Category.Id)
+            except Exception:
+                category_id = -1
+            try:
+                type_id = get_id_value(element.GetTypeId())
+            except Exception:
+                type_id = -1
+            result.append(((category_id, type_id), dx, dy, distance))
+        except Exception:
+            pass
+    return result
+def _rotate_xy(x, y, theta):
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    return x * cos_t - y * sin_t, x * sin_t + y * cos_t
+def _match_rotation_pairs(sample_vectors, reference_vectors, theta, tolerance):
+    pairs = []
+    used = set()
+    for sample in sample_vectors:
+        best_index = None
+        best_error = None
+        for index, reference in enumerate(reference_vectors):
+            if index in used or reference[0] != sample[0]:
+                continue
+            rx, ry = _rotate_xy(reference[1], reference[2], theta)
+            error = math.sqrt((rx - sample[1]) ** 2 + (ry - sample[2]) ** 2)
+            if best_error is None or error < best_error:
+                best_error = error
+                best_index = index
+        if best_index is not None and best_error <= tolerance:
+            used.add(best_index)
+            pairs.append((reference_vectors[best_index], sample))
+    return pairs
+def estimate_group_rotation(sample_vectors, reference_vectors):
+    """
+    Góc xoay (radian, ngược chiều kim đồng hồ) của Group so với Group đặt thử ở 0°.
+    Trả về (theta, số_cặp, tổng_phần_tử, độ_lệch_tối_đa_độ) hoặc None.
+    """
+    if not sample_vectors or not reference_vectors:
+        return None
+    tolerance = mm_to_internal(5.0)
+    anchor = max(sample_vectors, key=lambda item: item[3])
+    best = None
+    for reference in reference_vectors:
+        if reference[0] != anchor[0] or abs(reference[3] - anchor[3]) > tolerance:
+            continue
+        theta = math.atan2(
+            reference[1] * anchor[2] - reference[2] * anchor[1],
+            reference[1] * anchor[1] + reference[2] * anchor[2]
+        )
+        pairs = _match_rotation_pairs(sample_vectors, reference_vectors, theta, tolerance)
+        if best is None or len(pairs) > len(best[1]):
+            best = (theta, pairs)
+    if best is None or not best[1]:
+        return None
+    pairs = best[1]
+    cross = sum(r[1] * s_[2] - r[2] * s_[1] for r, s_ in pairs)
+    dot = sum(r[1] * s_[1] + r[2] * s_[2] for r, s_ in pairs)
+    theta = math.atan2(cross, dot)
+    pairs = _match_rotation_pairs(sample_vectors, reference_vectors, theta, tolerance)
+    if not pairs:
+        return None
+    max_deviation = 0.0
+    for r, s_ in pairs:
+        individual = math.atan2(
+            r[1] * s_[2] - r[2] * s_[1],
+            r[1] * s_[1] + r[2] * s_[2]
+        )
+        max_deviation = max(
+            max_deviation,
+            abs(math.degrees(normalize_angle_pi(individual - theta)))
+        )
+    return theta, len(pairs), len(sample_vectors), max_deviation
+def probe_default_group_vectors(group_type, point):
+    """
+    Đặt thử một Group cùng Type ở góc 0° (đúng cách tool đặt Group), đọc vị trí các
+    phần tử bên trong rồi RollBack - không để lại gì trong model.
+    """
+    probe = DB.Transaction(doc, u"Probe Group Default Orientation")
+    try:
+        probe.Start()
+        temp_group = doc.Create.PlaceGroup(point, group_type)
+        origin = get_group_origin_point(temp_group)
+        if origin is None:
+            origin = point
+        vectors = group_member_vectors(temp_group, origin)
+        probe.RollBack()
+        return vectors
+    except Exception:
+        try:
+            if probe.GetStatus() == DB.TransactionStatus.Started:
+                probe.RollBack()
+        except Exception:
+            pass
+        raise
+def measure_sample_group_rotation(group, origin, notices):
+    """Trả về (góc_radian hoặc None, mô tả nguồn / lý do thất bại)."""
+    try:
+        sample_vectors = group_member_vectors(group, origin)
+        if not sample_vectors:
+            return None, u"Group mẫu không có phần tử nào cách điểm gốc hơn 2 mm"
+        reference = probe_default_group_vectors(group.GroupType, origin)
+        if not reference:
+            return None, u"Group đặt thử không có phần tử nào đo được"
+        estimate = estimate_group_rotation(sample_vectors, reference)
+        if estimate is None:
+            return None, u"không ghép được phần tử của Group mẫu với Group đặt thử"
+        theta, pairs, total, deviation = estimate
+        if pairs < total:
+            notices.append(
+                u"Chỉ ghép được {0}/{1} phần tử của Group mẫu khi đo góc xoay.".format(pairs, total)
+            )
+        if deviation > 1.0:
+            notices.append(
+                u"CẢNH BÁO: các phần tử trong Group cho góc xoay lệch nhau tối đa {0:.2f}° "
+                u"(Group có thể bị chỉnh riêng từng phần tử); góc đo có thể kém tin cậy.".format(deviation)
+            )
+        return theta, u"đo từ vị trí {0}/{1} phần tử trong Group so với Group đặt thử ở 0°".format(
+            pairs, total
+        )
+    except Exception as ex:
+        return None, u"lỗi khi đo góc Group: {0}".format(safe_text(ex))
+def compute_learned_placement(sample_group, family_instance, rotation_basis, source_item):
+    """
+    Học vị trí (X/Y cục bộ), cao độ (Z) và góc xoay lệch giữa một Model Group
+    đã đặt đúng mẫu và Family nguồn tương ứng. Kết quả dùng làm Offset X/Y/Z
+    và Hiệu chỉnh góc áp dụng đồng loạt cho mọi Family nguồn còn lại.
 
-
+    QUAN TRỌNG VỀ HỆ TỌA ĐỘ:
+    - Model Group (sample_group) luôn nằm trong Model hiện tại (host), nên
+      get_group_location() trả về điểm theo hệ tọa độ HOST.
+    - Khi Family nguồn nằm trong Revit Link, get_family_origin()/
+      get_family_local_axes() trả về điểm/vector theo hệ tọa độ CỤC BỘ của
+      Link, KHÁC với hệ tọa độ Host. Nếu trừ trực tiếp hai giá trị này (như
+      trước đây) sẽ ra sai số bằng đúng phần translate/rotate của Link so với
+      Host - biểu hiện rõ nhất là sai cao độ Z và lệch vị trí X/Y.
+    - Cách xử lý: quy toàn bộ phép tính về hệ tọa độ cục bộ của nguồn (giống
+      hệt những gì get_anchor_point() làm khi áp dụng lại cho Family khác),
+      bằng cách đưa group_point từ Host về hệ cục bộ qua transform nghịch đảo
+      của nguồn. Với Model hiện tại, transform là Identity nên không đổi gì.
+    Trả về dict: offset_x_mm, offset_y_mm, offset_z_mm, rotation_offset_deg, notices.
+    """
+    notices = []
+    origin = get_family_origin(family_instance)
+    if origin is None:
+        raise ValueError(u"Không xác định được điểm gốc của Family mẫu.")
+    local_x, local_y = get_family_sample_axes(family_instance)
+    group_point_host = get_group_origin_point(sample_group)
+    origin_is_exact = group_point_host is not None
+    if group_point_host is None:
+        group_point_host = get_group_location(sample_group)
+        if group_point_host is not None:
+            notices.append(
+                u"CẢNH BÁO: không đọc được điểm gốc (LocationPoint) của Group mẫu, "
+                u"đã dùng tâm BoundingBox thay thế nên Offset có thể lệch."
+            )
+    if group_point_host is None:
+        raise ValueError(u"Không xác định được vị trí của Group mẫu.")
+    try:
+        inverse_transform = source_item.transform.Inverse
+    except Exception:
+        inverse_transform = DB.Transform.Identity
+    group_point = inverse_transform.OfPoint(group_point_host)
+    relative = group_point - origin
+    offset_x_internal = relative.DotProduct(local_x)
+    offset_y_internal = relative.DotProduct(local_y)
+    offset_z_internal = group_point.Z - origin.Z
+    group_angle, rotation_source = measure_sample_group_rotation(
+        sample_group, group_point_host, notices
+    )
+    family_direction = get_rotation_direction(family_instance, rotation_basis)
+    try:
+        family_direction_host = source_item.transform.OfVector(family_direction)
+    except Exception:
+        family_direction_host = family_direction
+    family_angle = vector_angle_xy(family_direction_host)
+    family_angle_deg = math.degrees(family_angle)
+    if group_angle is None:
+        group_angle = 0.0
+        rotation_source = u"GIẢ ĐỊNH 0° (" + rotation_source + u")"
+        notices.append(
+            u"CẢNH BÁO: không đo được góc xoay của Group mẫu nên giả định Group mẫu "
+            u"KHÔNG xoay. Nếu Group mẫu có xoay, hãy sửa ô 'Hiệu chỉnh góc Group'."
+        )
+    rotation_offset_deg = math.degrees(normalize_angle_pi(group_angle - family_angle))
+    def _mm_xyz(point):
+        return u"({0:.1f}; {1:.1f}; {2:.1f})".format(
+            internal_to_mm(point.X), internal_to_mm(point.Y), internal_to_mm(point.Z)
+        )
+    debug_lines = [
+        u"Group mẫu ID {0}; Family mẫu ID {1}".format(
+            get_id_value(sample_group.Id), get_family_id_value(family_instance)
+        ),
+        u"Điểm gốc Group mẫu (host, mm): {0} - {1}".format(
+            _mm_xyz(group_point_host),
+            u"LocationPoint" if origin_is_exact else u"tâm BoundingBox (dự phòng)"
+        ),
+        u"Điểm gốc Family mẫu (hệ nguồn, mm): {0}".format(_mm_xyz(origin)),
+        u"Điểm gốc Group mẫu quy về hệ nguồn (mm): {0}".format(_mm_xyz(group_point)),
+        u"Trục X = hướng {0:.1f}°, trục Y = hướng {1:.1f}°".format(
+            math.degrees(vector_angle_xy(local_x)), math.degrees(vector_angle_xy(local_y))
+        ),
+        u"Góc Group mẫu: {0:.2f}° (nguồn: {1}); góc Family theo {2}: {3:.2f}°; Hiệu chỉnh góc = {4:.2f}°".format(
+            math.degrees(group_angle),
+            rotation_source,
+            rotation_basis,
+            family_angle_deg,
+            rotation_offset_deg
+        )
+    ]
+    return {
+        "offset_x_mm": internal_to_mm(offset_x_internal),
+        "offset_y_mm": internal_to_mm(offset_y_internal),
+        "offset_z_mm": internal_to_mm(offset_z_internal),
+        "rotation_offset_deg": rotation_offset_deg,
+        "notices": notices,
+        "debug": debug_lines
+    }
 def pick_linked_family_instance(allowed_link_items):
     """Pick một FamilyInstance trong một Revit Link đã được chọn ban đầu."""
     reference = uidoc.Selection.PickObject(
         ObjectType.LinkedElement,
         u"Pick một Family trong Revit Link đã chọn"
     )
-
     link_instance = doc.GetElement(reference.ElementId)
     if not isinstance(link_instance, DB.RevitLinkInstance):
         raise ValueError(u"Đối tượng đã pick không thuộc Revit Link.")
-
     allowed_map = {}
     for item in allowed_link_items:
         try:
             allowed_map[get_id_value(item.element.Id)] = item
         except Exception:
             pass
-
     link_id_value = get_id_value(link_instance.Id)
     link_item = allowed_map.get(link_id_value)
     if link_item is None:
         raise ValueError(
             u"Family đã pick thuộc Link không nằm trong danh sách Link đã chọn khi mở tool."
         )
-
     link_doc = link_instance.GetLinkDocument()
     if link_doc is None:
         raise ValueError(u"Revit Link chứa Family đã pick hiện không được load.")
-
     try:
         linked_element_id = reference.LinkedElementId
     except Exception:
         linked_element_id = None
-
     if linked_element_id is None or is_invalid_element_id(linked_element_id):
         raise ValueError(u"Không đọc được ElementId của phần tử trong Revit Link.")
-
     linked_element = link_doc.GetElement(linked_element_id)
     if not isinstance(linked_element, DB.FamilyInstance):
         raise ValueError(u"Đối tượng đã pick không phải FamilyInstance. Hãy pick đúng Family trong Link.")
-
     return link_item, linked_element
-
-
 def get_document_cache_key():
     parts = []
-
     try:
         project_info = doc.ProjectInformation
         if project_info is not None:
             parts.append(safe_text(project_info.UniqueId))
     except Exception:
         pass
-
     try:
         path_name = safe_text(doc.PathName).strip()
         if path_name:
             parts.append(path_name.lower())
     except Exception:
         pass
-
     try:
         parts.append(safe_text(doc.Title).lower())
     except Exception:
         pass
-
     return u"|".join(parts)
-
-
 def transform_signature(transform):
     try:
         values = [
@@ -860,11 +1064,8 @@ def transform_signature(transform):
         return u",".join([u"{0:.8f}".format(value) for value in values])
     except Exception:
         return u""
-
-
 def get_view_state_signature(view):
     parts = [safe_text(getattr(view, "ViewType", u""))]
-
     try:
         parts.append(u"CROP_ACTIVE={0}".format(bool(view.CropBoxActive)))
         crop_box = view.CropBox
@@ -880,7 +1081,6 @@ def get_view_state_signature(view):
             ))
     except Exception:
         pass
-
     if isinstance(view, DB.ViewPlan):
         try:
             view_range = view.GetViewRange()
@@ -902,7 +1102,6 @@ def get_view_state_signature(view):
                     pass
         except Exception:
             pass
-
     try:
         if isinstance(view, DB.View3D) and view.IsSectionBoxActive:
             section_box = view.GetSectionBox()
@@ -918,10 +1117,7 @@ def get_view_state_signature(view):
                 ))
     except Exception:
         pass
-
     return u"|".join(parts)
-
-
 def make_scan_signature(
         link_items,
         host_view,
@@ -932,9 +1128,10 @@ def make_scan_signature(
         source_mode="KEYWORD",
         picked_family_name=u"",
         picked_type_name=u"",
-        lock_picked_type=False):
+        lock_picked_type=False,
+        selected_type_keys=None,
+        skip_group_members=False):
     """Tạo chữ ký cache, bao gồm các thiết lập ảnh hưởng tới danh sách nguồn."""
-
     try:
         view_uid = safe_text(host_view.UniqueId)
     except Exception:
@@ -942,7 +1139,6 @@ def make_scan_signature(
             view_uid = safe_text(get_id_value(host_view.Id))
         except Exception:
             view_uid = u"-1"
-
     link_keys = []
     for link_item in link_items:
         link_uid = safe_text(getattr(link_item, "uid", u""))
@@ -953,24 +1149,27 @@ def make_scan_signature(
                 linked_view_uid = safe_text(linked_view.UniqueId)
         except Exception:
             pass
-
         link_keys.append(u"{0}|{1}|{2}".format(
             link_uid,
             transform_signature(link_item.transform),
             linked_view_uid
         ))
-
     link_keys.sort()
+    source_kind = u"LINK"
+    for link_item in link_items:
+        if is_host_source(link_item):
+            source_kind = u"HOST"
+            break
     normalized_filter = u"|".join(split_keywords(raw_filter_text))
     raw_tolerance = safe_text(source_overlap_tolerance_text).strip().replace(u",", u".")
     try:
         normalized_tolerance = u"{0:.6f}".format(float(raw_tolerance or 0.0))
     except Exception:
         normalized_tolerance = raw_tolerance
-
     return (
         u"CACHEV={0};DOC={1};VIEW={2};VIEWSTATE={3};LINKS={4};FILTER={5};"
-        u"IGNORE_NESTED={6};SOURCE_DEDUP={7};SOURCE_TOL={8};SOURCE_SELECTOR={9}"
+        u"IGNORE_NESTED={6};SOURCE_DEDUP={7};SOURCE_TOL={8};SOURCE_SELECTOR={9};"
+        u"SOURCE_KIND={10};SKIP_GROUP_MEMBER={11}"
     ).format(
         CACHE_VERSION,
         get_document_cache_key(),
@@ -985,45 +1184,40 @@ def make_scan_signature(
             source_mode,
             picked_family_name,
             picked_type_name,
-            lock_picked_type
-        )
+            lock_picked_type,
+            selected_type_keys
+        ),
+        source_kind,
+        bool(skip_group_members) if source_kind == u"HOST" else False
     )
-
 def serialize_scan_cache(signature, work_items, diagnostics=None):
     entries = []
     used_source_keys = set()
-
     for work_item in work_items:
         source_key = family_source_key(work_item.link_item, work_item.family)
         if source_key in used_source_keys:
             continue
         used_source_keys.add(source_key)
-
         family_uid = get_family_unique_id(work_item.family)
         family_id = get_family_id_value(work_item.family)
         if not family_uid and family_id < 0:
             continue
-
         entries.append({
             "link_uid": safe_text(work_item.link_item.uid),
             "family_uid": family_uid,
             "family_id": family_id
         })
-
     payload = {
         "version": CACHE_VERSION,
         "signature": safe_text(signature),
         "entries": entries,
         "diagnostics": diagnostics or new_scan_diagnostics()
     }
-
     return safe_text(json.dumps(
         payload,
         ensure_ascii=True,
         separators=(",", ":")
     ))
-
-
 def save_persistent_scan_cache(
         config,
         signature,
@@ -1038,30 +1232,22 @@ def save_persistent_scan_cache(
     if filter_text is not None:
         config.family_filter = safe_text(filter_text)
     script.save_config()
-
-
 def get_cached_family(link_doc, family_uid, family_id):
     family = None
-
     if family_uid:
         try:
             family = link_doc.GetElement(family_uid)
         except Exception:
             family = None
-
     if family is None:
         try:
             if int(family_id) >= 0:
                 family = link_doc.GetElement(DB.ElementId(int(family_id)))
         except Exception:
             family = None
-
     if isinstance(family, DB.FamilyInstance):
         return family
-
     return None
-
-
 def load_persistent_scan_cache(
         config,
         expected_signature,
@@ -1072,37 +1258,30 @@ def load_persistent_scan_cache(
     raw_cache = safe_text(getattr(config, "scan_cache_json", u"")).strip()
     if not raw_cache:
         return None, u"Không có cache đã lưu.", None
-
     try:
         payload = json.loads(raw_cache)
     except Exception:
         return None, u"Cache đã lưu bị lỗi định dạng.", None
-
     try:
         if int(payload.get("version", -1)) != CACHE_VERSION:
             return None, u"Cache thuộc phiên bản tool cũ.", None
     except Exception:
         return None, u"Cache thuộc phiên bản tool cũ.", None
-
     if safe_text(payload.get("signature", u"")) != safe_text(expected_signature):
         return None, u"Cache không khớp Active View, Link, bộ lọc hoặc thiết lập chống trùng.", None
-
     link_map = {}
     for link_item in link_items:
         link_map[safe_text(link_item.uid)] = link_item
-
     restored = []
     used_source_keys = set()
     entries = payload.get("entries", []) or []
     defensive_exact_duplicate_count = 0
     defensive_nested_count = 0
-
     for entry in entries:
         link_uid = safe_text(entry.get("link_uid", u""))
         link_item = link_map.get(link_uid)
         if link_item is None:
             return None, u"Một Revit Link trong cache không còn được chọn hoặc đã thay đổi.", None
-
         family = get_cached_family(
             link_item.link_doc,
             safe_text(entry.get("family_uid", u"")),
@@ -1110,25 +1289,21 @@ def load_persistent_scan_cache(
         )
         if family is None:
             return None, u"Một Family trong cache không còn tồn tại hoặc Link đã reload.", None
-
         if ignore_nested and get_super_component(family) is not None:
             defensive_nested_count += 1
             continue
-
         source_key = family_source_key(link_item, family)
         if source_key in used_source_keys:
             defensive_exact_duplicate_count += 1
             continue
         used_source_keys.add(source_key)
         restored.append(FamilyWorkItem(link_item, family))
-
     restored.sort(
         key=lambda item: (
             item.link_item.display_name.lower(),
             get_family_id_value(item.family)
         )
     )
-
     diagnostics = payload.get("diagnostics", None) or new_scan_diagnostics()
     diagnostics = dict(diagnostics)
     diagnostics["exact_source_duplicate_skipped"] = int(
@@ -1137,7 +1312,6 @@ def load_persistent_scan_cache(
     diagnostics["nested_skipped"] = int(
         diagnostics.get("nested_skipped", 0)
     ) + defensive_nested_count
-
     if source_dedup_enabled:
         restored, overlap_records = deduplicate_overlapping_sources(
             restored,
@@ -1150,36 +1324,27 @@ def load_persistent_scan_cache(
             diagnostics["duplicate_source_records"] = list(
                 diagnostics.get("duplicate_source_records", [])
             ) + overlap_records
-
     diagnostics["final_count"] = len(restored)
     return restored, u"Đã nạp cache bền từ lần kiểm tra trước.", diagnostics
-
 def describe_family(family_instance):
     family_name = u"Unknown Family"
     type_name = u"Unknown Type"
-
     try:
         family_name = safe_text(family_instance.Symbol.Family.Name)
     except Exception:
         pass
-
     try:
         type_name = get_element_name(family_instance.Symbol)
     except Exception:
         pass
-
     try:
         element_id = get_id_value(family_instance.Id)
     except Exception:
         element_id = u"?"
-
     return u"{0} : {1} [ID {2}]".format(family_name, type_name, element_id)
-
-
 # ============================================================
 # NHẬN DIỆN FAMILY HIỂN THỊ TRONG ACTIVE VIEW
 # ============================================================
-
 def get_link_graphics_settings(view, link_instance):
     """Revit 2024+. Trả về None trên phiên bản cũ hoặc view không hỗ trợ."""
     try:
@@ -1188,7 +1353,6 @@ def get_link_graphics_settings(view, link_instance):
             return settings
     except Exception:
         pass
-
     try:
         type_id = link_instance.GetTypeId()
         settings = view.GetLinkOverrides(type_id)
@@ -1196,49 +1360,38 @@ def get_link_graphics_settings(view, link_instance):
             return settings
     except Exception:
         pass
-
     return None
-
-
 def get_linked_view(link_item, host_view):
+    if is_host_source(link_item) or link_item.element is None:
+        return None
     settings = get_link_graphics_settings(host_view, link_item.element)
     if settings is None:
         return None
-
     try:
         visibility_type = safe_text(settings.LinkVisibilityType).lower()
         linked_view_id = settings.LinkedViewId
-
         if "bylinkview" not in visibility_type and "by link view" not in visibility_type:
             return None
         if is_invalid_element_id(linked_view_id):
             return None
-
         linked_view = link_item.link_doc.GetElement(linked_view_id)
         if isinstance(linked_view, DB.View) and not linked_view.IsTemplate:
             return linked_view
     except Exception:
         pass
-
     return None
-
-
 def category_is_visible_by_host_view(family_instance, host_view):
     try:
         category = family_instance.Category
         if category is None:
             return False
-
         # Built-in category ids có cùng giá trị giữa host và link.
         if host_view.GetCategoryHidden(category.Id):
             return False
     except Exception:
         # Một số category/link setting không cho query; không loại nhầm.
         pass
-
     return True
-
-
 def get_plan_view_z_range(view_plan):
     """
     Trả về khoảng Z host theo View Range. Bao gồm View Depth để các phần tử
@@ -1248,7 +1401,6 @@ def get_plan_view_z_range(view_plan):
         view_range = view_plan.GetViewRange()
     except Exception:
         return None
-
     elevations = []
     plane_names = [
         "TopClipPlane",
@@ -1256,28 +1408,21 @@ def get_plan_view_z_range(view_plan):
         "BottomClipPlane",
         "ViewDepthPlane"
     ]
-
     for plane_name in plane_names:
         try:
             plane = getattr(DB.PlanViewPlane, plane_name)
             level_id = view_range.GetLevelId(plane)
             offset = view_range.GetOffset(plane)
-
             if is_invalid_element_id(level_id):
                 continue
-
             level = doc.GetElement(level_id)
             if isinstance(level, DB.Level):
                 elevations.append(level.Elevation + offset)
         except Exception:
             pass
-
     if not elevations:
         return None
-
     return min(elevations), max(elevations)
-
-
 def get_active_view_clip_box(view):
     """
     Trả về (BoundingBoxXYZ, check_z).
@@ -1289,68 +1434,52 @@ def get_active_view_clip_box(view):
             return view.GetSectionBox(), True
     except Exception:
         pass
-
     try:
         if view.CropBoxActive:
             check_z = not isinstance(view, DB.ViewPlan)
             return view.CropBox, check_z
     except Exception:
         pass
-
     return None, False
-
-
 def points_intersect_oriented_box(host_points, oriented_box, check_z):
     if not host_points or oriented_box is None:
         return True
-
     try:
         inverse = oriented_box.Transform.Inverse
     except Exception:
         inverse = DB.Transform.Identity
-
     local_points = []
     for point in host_points:
         try:
             local_points.append(inverse.OfPoint(point))
         except Exception:
             local_points.append(point)
-
     xs = [point.X for point in local_points]
     ys = [point.Y for point in local_points]
     zs = [point.Z for point in local_points]
-
     min_pt = oriented_box.Min
     max_pt = oriented_box.Max
-
     if not ranges_overlap(min(xs), max(xs), min_pt.X, max_pt.X):
         return False
     if not ranges_overlap(min(ys), max(ys), min_pt.Y, max_pt.Y):
         return False
     if check_z and not ranges_overlap(min(zs), max(zs), min_pt.Z, max_pt.Z):
         return False
-
     return True
-
-
 def get_family_host_bbox_points(family_instance, link_item, linked_view=None):
     bbox = None
-
     if linked_view is not None:
         try:
             bbox = family_instance.get_BoundingBox(linked_view)
         except Exception:
             bbox = None
-
     if bbox is None:
         try:
             bbox = family_instance.get_BoundingBox(None)
         except Exception:
             bbox = None
-
     if bbox is None:
         return []
-
     result = []
     for link_point in bbox_model_corners(bbox):
         try:
@@ -1358,37 +1487,29 @@ def get_family_host_bbox_points(family_instance, link_item, linked_view=None):
         except Exception:
             pass
     return result
-
-
 def get_family_host_reference_point(family_instance, link_item, host_points=None):
     """
     Lấy cao độ đại diện của Family trong hệ tọa độ host.
-
     Ưu tiên LocationPoint/LocationCurve vì đây là cao độ đặt thật của Family.
     BoundingBox center chỉ là fallback. Việc kiểm tra thêm điểm đại diện giúp
     ngăn Family ở tầng trên lọt qua chỉ vì BoundingBox hoặc linked view rộng.
     """
     link_point = None
-
     try:
         location = family_instance.Location
-
         if isinstance(location, DB.LocationPoint):
             link_point = location.Point
-
         elif isinstance(location, DB.LocationCurve):
             curve = location.Curve
             if curve is not None:
                 link_point = curve.Evaluate(0.5, True)
     except Exception:
         link_point = None
-
     if link_point is not None:
         try:
             return link_item.transform.OfPoint(link_point)
         except Exception:
             pass
-
     if host_points:
         try:
             count = float(len(host_points))
@@ -1399,10 +1520,7 @@ def get_family_host_reference_point(family_instance, link_item, host_points=None
             )
         except Exception:
             pass
-
     return None
-
-
 def family_intersects_active_view(family_instance, link_item, host_view, linked_view):
     host_points = get_family_host_bbox_points(
         family_instance,
@@ -1411,12 +1529,10 @@ def family_intersects_active_view(family_instance, link_item, host_view, linked_
     )
     if not host_points:
         return False
-
     clip_box, check_z = get_active_view_clip_box(host_view)
     if clip_box is not None:
         if not points_intersect_oriented_box(host_points, clip_box, check_z):
             return False
-
     # Luôn kiểm tra View Range của Active View trong host, kể cả Link đang dùng
     # By Linked View. Collector của linked view chỉ cho biết Family hiện trong
     # linked view đó, không đảm bảo Family nằm trong tầng của host active view.
@@ -1426,7 +1542,6 @@ def family_intersects_active_view(family_instance, link_item, host_view, linked_
             z_min = z_range[0]
             z_max = z_range[1]
             z_values = [point.Z for point in host_points]
-
             # Bước 1: hình học Family phải giao với View Range của host.
             if not ranges_overlap(
                 min(z_values),
@@ -1435,7 +1550,6 @@ def family_intersects_active_view(family_instance, link_item, host_view, linked_
                 z_max
             ):
                 return False
-
             # Bước 2: điểm đặt đại diện cũng phải nằm trong View Range. Bước này
             # loại Family ở tầng trên/dưới có BoundingBox bất thường hoặc family
             # cao nhiều tầng nhưng điểm đặt không thuộc tầng đang mở.
@@ -1444,7 +1558,6 @@ def family_intersects_active_view(family_instance, link_item, host_view, linked_
                 link_item,
                 host_points
             )
-
             if reference_point is not None:
                 z_tolerance = mm_to_internal(5.0)
                 if (
@@ -1452,13 +1565,39 @@ def family_intersects_active_view(family_instance, link_item, host_view, linked_
                     or reference_point.Z > z_max + z_tolerance
                 ):
                     return False
-
     return True
-
-
-def collect_link_candidate_families(link_item, host_view):
+def collect_host_candidate_families(host_view):
+    """
+    Model hiện tại: dùng collector theo Active View để Revit tự loại phần tử bị ẩn
+    (Hide in View, Filter, Category tắt, Crop, View Range...). Nếu view không hỗ trợ
+    collector theo view thì quét toàn model và để bước kiểm tra visibility xử lý.
+    """
+    try:
+        collector = (
+            DB.FilteredElementCollector(doc, host_view.Id)
+            .OfClass(DB.FamilyInstance)
+            .WhereElementIsNotElementType()
+        )
+        return list(collector)
+    except Exception:
+        pass
+    collector = (
+        DB.FilteredElementCollector(doc)
+        .OfClass(DB.FamilyInstance)
+        .WhereElementIsNotElementType()
+    )
+    return list(collector)
+def collect_source_candidate_families(source_item, host_view):
+    """
+    Trả về (candidates, linked_view) cho một nguồn Family (Revit Link hoặc
+    Model hiện tại). linked_view chỉ khác None khi Link đang hiển thị
+    By Linked View (Revit 2024+); Model hiện tại và các trường hợp khác
+    luôn trả về None.
+    """
+    if is_host_source(source_item):
+        return collect_host_candidate_families(host_view), None
+    link_item = source_item
     linked_view = get_linked_view(link_item, host_view)
-
     if linked_view is not None:
         try:
             collector = (
@@ -1469,15 +1608,12 @@ def collect_link_candidate_families(link_item, host_view):
             return list(collector), linked_view
         except Exception:
             pass
-
     collector = (
         DB.FilteredElementCollector(link_item.link_doc)
         .OfClass(DB.FamilyInstance)
         .WhereElementIsNotElementType()
     )
     return list(collector), None
-
-
 def spatial_cell_key(point, tolerance):
     if point is None or tolerance <= 0.0:
         return None
@@ -1486,8 +1622,6 @@ def spatial_cell_key(point, tolerance):
         int(math.floor(point.Y / tolerance)),
         int(math.floor(point.Z / tolerance))
     )
-
-
 def make_duplicate_source_record(reason, kept_item, removed_item, distance_internal=None):
     distance_text = u"-"
     if distance_internal is not None:
@@ -1495,7 +1629,6 @@ def make_duplicate_source_record(reason, kept_item, removed_item, distance_inter
             distance_text = u"{0:.2f}".format(internal_to_mm(distance_internal))
         except Exception:
             pass
-
     return {
         "reason": reason,
         "kept_link": kept_item.link_item.display_name,
@@ -1504,8 +1637,6 @@ def make_duplicate_source_record(reason, kept_item, removed_item, distance_inter
         "removed_family": describe_family(removed_item.family),
         "distance_mm": distance_text
     }
-
-
 def deduplicate_overlapping_sources(work_items, tolerance):
     """
     Loại hai nguồn có cùng Category + Family + Type và điểm gốc trong host gần nhau.
@@ -1513,22 +1644,18 @@ def deduplicate_overlapping_sources(work_items, tolerance):
     """
     if tolerance is None or tolerance <= 0.0:
         return list(work_items), []
-
     kept = []
     buckets = {}
     duplicate_records = []
-
     for work_item in work_items:
         point = work_item.get_source_point()
         if point is None:
             kept.append(work_item)
             continue
-
         cell = spatial_cell_key(point, tolerance)
         semantic_key = work_item.semantic_key
         duplicate_of = None
         duplicate_distance = None
-
         for dx in (-1, 0, 1):
             if duplicate_of is not None:
                 break
@@ -1553,7 +1680,6 @@ def deduplicate_overlapping_sources(work_items, tolerance):
                             break
                     if duplicate_of is not None:
                         break
-
         if duplicate_of is not None:
             duplicate_records.append(make_duplicate_source_record(
                 u"Cùng Family/Type và chồng vị trí",
@@ -1562,14 +1688,10 @@ def deduplicate_overlapping_sources(work_items, tolerance):
                 duplicate_distance
             ))
             continue
-
         kept.append(work_item)
         bucket_key = (semantic_key, cell[0], cell[1], cell[2])
         buckets.setdefault(bucket_key, []).append(work_item)
-
     return kept, duplicate_records
-
-
 def collect_visible_matching_work_items(
         link_items,
         host_view,
@@ -1581,20 +1703,20 @@ def collect_visible_matching_work_items(
         source_mode="KEYWORD",
         picked_family_name=u"",
         picked_type_name=u"",
-        lock_picked_type=False):
+        lock_picked_type=False,
+        selected_type_keys=None,
+        skip_group_members=False):
     """Quét, lọc visibility và chuẩn hóa danh sách Family nguồn."""
-
+    selected_type_key_set = set(normalize_type_keys(selected_type_keys))
     diagnostics = new_scan_diagnostics()
     matched_candidates = []
     used_source_map = {}
-
     for link_item in link_items:
-        candidates, linked_view = collect_link_candidate_families(
+        candidates, linked_view = collect_source_candidate_families(
             link_item,
             host_view
         )
         diagnostics["candidate_total"] += len(candidates)
-
         for family_instance in candidates:
             try:
                 if not family_matches_source_filter(
@@ -1603,12 +1725,18 @@ def collect_visible_matching_work_items(
                         source_mode,
                         picked_family_name,
                         picked_type_name,
-                        lock_picked_type):
+                        lock_picked_type,
+                        selected_type_key_set):
                     continue
-
                 diagnostics["text_matched"] += 1
+                if (
+                    skip_group_members and
+                    is_host_source(link_item) and
+                    is_group_member(family_instance)
+                ):
+                    diagnostics["group_member_skipped"] += 1
+                    continue
                 current_item = FamilyWorkItem(link_item, family_instance)
-
                 super_component = get_super_component(family_instance)
                 if ignore_nested and super_component is not None:
                     diagnostics["nested_skipped"] += 1
@@ -1621,21 +1749,19 @@ def collect_visible_matching_work_items(
                         "distance_mm": u"-"
                     })
                     continue
-
                 source_key = current_item.source_key
                 kept_item = used_source_map.get(source_key)
                 if kept_item is not None:
                     diagnostics["exact_source_duplicate_skipped"] += 1
                     diagnostics["duplicate_source_records"].append(
                         make_duplicate_source_record(
-                            u"Trùng Link UniqueId + Family UniqueId",
+                            u"Trùng Nguồn UniqueId + Family UniqueId",
                             kept_item,
                             current_item,
                             0.0
                         )
                     )
                     continue
-
                 used_source_map[source_key] = current_item
                 matched_candidates.append((
                     link_item,
@@ -1644,11 +1770,9 @@ def collect_visible_matching_work_items(
                 ))
             except Exception:
                 pass
-
     visible_items = []
     cancelled = False
     total_matched = len(matched_candidates)
-
     def process_visibility(link_item, family_instance, linked_view):
         if linked_view is None and not category_is_visible_by_host_view(
             family_instance,
@@ -1656,7 +1780,6 @@ def collect_visible_matching_work_items(
         ):
             diagnostics["visibility_skipped"] += 1
             return
-
         if not family_intersects_active_view(
             family_instance,
             link_item,
@@ -1665,9 +1788,7 @@ def collect_visible_matching_work_items(
         ):
             diagnostics["visibility_skipped"] += 1
             return
-
         visible_items.append(FamilyWorkItem(link_item, family_instance))
-
     if progress_enabled and total_matched > 0:
         with forms.ProgressBar(
             title=(
@@ -1681,15 +1802,12 @@ def collect_visible_matching_work_items(
                 if progress.cancelled:
                     cancelled = True
                     break
-
                 link_item, family_instance, linked_view = candidate
                 try:
                     process_visibility(link_item, family_instance, linked_view)
                 except Exception:
                     diagnostics["visibility_skipped"] += 1
-
                 progress.update_progress(index + 1, total_matched)
-
             if progress.cancelled:
                 cancelled = True
     else:
@@ -1698,14 +1816,12 @@ def collect_visible_matching_work_items(
                 process_visibility(link_item, family_instance, linked_view)
             except Exception:
                 diagnostics["visibility_skipped"] += 1
-
     visible_items.sort(
         key=lambda item: (
             item.link_item.display_name.lower(),
             get_family_id_value(item.family)
         )
     )
-
     if source_dedup_enabled:
         visible_items, overlap_records = deduplicate_overlapping_sources(
             visible_items,
@@ -1715,33 +1831,25 @@ def collect_visible_matching_work_items(
         diagnostics["duplicate_source_records"] = list(
             diagnostics.get("duplicate_source_records", [])
         ) + overlap_records
-
     diagnostics["final_count"] = len(visible_items)
     return visible_items, cancelled, diagnostics
-
-
 # ============================================================
 # HÌNH HỌC FAMILY TRONG LINK
 # ============================================================
-
 def get_family_origin(family_instance):
     location = family_instance.Location
-
     if isinstance(location, DB.LocationPoint):
         return location.Point
-
     if isinstance(location, DB.LocationCurve):
         curve = location.Curve
         if curve is not None:
             return curve.Evaluate(0.5, True)
-
     try:
         transform = family_instance.GetTransform()
         if transform is not None:
             return transform.Origin
     except Exception:
         pass
-
     bbox = family_instance.get_BoundingBox(None)
     if bbox is not None:
         points = bbox_model_corners(bbox)
@@ -1751,57 +1859,91 @@ def get_family_origin(family_instance):
                 sum(point.Y for point in points) / len(points),
                 sum(point.Z for point in points) / len(points)
             )
-
     return None
-
-
 def get_family_local_axes(family_instance):
     local_x = None
     local_y = None
-
     try:
         local_x = normalize_xy(family_instance.HandOrientation)
     except Exception:
         pass
-
     try:
         local_y = normalize_xy(family_instance.FacingOrientation)
     except Exception:
         pass
-
     try:
         instance_transform = family_instance.GetTransform()
     except Exception:
         instance_transform = None
-
     if local_x is None and instance_transform is not None:
         local_x = normalize_xy(instance_transform.BasisX)
-
     if local_y is None and instance_transform is not None:
         local_y = normalize_xy(instance_transform.BasisY)
-
     if local_x is None:
         local_x = DB.XYZ.BasisX
-
     if local_y is None:
         local_y = DB.XYZ.BasisY
-
     if abs(local_x.DotProduct(local_y)) > 0.999:
         local_y = DB.XYZ(-local_x.Y, local_x.X, 0.0)
-
     return local_x, local_y
+def get_family_sample_axes(family_instance):
+    """
+    Trả về (local_x, local_y) VUÔNG GÓC THẬT SỰ trong mặt phẳng ngang, dùng
+    riêng cho chế độ "Theo mẫu Group đã đặt" (SAMPLE) - cả lúc học
+    (compute_learned_placement) lẫn lúc áp dụng (get_anchor_point).
 
+    Khác với get_family_local_axes() (dùng cho chế độ Anchor, giữ nguyên để
+    không ảnh hưởng hành vi đã có từ trước): hàm get_family_local_axes() đo
+    HandOrientation và FacingOrientation MỘT CÁCH ĐỘC LẬP rồi chiếu riêng từng
+    vector xuống mặt phẳng XY. Với Family đặt thẳng đứng kiểu thông thường thì
+    hai vector này vuông góc nên không sao; nhưng với Family gắn tường/trần
+    hoặc đặt nghiêng (ví dụ HandOrientation gần như thẳng đứng), chiếu riêng
+    từng vector có thể cho ra hai trục KHÔNG vuông góc với nhau.
 
+    Hệ quả: công thức chiếu bằng dot-product (offset = (P - origin).(trục))
+    chỉ đúng khi hai trục vuông góc; nếu không, offset X và Y bị "chéo" lẫn
+    nhau - biểu hiện ra ngoài là "đặt đúng một chiều, chiều còn lại (và đôi khi
+    cả cao độ cảm nhận) bị lệch", đúng như lỗi đã gặp. Hàm này khắc phục bằng
+    cách luôn suy trục còn lại là vuông góc thật sự với trục chính trong mặt
+    phẳng ngang, thay vì đo hai trục độc lập.
+    """
+    primary = None
+    used_facing_as_primary = False
+    try:
+        primary = normalize_xy(family_instance.HandOrientation)
+    except Exception:
+        primary = None
+    if primary is None:
+        try:
+            primary = normalize_xy(family_instance.FacingOrientation)
+            used_facing_as_primary = True
+        except Exception:
+            primary = None
+    if primary is None:
+        try:
+            instance_transform = family_instance.GetTransform()
+        except Exception:
+            instance_transform = None
+        if instance_transform is not None:
+            primary = normalize_xy(instance_transform.BasisX)
+        if primary is None and instance_transform is not None:
+            primary = normalize_xy(instance_transform.BasisY)
+            used_facing_as_primary = True
+    if primary is None:
+        primary = DB.XYZ.BasisX
+    perpendicular = DB.XYZ(-primary.Y, primary.X, 0.0)
+    if used_facing_as_primary:
+        # HandOrientation gần như thẳng đứng (Family gắn tường/trần); dùng
+        # FacingOrientation (hoặc BasisY) làm trục ngang chính thay thế.
+        return perpendicular, primary
+    return primary, perpendicular
 def transformed_point(transform, point):
     if transform is None:
         return point
     return transform.OfPoint(point)
-
-
 def collect_geometry_points(geometry_element, accumulated_transform, points, depth):
     if geometry_element is None or depth > 12:
         return
-
     for geometry_object in geometry_element:
         try:
             if isinstance(geometry_object, DB.GeometryInstance):
@@ -1815,11 +1957,9 @@ def collect_geometry_points(geometry_element, accumulated_transform, points, dep
                     points,
                     depth + 1
                 )
-
             elif isinstance(geometry_object, DB.Solid):
                 if geometry_object.Faces.Size == 0 or geometry_object.Edges.Size == 0:
                     continue
-
                 for edge in geometry_object.Edges:
                     try:
                         for point in edge.Tessellate():
@@ -1843,7 +1983,6 @@ def collect_geometry_points(geometry_element, accumulated_transform, points, dep
                             )
                         except Exception:
                             pass
-
             elif isinstance(geometry_object, DB.Mesh):
                 try:
                     for point in geometry_object.Vertices:
@@ -1852,66 +1991,48 @@ def collect_geometry_points(geometry_element, accumulated_transform, points, dep
                         )
                 except Exception:
                     pass
-
         except Exception:
             continue
-
-
 def get_solid_geometry_points(family_instance):
     options = DB.Options()
     options.ComputeReferences = False
     options.IncludeNonVisibleObjects = False
     options.DetailLevel = DB.ViewDetailLevel.Fine
-
     geometry = family_instance.get_Geometry(options)
     points = []
-
     collect_geometry_points(
         geometry,
         DB.Transform.Identity,
         points,
         0
     )
-
     return points
-
-
 def get_bbox_points(family_instance):
     bbox = family_instance.get_BoundingBox(None)
     return bbox_model_corners(bbox)
-
-
 def get_family_extents(family_instance, use_solid):
     origin = get_family_origin(family_instance)
     if origin is None:
         return None
-
     local_x, local_y = get_family_local_axes(family_instance)
-
     points = []
     used_solid = False
-
     if use_solid:
         try:
             points = get_solid_geometry_points(family_instance)
             used_solid = len(points) > 0
         except Exception:
             points = []
-
     if not points:
         points = get_bbox_points(family_instance)
-
     if not points:
         return None
-
     x_values = []
     y_values = []
-
     for point in points:
         relative = point - origin
         x_values.append(relative.DotProduct(local_x))
         y_values.append(relative.DotProduct(local_y))
-
     return {
         "origin": origin,
         "local_x": local_x,
@@ -1922,50 +2043,70 @@ def get_family_extents(family_instance, use_solid):
         "max_y": max(y_values),
         "used_solid": used_solid
     }
-
-
-def get_anchor_point(family_instance, anchor_mode, offset_x, offset_y, use_solid):
+def get_anchor_point(
+        family_instance,
+        placement_mode,
+        anchor_mode,
+        offset_x,
+        offset_y,
+        offset_z,
+        use_solid):
+    """
+    Trả về (target_point, used_solid).
+    - placement_mode == "SAMPLE": đặt Group tại điểm = gốc Family + Offset X/Y
+      theo hệ trục cục bộ (HandOrientation/FacingOrientation), không cần đọc
+      Solid/BoundingBox nên luôn nhanh. Offset X/Y/Z thường được học tự động
+      từ một Group mẫu đã đặt đúng (xem compute_learned_placement), nhưng vẫn
+      có thể chỉnh tay.
+    - placement_mode khác (mặc định "ANCHOR"): giữ nguyên cách cũ, đặt tại một
+      trong bốn góc BoundingBox/Solid của Family rồi cộng thêm Offset X/Y.
+    Trong cả hai chế độ, cao độ Z luôn bằng gốc Family + Offset Z (Offset Z
+    mặc định 0 để giữ đúng hành vi cũ khi chưa dùng Group mẫu).
+    """
+    mode_kind = safe_text(placement_mode).upper().strip()
+    if mode_kind == "SAMPLE":
+        origin = get_family_origin(family_instance)
+        if origin is None:
+            return None, False
+        local_x, local_y = get_family_sample_axes(family_instance)
+        target = (
+            origin
+            + local_x.Multiply(offset_x)
+            + local_y.Multiply(offset_y)
+        )
+        target = DB.XYZ(target.X, target.Y, origin.Z + offset_z)
+        return target, False
     extents = get_family_extents(family_instance, use_solid)
     if extents is None:
         return None, False
-
     mode = safe_text(anchor_mode).upper().strip()
-
     if mode.startswith("LEFT_"):
         x_value = extents["min_x"]
     elif mode.startswith("RIGHT_"):
         x_value = extents["max_x"]
     else:
         raise ValueError(u"Anchor mode không hợp lệ: {0}".format(mode))
-
     if mode.endswith("_FRONT"):
         y_value = extents["max_y"]
     elif mode.endswith("_BACK"):
         y_value = extents["min_y"]
     else:
         raise ValueError(u"Anchor mode không hợp lệ: {0}".format(mode))
-
     # Offset có dấu theo hệ trục cục bộ của Family.
     x_value += offset_x
     y_value += offset_y
-
     origin = extents["origin"]
     local_x = extents["local_x"]
     local_y = extents["local_y"]
-
     target = (
         origin
         + local_x.Multiply(x_value)
         + local_y.Multiply(y_value)
     )
-
-    target = DB.XYZ(target.X, target.Y, origin.Z)
+    target = DB.XYZ(target.X, target.Y, origin.Z + offset_z)
     return target, extents["used_solid"]
-
-
 def get_rotation_direction(family_instance, rotation_basis):
     basis = safe_text(rotation_basis).upper().strip()
-
     if basis == "FACING":
         try:
             direction = normalize_xy(family_instance.FacingOrientation)
@@ -1980,17 +2121,22 @@ def get_rotation_direction(family_instance, rotation_basis):
                 return direction
         except Exception:
             pass
-
     local_x, local_y = get_family_local_axes(family_instance)
     if basis == "FACING":
         return local_y
     return local_x
-
-
 # ============================================================
 # KIỂM TRA GROUP TRÙNG
 # ============================================================
-
+def get_group_origin_point(group):
+    """Điểm gốc THẬT của Group (LocationPoint) - đúng điểm PlaceGroup() dùng để đặt."""
+    try:
+        location = group.Location
+        if isinstance(location, DB.LocationPoint):
+            return location.Point
+    except Exception:
+        pass
+    return None
 def get_group_location(group):
     try:
         location = group.Location
@@ -1998,7 +2144,6 @@ def get_group_location(group):
             return location.Point
     except Exception:
         pass
-
     try:
         bbox = group.get_BoundingBox(None)
         if bbox is not None:
@@ -2011,10 +2156,7 @@ def get_group_location(group):
                 )
     except Exception:
         pass
-
     return None
-
-
 def collect_existing_group_points(group_type):
     result = []
     collector = (
@@ -2022,9 +2164,7 @@ def collect_existing_group_points(group_type):
         .OfClass(DB.Group)
         .WhereElementIsNotElementType()
     )
-
     target_type_id = get_id_value(group_type.Id)
-
     for group in collector:
         try:
             if get_id_value(group.GroupType.Id) != target_type_id:
@@ -2034,94 +2174,207 @@ def collect_existing_group_points(group_type):
                 result.append(point)
         except Exception:
             pass
-
     return result
-
-
 def has_nearby_point(target_point, existing_points, tolerance):
     if tolerance <= 0.0:
         return False
-
     for point in existing_points:
         try:
             if points_distance_3d(target_point, point) <= tolerance:
                 return True
         except Exception:
             pass
-
     return False
-
-
 # ============================================================
 # GIAO DIỆN NGƯỜI DÙNG
 # ============================================================
-
 class SettingsWindow(forms.WPFWindow):
-    def __init__(self, xaml_file, link_items, group_items, config, view):
+    def __init__(
+            self,
+            xaml_file,
+            link_items,
+            group_items,
+            config,
+            view,
+            initial_status=None,
+            sample_status=None,
+            picked_link_name=u""):
         forms.WPFWindow.__init__(self, xaml_file)
-
-        self.link_items = link_items
+        self.link_items = list(link_items or [])
+        self.host_item = HostModelItem(doc)
         self.group_items = group_items
         self.config = config
         self.host_view = view
         self.result = None
-
         self.cached_matched_items = None
         self.cached_scan_signature = None
         self.cached_scan_diagnostics = None
         self.cache_source = None
-
         self.picked_family_name = u""
         self.picked_type_name = u""
-        self.picked_link_name = u""
-
+        self.picked_link_name = safe_text(picked_link_name)
+        # Thao tác cần pick trong Revit: cửa sổ ĐÓNG hẳn, vòng lặp ở phần khởi chạy
+        # thực hiện pick rồi mở lại cửa sổ với đúng trạng thái cũ.
+        self.pending_action = None
+        self.pending_payload = {}
+        # Family nguồn đã dùng để học vị trí/cao độ từ Group mẫu (chế độ Sample).
+        # Family này đã có Group mẫu sẵn tại đó nên sẽ bị loại khỏi danh sách
+        # đặt Group khi chạy thật, tránh đặt chồng lên Group đã có.
+        self.learned_sample_source_key = u""
+        self.learned_sample_description = u""
+        self.learned_sample_summary = u""
+        self.learned_sample_signature = u""
+        self.learned_sample_debug = u""
+        self.learned_rotation_basis = u""
+        # Danh sách Type cho chế độ "Chọn theo Type"
+        self.type_entries = []
+        self.selected_type_keys = set()
+        self._suppress_type_events = False
+        self._initializing = True
         self.active_view_text.Text = u"Active View: {0}".format(
             get_element_name(view) or safe_text(view.ViewType)
         )
-
-        for item in link_items:
-            self.links_list.Items.Add(item.display_name)
-
         for item in group_items:
             self.group_combo.Items.Add(item.display_name)
-
         self.rotation_basis_combo.Items.Add(u"Xoay theo HandOrientation")
         self.rotation_basis_combo.Items.Add(u"Xoay theo FacingOrientation")
-
         self.restore_config()
-
+        self.refresh_links_list()
         self.scan_button.Click += self.scan_clicked
         self.run_button.Click += self.run_clicked
         self.cancel_button.Click += self.cancel_clicked
         self.pick_family_button.Click += self.pick_family_clicked
+        self.pick_links_button.Click += self.pick_links_clicked
+        self.learn_sample_button.Click += self.learn_sample_clicked
+        self.placement_anchor_radio.Checked += self.placement_mode_changed
+        self.placement_sample_radio.Checked += self.placement_mode_changed
+        self.source_link_radio.Checked += self.source_kind_changed
+        self.source_host_radio.Checked += self.source_kind_changed
         self.keyword_mode_radio.Checked += self.source_mode_changed
         self.pick_mode_radio.Checked += self.source_mode_changed
+        self.types_mode_radio.Checked += self.source_mode_changed
+        self.load_types_button.Click += self.load_types_clicked
+        self.select_all_types_button.Click += self.select_all_types_clicked
+        self.clear_types_button.Click += self.clear_types_clicked
+        self.type_search_text.TextChanged += self.type_search_changed
+        self.type_search_text.PreviewKeyDown += self.type_search_key_down
+        self.type_list.SelectionChanged += self.type_list_selection_changed
         self.pick_exact_type_checkbox.Checked += self.scan_setting_changed
         self.pick_exact_type_checkbox.Unchecked += self.scan_setting_changed
         self.filter_text.TextChanged += self.scan_setting_changed
         self.ignore_nested_checkbox.Checked += self.scan_setting_changed
         self.ignore_nested_checkbox.Unchecked += self.scan_setting_changed
+        self.skip_group_member_checkbox.Checked += self.scan_setting_changed
+        self.skip_group_member_checkbox.Unchecked += self.scan_setting_changed
         self.source_dedup_checkbox.Checked += self.scan_setting_changed
         self.source_dedup_checkbox.Unchecked += self.scan_setting_changed
         self.source_overlap_tolerance_text.TextChanged += self.scan_setting_changed
         self.test_one_checkbox.Checked += self.test_one_changed
         self.test_one_checkbox.Unchecked += self.test_one_changed
-
         self.update_source_mode_state()
+        self.update_placement_mode_state()
         self.update_test_index_state()
+        self.update_type_selection_text()
+        if self.get_source_mode() == "TYPES" and self.source_is_ready():
+            self.load_type_list(show_message=False)
+        self._initializing = False
         self.try_load_persistent_cache()
-
+        scroll_target = None
+        if initial_status:
+            self.match_count_text.Text = initial_status
+            scroll_target = self.match_count_text
+        if sample_status:
+            self.sample_info_text.Text = sample_status
+            scroll_target = self.sample_info_text
+        if scroll_target is not None:
+            self._scroll_target = scroll_target
+            self.Loaded += self._scroll_to_status
+    def _scroll_to_status(self, sender, args):
+        try:
+            self._scroll_target.BringIntoView()
+        except Exception:
+            pass
+    def set_sample_status(self, text):
+        """Hiện trạng thái học mẫu ở CẢ ô trong mục 3 và ô trạng thái mục 1."""
+        self.sample_info_text.Text = text
+        self.match_count_text.Text = text
+    def apply_state_to_config(self):
+        """Ghi toàn bộ giá trị đang hiển thị vào config (trong bộ nhớ) để mở lại cửa sổ khôi phục."""
+        cfg = self.config
+        group_item = self.get_selected_group_item()
+        if group_item is not None:
+            cfg.last_group_uid = group_item.uid
+        cfg.source_document_mode = self.get_source_kind()
+        cfg.family_filter = safe_text(self.filter_text.Text)
+        cfg.source_filter_mode = self.get_source_mode()
+        cfg.picked_family_name = self.picked_family_name
+        cfg.picked_type_name = self.picked_type_name
+        cfg.pick_exact_type = self.pick_exact_type_checkbox.IsChecked is True
+        cfg.selected_type_keys_json = safe_text(json.dumps(
+            sorted(self.selected_type_keys),
+            ensure_ascii=True
+        ))
+        cfg.skip_group_members = self.skip_group_member_checkbox.IsChecked is True
+        cfg.placement_mode = self.get_placement_mode()
+        cfg.anchor_mode = self.get_anchor_mode()
+        cfg.offset_x_mm = safe_text(self.offset_x_text.Text)
+        cfg.offset_y_mm = safe_text(self.offset_y_text.Text)
+        cfg.offset_z_mm = safe_text(self.offset_z_text.Text)
+        cfg.rotation_offset_deg = safe_text(self.rotation_offset_text.Text)
+        cfg.rotation_basis = (
+            "FACING" if self.rotation_basis_combo.SelectedIndex == 1 else "HAND"
+        )
+        cfg.ignore_nested = self.ignore_nested_checkbox.IsChecked is True
+        cfg.source_dedup_enabled = self.source_dedup_checkbox.IsChecked is True
+        cfg.source_overlap_tolerance_mm = safe_text(
+            self.source_overlap_tolerance_text.Text
+        )
+        cfg.skip_duplicate = self.skip_duplicate_checkbox.IsChecked is True
+        cfg.duplicate_tolerance_mm = safe_text(self.duplicate_tolerance_text.Text)
+        cfg.use_solid = self.use_solid_checkbox.IsChecked is True
+        cfg.test_one = self.test_one_checkbox.IsChecked is True
+        cfg.test_family_index = safe_text(self.test_index_text.Text)
+        cfg.learned_sample_source_key = self.learned_sample_source_key
+        cfg.learned_sample_description = self.learned_sample_description
+        cfg.learned_sample_summary = self.learned_sample_summary
+        cfg.learned_sample_signature = self.learned_sample_signature
+        cfg.learned_sample_debug = self.learned_sample_debug
+        cfg.learned_rotation_basis = self.learned_rotation_basis
+    def request_action(self, action, payload=None):
+        """
+        Đóng cửa sổ để thực hiện thao tác pick trong Revit rồi mở lại. Không dùng
+        forms.WindowToggler vì nó hiện lại cửa sổ ngay khi handler còn đang chờ.
+        """
+        try:
+            self.apply_state_to_config()
+        except Exception as ex:
+            self.match_count_text.Text = u"Không lưu được trạng thái giao diện: {0}".format(
+                safe_text(ex)
+            )
+            return
+        self.pending_action = action
+        self.pending_payload = payload or {}
+        self.result = None
+        self.Close()
+    # --------------------------------------------------------
+    # CONFIG
+    # --------------------------------------------------------
     def restore_config(self):
         last_group_uid = safe_text(getattr(self.config, "last_group_uid", u""))
         self.group_combo.SelectedIndex = self.find_uid_index(
             self.group_items,
             last_group_uid
         )
-
+        source_kind = safe_text(
+            getattr(self.config, "source_document_mode", u"LINK")
+        ).upper().strip()
+        if source_kind == "HOST":
+            self.source_host_radio.IsChecked = True
+        else:
+            self.source_link_radio.IsChecked = True
         self.filter_text.Text = safe_text(
             getattr(self.config, "family_filter", u"")
         )
-
         self.picked_family_name = safe_text(
             getattr(self.config, "picked_family_name", u"")
         ).strip()
@@ -2131,21 +2384,35 @@ class SettingsWindow(forms.WPFWindow):
         self.pick_exact_type_checkbox.IsChecked = bool(
             getattr(self.config, "pick_exact_type", False)
         )
-
+        raw_type_keys = safe_text(
+            getattr(self.config, "selected_type_keys_json", u"")
+        ).strip()
+        self.selected_type_keys = set()
+        if raw_type_keys:
+            try:
+                self.selected_type_keys = set(
+                    normalize_type_keys(json.loads(raw_type_keys))
+                )
+            except Exception:
+                self.selected_type_keys = set()
         source_mode = safe_text(
             getattr(self.config, "source_filter_mode", u"KEYWORD")
         ).upper().strip()
         if source_mode == "PICK" and self.picked_family_name:
             self.pick_mode_radio.IsChecked = True
+        elif source_mode == "TYPES":
+            self.types_mode_radio.IsChecked = True
         else:
             self.keyword_mode_radio.IsChecked = True
         self.update_picked_family_text()
-
         self.offset_x_text.Text = safe_text(
             getattr(self.config, "offset_x_mm", u"0")
         )
         self.offset_y_text.Text = safe_text(
             getattr(self.config, "offset_y_mm", u"0")
+        )
+        self.offset_z_text.Text = safe_text(
+            getattr(self.config, "offset_z_mm", u"0")
         )
         self.rotation_offset_text.Text = safe_text(
             getattr(self.config, "rotation_offset_deg", u"0")
@@ -2159,12 +2426,14 @@ class SettingsWindow(forms.WPFWindow):
         self.test_index_text.Text = safe_text(
             getattr(self.config, "test_family_index", u"1")
         )
-
         self.skip_duplicate_checkbox.IsChecked = bool(
             getattr(self.config, "skip_duplicate", True)
         )
         self.ignore_nested_checkbox.IsChecked = bool(
             getattr(self.config, "ignore_nested", True)
+        )
+        self.skip_group_member_checkbox.IsChecked = bool(
+            getattr(self.config, "skip_group_members", True)
         )
         self.source_dedup_checkbox.IsChecked = bool(
             getattr(self.config, "source_dedup_enabled", True)
@@ -2175,7 +2444,6 @@ class SettingsWindow(forms.WPFWindow):
         self.test_one_checkbox.IsChecked = bool(
             getattr(self.config, "test_one", True)
         )
-
         rotation_basis = safe_text(
             getattr(self.config, "rotation_basis", u"HAND")
         ).upper()
@@ -2183,7 +2451,6 @@ class SettingsWindow(forms.WPFWindow):
             self.rotation_basis_combo.SelectedIndex = 1
         else:
             self.rotation_basis_combo.SelectedIndex = 0
-
         anchor_mode = safe_text(
             getattr(self.config, "anchor_mode", u"RIGHT_FRONT")
         ).upper()
@@ -2196,20 +2463,48 @@ class SettingsWindow(forms.WPFWindow):
         if anchor_mode not in anchor_controls:
             anchor_mode = "RIGHT_FRONT"
         anchor_controls[anchor_mode].IsChecked = True
-
+        placement_mode = safe_text(
+            getattr(self.config, "placement_mode", u"ANCHOR")
+        ).upper().strip()
+        if placement_mode == "SAMPLE":
+            self.placement_sample_radio.IsChecked = True
+        else:
+            self.placement_anchor_radio.IsChecked = True
+        # Khôi phục trạng thái "đã học" (từ lần học trước / trước khi mở lại cửa sổ).
+        self.learned_sample_source_key = safe_text(
+            getattr(self.config, "learned_sample_source_key", u"")
+        ).strip()
+        self.learned_sample_description = safe_text(
+            getattr(self.config, "learned_sample_description", u"")
+        ).strip()
+        self.learned_sample_summary = safe_text(
+            getattr(self.config, "learned_sample_summary", u"")
+        ).strip()
+        self.learned_sample_signature = safe_text(
+            getattr(self.config, "learned_sample_signature", u"")
+        ).strip()
+        self.learned_sample_debug = safe_text(
+            getattr(self.config, "learned_sample_debug", u"")
+        ).strip()
+        self.learned_rotation_basis = safe_text(
+            getattr(self.config, "learned_rotation_basis", u"")
+        ).strip()
+        if self.learned_sample_summary:
+            self.sample_info_text.Text = (
+                u"Đang dùng Offset đã học ở lần trước: {0}. "
+                u"Bấm 'Học vị trí từ Group mẫu...' để học lại nếu Group mẫu đã đổi."
+            ).format(self.learned_sample_summary)
     def find_uid_index(self, items, uid):
         if uid:
             for index, item in enumerate(items):
                 if item.uid == uid:
                     return index
         return 0 if items else -1
-
     def get_selected_group_item(self):
         index = self.group_combo.SelectedIndex
         if index < 0 or index >= len(self.group_items):
             return None
         return self.group_items[index]
-
     def get_anchor_mode(self):
         if self.left_front_radio.IsChecked:
             return "LEFT_FRONT"
@@ -2220,72 +2515,321 @@ class SettingsWindow(forms.WPFWindow):
         if self.right_back_radio.IsChecked:
             return "RIGHT_BACK"
         return "RIGHT_FRONT"
-
+    def get_placement_mode(self):
+        if self.placement_sample_radio.IsChecked is True:
+            return "SAMPLE"
+        return "ANCHOR"
+    def update_placement_mode_state(self):
+        sample_mode = self.get_placement_mode() == "SAMPLE"
+        # Góc neo (LEFT/RIGHT_FRONT/BACK) chỉ có ý nghĩa ở chế độ Anchor;
+        # ở chế độ Sample, Offset X/Y/Z được học trực tiếp từ gốc Family.
+        self.left_front_radio.IsEnabled = not sample_mode
+        self.right_front_radio.IsEnabled = not sample_mode
+        self.left_back_radio.IsEnabled = not sample_mode
+        self.right_back_radio.IsEnabled = not sample_mode
+        self.learn_sample_button.IsEnabled = sample_mode
+        self.sample_info_text.IsEnabled = sample_mode
+    def placement_mode_changed(self, sender, args):
+        if self._initializing:
+            return
+        self.update_placement_mode_state()
+    def learn_sample_clicked(self, sender, args):
+        """Học Offset từ Group mẫu: cửa sổ đóng để pick Group rồi Family, sau đó mở lại."""
+        if self.get_source_kind() == "LINK" and not self.link_items:
+            self.set_sample_status(
+                u"Chưa học được: chưa chọn Revit Link. Bấm 'Pick Revit Link' trước khi học vị trí mẫu."
+            )
+            return
+        self.request_action("LEARN_SAMPLE", {
+            "source_kind": self.get_source_kind(),
+            "rotation_basis": (
+                "FACING" if self.rotation_basis_combo.SelectedIndex == 1 else "HAND"
+            )
+        })
+    # --------------------------------------------------------
+    # NGUỒN FAMILY: REVIT LINK / MODEL HIỆN TẠI
+    # --------------------------------------------------------
+    def get_source_kind(self):
+        if self.source_host_radio.IsChecked is True:
+            return "HOST"
+        return "LINK"
+    def get_source_items(self):
+        if self.get_source_kind() == "HOST":
+            return [self.host_item]
+        return list(self.link_items)
+    def source_is_ready(self):
+        return len(self.get_source_items()) > 0
+    def refresh_links_list(self):
+        self.links_list.Items.Clear()
+        if not self.link_items:
+            self.links_list.Items.Add(u"(Chưa chọn Revit Link - bấm 'Pick Revit Link' khi cần dùng Link)")
+            return
+        for item in self.link_items:
+            self.links_list.Items.Add(item.display_name)
+    def pick_links_clicked(self, sender, args):
+        """Pick Revit Link: cửa sổ đóng để pick rồi tự mở lại."""
+        self.request_action("PICK_LINKS")
+    def source_kind_changed(self, sender, args):
+        if self._initializing:
+            return
+        self.update_source_mode_state()
+        self.type_entries = []
+        self.apply_type_search()
+        if self.get_source_mode() == "TYPES" and self.source_is_ready():
+            self.load_type_list(show_message=False)
+        self.scan_setting_changed(sender, args)
+    # --------------------------------------------------------
+    # CÁCH CHỌN FAMILY NGUỒN
+    # --------------------------------------------------------
     def get_source_mode(self):
         if self.pick_mode_radio.IsChecked is True:
             return "PICK"
+        if self.types_mode_radio.IsChecked is True:
+            return "TYPES"
         return "KEYWORD"
-
     def update_picked_family_text(self):
         if not self.picked_family_name:
-            self.picked_family_text.Text = u"Chưa pick Family từ Link."
+            self.picked_family_text.Text = u"Chưa pick Family."
             return
-
         description = u"Family: {0}".format(self.picked_family_name)
         if self.picked_type_name:
             description += u"  |  Type: {0}".format(self.picked_type_name)
         if self.picked_link_name:
-            description += u"  |  Link: {0}".format(self.picked_link_name)
+            description += u"  |  Nguồn: {0}".format(self.picked_link_name)
         self.picked_family_text.Text = description
-
     def update_source_mode_state(self):
-        pick_mode = self.get_source_mode() == "PICK"
-        self.filter_text.IsEnabled = not pick_mode
+        host_mode = self.get_source_kind() == "HOST"
+        mode = self.get_source_mode()
+        pick_mode = mode == "PICK"
+        types_mode = mode == "TYPES"
+        self.links_list.IsEnabled = not host_mode
+        self.pick_links_button.IsEnabled = not host_mode
+        self.skip_group_member_checkbox.IsEnabled = host_mode
+        if host_mode:
+            self.pick_family_button.Content = u"Pick Family trong Model"
+        else:
+            self.pick_family_button.Content = u"Pick Family từ Link"
+        self.filter_text.IsEnabled = mode == "KEYWORD"
         self.pick_family_button.IsEnabled = pick_mode
         self.pick_exact_type_checkbox.IsEnabled = pick_mode
         self.picked_family_text.IsEnabled = pick_mode
-
+        self.type_search_text.IsEnabled = types_mode
+        self.load_types_button.IsEnabled = types_mode
+        self.select_all_types_button.IsEnabled = types_mode
+        self.clear_types_button.IsEnabled = types_mode
+        self.type_list.IsEnabled = types_mode
+        self.type_selection_text.IsEnabled = types_mode
     def source_mode_changed(self, sender, args):
+        if self._initializing:
+            return
         self.update_source_mode_state()
+        if (
+            self.get_source_mode() == "TYPES" and
+            not self.type_entries and
+            self.source_is_ready()
+        ):
+            self.load_type_list(show_message=False)
         self.scan_setting_changed(sender, args)
-
     def pick_family_clicked(self, sender, args):
-        try:
-            with forms.WindowToggler(self):
-                link_item, family_instance = pick_linked_family_instance(self.link_items)
-
-            family_name = get_family_name(family_instance)
-            type_name = get_family_type_name(family_instance)
-            if not family_name:
-                raise ValueError(u"Không đọc được Family Name của phần tử đã pick.")
-
-            self.picked_family_name = family_name
-            self.picked_type_name = type_name
-            self.picked_link_name = link_item.display_name
-            self.pick_mode_radio.IsChecked = True
-            self.update_picked_family_text()
-            self.invalidate_scan_cache()
+        if self.get_source_kind() == "LINK" and not self.link_items:
             self.match_count_text.Text = (
-                u"Đã pick Family '{0}'. Bấm Kiểm tra số lượng hoặc Bắt đầu."
-            ).format(family_name)
-            self.update_test_index_hint()
-        except UI.Exceptions.OperationCanceledException:
-            pass
+                u"Chưa chọn Revit Link. Bấm 'Pick Revit Link' trước."
+            )
+            return
+        self.request_action("PICK_FAMILY", {"source_kind": self.get_source_kind()})
+    # --------------------------------------------------------
+    # CHỌN THEO TYPE
+    # --------------------------------------------------------
+    def load_types_clicked(self, sender, args):
+        self.load_type_list(show_message=True)
+    def load_type_list(self, show_message=True):
+        """Gom các FamilyInstance trong nguồn theo Category + Family + Type."""
+        if not self.source_is_ready():
+            self.type_entries = []
+            self.apply_type_search()
+            if show_message:
+                self.match_count_text.Text = (
+                    u"Chưa có nguồn Family. Hãy pick Revit Link hoặc chọn Model hiện tại."
+                )
+            return
+        if self.get_source_kind() == "LINK" and not self.link_items:
+            self.type_entries = []
+            self.apply_type_search()
+            if show_message:
+                self.match_count_text.Text = u"Chưa chọn Revit Link. Bấm 'Pick Revit Link' trước."
+            return
+        host_mode = self.get_source_kind() == "HOST"
+        ignore_nested = self.ignore_nested_checkbox.IsChecked is True
+        skip_members = host_mode and self.skip_group_member_checkbox.IsChecked is True
+        entry_map = {}
+        try:
+            for source_item in self.get_source_items():
+                candidates, linked_view = collect_source_candidate_families(
+                    source_item,
+                    self.host_view
+                )
+                for family_instance in candidates:
+                    try:
+                        if ignore_nested and get_super_component(family_instance) is not None:
+                            continue
+                        if skip_members and is_group_member(family_instance):
+                            continue
+                        if linked_view is None and not category_is_visible_by_host_view(
+                            family_instance,
+                            self.host_view
+                        ):
+                            continue
+                        key = family_semantic_key(family_instance)
+                        entry = entry_map.get(key)
+                        if entry is None:
+                            entry = {
+                                "key": key,
+                                "display": family_type_display(family_instance),
+                                "count": 0
+                            }
+                            entry_map[key] = entry
+                        entry["count"] += 1
+                    except Exception:
+                        pass
         except Exception as ex:
-            self.match_count_text.Text = u"Không thể dùng Family đã pick: {0}".format(
+            self.match_count_text.Text = u"Lỗi nạp danh sách Type: {0}".format(
                 safe_text(ex)
             )
-
+            return
+        entries = list(entry_map.values())
+        entries.sort(key=lambda item: item["display"].lower())
+        self.type_entries = entries
+        available_keys = set([entry["key"] for entry in entries])
+        missing_keys = [key for key in self.selected_type_keys if key not in available_keys]
+        if missing_keys:
+            self.selected_type_keys = set(
+                [key for key in self.selected_type_keys if key in available_keys]
+            )
+        self.apply_type_search()
+        if show_message or missing_keys:
+            message = u"Đã nạp {0} Type từ {1}.".format(
+                len(entries),
+                u"Model hiện tại" if host_mode else u"Revit Link"
+            )
+            if missing_keys:
+                message += u" Bỏ {0} Type đã chọn trước đó vì không còn trong nguồn/Active View.".format(
+                    len(missing_keys)
+                )
+            self.match_count_text.Text = message
+        if not self._initializing:
+            self.invalidate_scan_cache()
+            self.update_test_index_hint()
+    def type_entry_matches_search(self, entry, tokens):
+        if not tokens:
+            return True
+        text = entry["display"].lower()
+        for token in tokens:
+            if token not in text:
+                return False
+        return True
+    def get_type_search_tokens(self):
+        text = safe_text(self.type_search_text.Text).strip().lower()
+        if not text:
+            return []
+        return [token for token in re.split(u"\\s+", text) if token]
+    def apply_type_search(self):
+        tokens = self.get_type_search_tokens()
+        self._suppress_type_events = True
+        try:
+            self.type_list.Items.Clear()
+            for entry in self.type_entries:
+                if not self.type_entry_matches_search(entry, tokens):
+                    continue
+                list_item = ListBoxItem()
+                list_item.Content = u"{0}   ({1})".format(entry["display"], entry["count"])
+                list_item.Tag = entry["key"]
+                self.type_list.Items.Add(list_item)
+                if entry["key"] in self.selected_type_keys:
+                    list_item.IsSelected = True
+        finally:
+            self._suppress_type_events = False
+        self.update_type_selection_text()
+    def type_search_changed(self, sender, args):
+        self.apply_type_search()
+    def type_search_key_down(self, sender, args):
+        # Enter trong ô tìm Type không được kích hoạt nút "Bắt đầu" (IsDefault).
+        # Dùng ToString() thay vì import System.Windows.Input.Key để tránh phụ
+        # thuộc assembly PresentationCore (có môi trường IronPython không load sẵn).
+        try:
+            key_name = safe_text(args.Key).strip()
+            if key_name in (u"Enter", u"Return"):
+                args.Handled = True
+        except Exception:
+            pass
+    def type_list_selection_changed(self, sender, args):
+        if self._suppress_type_events:
+            return
+        changed = False
+        try:
+            for list_item in args.AddedItems:
+                key = safe_text(list_item.Tag)
+                if key and key not in self.selected_type_keys:
+                    self.selected_type_keys.add(key)
+                    changed = True
+            for list_item in args.RemovedItems:
+                key = safe_text(list_item.Tag)
+                if key in self.selected_type_keys:
+                    self.selected_type_keys.discard(key)
+                    changed = True
+        except Exception:
+            pass
+        self.update_type_selection_text()
+        if changed:
+            self.scan_setting_changed(sender, args)
+    def set_visible_type_selection(self, selected):
+        self._suppress_type_events = True
+        try:
+            for list_item in self.type_list.Items:
+                key = safe_text(list_item.Tag)
+                if not key:
+                    continue
+                list_item.IsSelected = selected
+                if selected:
+                    self.selected_type_keys.add(key)
+                else:
+                    self.selected_type_keys.discard(key)
+        finally:
+            self._suppress_type_events = False
+        self.update_type_selection_text()
+        self.scan_setting_changed(None, None)
+    def select_all_types_clicked(self, sender, args):
+        self.set_visible_type_selection(True)
+    def clear_types_clicked(self, sender, args):
+        self.set_visible_type_selection(False)
+    def update_type_selection_text(self):
+        count = len(self.selected_type_keys)
+        total_instances = 0
+        for entry in self.type_entries:
+            if entry["key"] in self.selected_type_keys:
+                total_instances += entry["count"]
+        if not self.type_entries:
+            self.type_selection_text.Text = (
+                u"Chưa nạp danh sách Type. Bấm 'Nạp danh sách Type'."
+                if count == 0 else
+                u"Đã lưu {0} Type từ lần trước. Bấm 'Nạp danh sách Type' để xem lại.".format(count)
+            )
+            return
+        self.type_selection_text.Text = (
+            u"Đã chọn {0}/{1} Type (~{2} Family sơ bộ). "
+            u"Click để chọn/bỏ chọn từng Type."
+        ).format(count, len(self.type_entries), total_instances)
+    # --------------------------------------------------------
+    # CACHE
+    # --------------------------------------------------------
     def get_source_overlap_tolerance_mm(self):
         return parse_number(
             self.source_overlap_tolerance_text.Text,
             u"Dung sai nhận diện nguồn chồng vị trí",
             0.0
         )
-
     def current_scan_signature(self):
         return make_scan_signature(
-            self.link_items,
+            self.get_source_items(),
             self.host_view,
             safe_text(self.filter_text.Text),
             self.ignore_nested_checkbox.IsChecked is True,
@@ -2294,15 +2838,15 @@ class SettingsWindow(forms.WPFWindow):
             self.get_source_mode(),
             self.picked_family_name,
             self.picked_type_name,
-            self.pick_exact_type_checkbox.IsChecked is True
+            self.pick_exact_type_checkbox.IsChecked is True,
+            sorted(self.selected_type_keys),
+            self.skip_group_member_checkbox.IsChecked is True
         )
-
     def invalidate_scan_cache(self):
         self.cached_matched_items = None
         self.cached_scan_signature = None
         self.cached_scan_diagnostics = None
         self.cache_source = None
-
     def update_test_index_hint(self):
         count = 0
         if self.cached_matched_items is not None:
@@ -2311,8 +2855,24 @@ class SettingsWindow(forms.WPFWindow):
             self.test_index_hint.Text = u"Nhập từ 1 đến {0}".format(count)
         else:
             self.test_index_hint.Text = u"Nhập từ 1 đến tổng số Family đã kiểm tra"
-
     def try_load_persistent_cache(self):
+        if self._initializing:
+            return False
+        if self.get_source_kind() == "HOST":
+            # Model hiện tại thay đổi liên tục; luôn quét mới (collector theo view nên nhanh).
+            self.invalidate_scan_cache()
+            self.match_count_text.Text = (
+                u"Model hiện tại: tool luôn quét mới, không dùng cache bền."
+            )
+            self.update_test_index_hint()
+            return False
+        if not self.link_items:
+            self.invalidate_scan_cache()
+            self.match_count_text.Text = (
+                u"Chưa chọn Revit Link. Bấm 'Pick Revit Link' khi cần dùng Link làm nguồn."
+            )
+            self.update_test_index_hint()
+            return False
         try:
             source_tolerance = mm_to_internal(
                 self.get_source_overlap_tolerance_mm()
@@ -2322,7 +2882,6 @@ class SettingsWindow(forms.WPFWindow):
             self.match_count_text.Text = u"Dung sai nguồn chồng vị trí chưa hợp lệ."
             self.update_test_index_hint()
             return False
-
         signature = self.current_scan_signature()
         items, message, diagnostics = load_persistent_scan_cache(
             self.config,
@@ -2332,7 +2891,6 @@ class SettingsWindow(forms.WPFWindow):
             self.source_dedup_checkbox.IsChecked is True,
             source_tolerance
         )
-
         if items is not None:
             self.cached_matched_items = list(items)
             self.cached_scan_signature = signature
@@ -2343,7 +2901,6 @@ class SettingsWindow(forms.WPFWindow):
             ).format(len(items))
             self.update_test_index_hint()
             return True
-
         self.invalidate_scan_cache()
         if safe_text(getattr(self.config, "scan_cache_json", u"")).strip():
             self.match_count_text.Text = safe_text(message)
@@ -2351,36 +2908,47 @@ class SettingsWindow(forms.WPFWindow):
             self.match_count_text.Text = u"Chưa kiểm tra"
         self.update_test_index_hint()
         return False
-
     def scan_setting_changed(self, sender, args):
+        if self._initializing:
+            return
         if self.try_load_persistent_cache():
             return
         self.match_count_text.Text = (
-            u"Thiết lập quét đã thay đổi. Bấm Kiểm tra để tạo cache mới, "
+            u"Thiết lập quét đã thay đổi. Bấm Kiểm tra để quét, "
             u"hoặc bấm Bắt đầu để tool tự quét một lần."
         )
-
     def test_one_changed(self, sender, args):
         self.update_test_index_state()
-
     def update_test_index_state(self):
         enabled = self.test_one_checkbox.IsChecked is True
         self.test_index_text.IsEnabled = enabled
         self.test_index_label.IsEnabled = enabled
         self.test_index_hint.IsEnabled = enabled
         self.update_test_index_hint()
-
+    def validate_source_selection(self):
+        """Trả về thông báo lỗi hoặc None nếu nguồn hợp lệ."""
+        if self.get_source_kind() == "LINK" and not self.link_items:
+            return (
+                u"Chưa chọn Revit Link. Bấm 'Pick Revit Link' hoặc chuyển sang Model hiện tại."
+            )
+        mode = self.get_source_mode()
+        if mode == "PICK" and not self.picked_family_name:
+            return u"Chế độ Pick Family: hãy bấm nút Pick Family trước."
+        if mode == "TYPES" and not self.selected_type_keys:
+            return u"Chế độ chọn theo Type: hãy nạp danh sách và chọn ít nhất 1 Type."
+        return None
     def scan_clicked(self, sender, args):
-        if self.get_source_mode() == "PICK" and not self.picked_family_name:
-            self.match_count_text.Text = u"Chế độ Pick Family: hãy bấm 'Pick Family từ Link' trước."
+        error_message = self.validate_source_selection()
+        if error_message:
+            self.match_count_text.Text = error_message
             return
-
         try:
             raw_filter_text = safe_text(self.filter_text.Text)
             keywords = split_keywords(raw_filter_text)
             source_tolerance_mm = self.get_source_overlap_tolerance_mm()
+            host_mode = self.get_source_kind() == "HOST"
             matched, cancelled, diagnostics = collect_visible_matching_work_items(
-                self.link_items,
+                self.get_source_items(),
                 self.host_view,
                 keywords,
                 self.ignore_nested_checkbox.IsChecked is True,
@@ -2390,55 +2958,60 @@ class SettingsWindow(forms.WPFWindow):
                 self.get_source_mode(),
                 self.picked_family_name,
                 self.picked_type_name,
-                self.pick_exact_type_checkbox.IsChecked is True
+                self.pick_exact_type_checkbox.IsChecked is True,
+                sorted(self.selected_type_keys),
+                self.skip_group_member_checkbox.IsChecked is True
             )
-
             if cancelled:
                 self.match_count_text.Text = (
                     u"Đã hủy kiểm tra. Cache hợp lệ trước đó vẫn được giữ nếu có."
                 )
                 return
-
             signature = self.current_scan_signature()
             self.cached_matched_items = list(matched)
             self.cached_scan_signature = signature
             self.cached_scan_diagnostics = diagnostics
             self.cache_source = "fresh_scan"
-
-            save_persistent_scan_cache(
-                self.config,
-                signature,
-                matched,
-                raw_filter_text,
-                diagnostics
-            )
-
-            self.match_count_text.Text = (
-                u"Tìm thấy {0} Family duy nhất; bỏ nested {1}, nguồn trùng {2}. Cache đã lưu."
+            if not host_mode:
+                save_persistent_scan_cache(
+                    self.config,
+                    signature,
+                    matched,
+                    raw_filter_text,
+                    diagnostics
+                )
+            message = (
+                u"Tìm thấy {0} Family duy nhất; bỏ nested {1}, nguồn trùng {2}"
             ).format(
                 len(matched),
                 diagnostics.get("nested_skipped", 0),
                 diagnostics.get("exact_source_duplicate_skipped", 0)
                 + diagnostics.get("overlap_source_skipped", 0)
             )
+            if host_mode:
+                message += u", bỏ trong Model Group {0}. (Model hiện tại không lưu cache bền)".format(
+                    diagnostics.get("group_member_skipped", 0)
+                )
+            else:
+                message += u". Cache đã lưu."
+            self.match_count_text.Text = message
             self.update_test_index_hint()
         except Exception as ex:
             self.invalidate_scan_cache()
             self.match_count_text.Text = u"Lỗi quét: {0}".format(safe_text(ex))
-
     def run_clicked(self, sender, args):
         group_item = self.get_selected_group_item()
         if group_item is None:
             self.match_count_text.Text = u"Hãy chọn Model Group Type cần đặt."
             return
-
-        if self.get_source_mode() == "PICK" and not self.picked_family_name:
-            self.match_count_text.Text = u"Chế độ Pick Family: hãy bấm 'Pick Family từ Link' trước."
+        error_message = self.validate_source_selection()
+        if error_message:
+            self.match_count_text.Text = error_message
             return
-
         try:
             offset_x_mm = parse_number(self.offset_x_text.Text, u"Offset X")
             offset_y_mm = parse_number(self.offset_y_text.Text, u"Offset Y")
+            offset_z_mm = parse_number(self.offset_z_text.Text, u"Offset Z (cao độ)")
             rotation_offset_deg = parse_number(
                 self.rotation_offset_text.Text,
                 u"Hiệu chỉnh góc"
@@ -2449,7 +3022,6 @@ class SettingsWindow(forms.WPFWindow):
                 0.0
             )
             source_overlap_tolerance_mm = self.get_source_overlap_tolerance_mm()
-
             test_one = self.test_one_checkbox.IsChecked is True
             test_family_index = 1
             if test_one:
@@ -2465,14 +3037,11 @@ class SettingsWindow(forms.WPFWindow):
         except ValueError as ex:
             self.match_count_text.Text = safe_text(ex)
             return
-
         rotation_basis = "HAND"
         if self.rotation_basis_combo.SelectedIndex == 1:
             rotation_basis = "FACING"
-
         raw_filter_text = safe_text(self.filter_text.Text)
         current_scan_signature = self.current_scan_signature()
-
         cached_items = None
         cached_diagnostics = None
         cache_used = False
@@ -2487,24 +3056,38 @@ class SettingsWindow(forms.WPFWindow):
             )
             cache_used = True
             cache_source = self.cache_source
-
         self.result = {
             "config": self.config,
-            "link_items": self.link_items,
+            "source_kind": self.get_source_kind(),
+            "link_items": self.get_source_items(),
             "group_item": group_item,
             "filter_text": raw_filter_text,
             "source_filter_mode": self.get_source_mode(),
             "picked_family_name": self.picked_family_name,
             "picked_type_name": self.picked_type_name,
             "pick_exact_type": self.pick_exact_type_checkbox.IsChecked is True,
+            "selected_type_keys": sorted(self.selected_type_keys),
+            "selected_type_displays": [
+                entry["display"] for entry in self.type_entries
+                if entry["key"] in self.selected_type_keys
+            ],
+            "skip_group_members": self.skip_group_member_checkbox.IsChecked is True,
             "scan_signature": current_scan_signature,
             "cached_matched_items": cached_items,
             "cached_scan_diagnostics": cached_diagnostics,
             "cache_used": cache_used,
             "cache_source": cache_source,
+            "placement_mode": self.get_placement_mode(),
+            "learned_sample_source_key": self.learned_sample_source_key,
+            "learned_sample_description": self.learned_sample_description,
+            "learned_sample_summary": self.learned_sample_summary,
+            "learned_sample_signature": self.learned_sample_signature,
+            "learned_sample_debug": self.learned_sample_debug,
+            "learned_rotation_basis": self.learned_rotation_basis,
             "anchor_mode": self.get_anchor_mode(),
             "offset_x_mm": offset_x_mm,
             "offset_y_mm": offset_y_mm,
+            "offset_z_mm": offset_z_mm,
             "rotation_offset_deg": rotation_offset_deg,
             "rotation_basis": rotation_basis,
             "ignore_nested": self.ignore_nested_checkbox.IsChecked is True,
@@ -2517,16 +3100,12 @@ class SettingsWindow(forms.WPFWindow):
             "test_family_index": test_family_index
         }
         self.Close()
-
     def cancel_clicked(self, sender, args):
         self.result = None
         self.Close()
-
-
 # ============================================================
 # MAIN PROCESS
 # ============================================================
-
 def save_user_config(config, settings):
     config.last_group_uid = settings["group_item"].uid
     config.family_filter = settings["filter_text"]
@@ -2534,9 +3113,23 @@ def save_user_config(config, settings):
     config.picked_family_name = settings.get("picked_family_name", u"")
     config.picked_type_name = settings.get("picked_type_name", u"")
     config.pick_exact_type = settings.get("pick_exact_type", False)
+    config.source_document_mode = settings.get("source_kind", "LINK")
+    config.selected_type_keys_json = safe_text(json.dumps(
+        list(settings.get("selected_type_keys", []) or []),
+        ensure_ascii=True
+    ))
+    config.skip_group_members = settings.get("skip_group_members", True)
+    config.placement_mode = settings.get("placement_mode", "ANCHOR")
+    config.learned_sample_source_key = settings.get("learned_sample_source_key", u"")
+    config.learned_sample_description = settings.get("learned_sample_description", u"")
+    config.learned_sample_summary = settings.get("learned_sample_summary", u"")
+    config.learned_sample_signature = settings.get("learned_sample_signature", u"")
+    config.learned_sample_debug = settings.get("learned_sample_debug", u"")
+    config.learned_rotation_basis = settings.get("learned_rotation_basis", u"")
     config.anchor_mode = settings["anchor_mode"]
     config.offset_x_mm = safe_text(settings["offset_x_mm"])
     config.offset_y_mm = safe_text(settings["offset_y_mm"])
+    config.offset_z_mm = safe_text(settings.get("offset_z_mm", 0.0))
     config.rotation_offset_deg = safe_text(settings["rotation_offset_deg"])
     config.rotation_basis = settings["rotation_basis"]
     config.ignore_nested = settings["ignore_nested"]
@@ -2552,40 +3145,40 @@ def save_user_config(config, settings):
     config.test_one = settings["test_one"]
     config.test_family_index = safe_text(settings["test_family_index"])
     script.save_config()
-
-
 def defensively_normalize_work_items(
         work_items,
         ignore_nested,
         source_dedup_enabled,
-        source_overlap_tolerance_internal):
+        source_overlap_tolerance_internal,
+        skip_group_members=False):
     """Lớp bảo vệ cuối trước transaction, kể cả khi cache cũ hoặc dữ liệu lỗi."""
     diagnostics = new_scan_diagnostics()
     normalized = []
     used_source_keys = set()
-
     for work_item in work_items or []:
         family_instance = work_item.family
-
         if ignore_nested and get_super_component(family_instance) is not None:
             diagnostics["nested_skipped"] += 1
             continue
-
+        if (
+            skip_group_members and
+            is_host_source(work_item.link_item) and
+            is_group_member(family_instance)
+        ):
+            diagnostics["group_member_skipped"] += 1
+            continue
         source_key = family_source_key(work_item.link_item, family_instance)
         if source_key in used_source_keys:
             diagnostics["exact_source_duplicate_skipped"] += 1
             continue
-
         used_source_keys.add(source_key)
         normalized.append(work_item)
-
     normalized.sort(
         key=lambda item: (
             item.link_item.display_name.lower(),
             get_family_id_value(item.family)
         )
     )
-
     if source_dedup_enabled:
         normalized, overlap_records = deduplicate_overlapping_sources(
             normalized,
@@ -2595,11 +3188,8 @@ def defensively_normalize_work_items(
         diagnostics["duplicate_source_records"] = list(
             diagnostics.get("duplicate_source_records", [])
         ) + overlap_records
-
     diagnostics["final_count"] = len(normalized)
     return normalized, diagnostics
-
-
 def run_tool(settings, initial_notices=None):
     group_type = settings["group_item"].element
     keywords = split_keywords(settings["filter_text"])
@@ -2607,22 +3197,47 @@ def run_tool(settings, initial_notices=None):
     picked_family_name = safe_text(settings.get("picked_family_name", u"")).strip()
     picked_type_name = safe_text(settings.get("picked_type_name", u"")).strip()
     pick_exact_type = settings.get("pick_exact_type", False) is True
+    selected_type_keys = list(settings.get("selected_type_keys", []) or [])
+    skip_group_members = settings.get("skip_group_members", False) is True
+    source_kind = safe_text(settings.get("source_kind", "LINK")).upper().strip()
+    host_mode = source_kind == "HOST"
+    placement_mode = safe_text(settings.get("placement_mode", "ANCHOR")).upper().strip()
+    learned_sample_source_key = safe_text(
+        settings.get("learned_sample_source_key", u"")
+    ).strip()
     report_notices = list(initial_notices or [])
-
+    # Góc học được chỉ đúng với CƠ SỞ XOAY dùng lúc học (Hand/Facing lệch nhau 90°).
+    learned_basis = safe_text(settings.get("learned_rotation_basis", u"")).upper().strip()
+    if placement_mode == "SAMPLE" and learned_basis in ("HAND", "FACING"):
+        if learned_basis != safe_text(settings["rotation_basis"]).upper().strip():
+            report_notices.append(
+                u"Cơ sở xoay đang chọn ({0}) khác cơ sở xoay lúc học ({1}); chế độ mẫu đã dùng {1} "
+                u"để góc không bị lệch 90°.".format(settings["rotation_basis"], learned_basis)
+            )
+        settings = dict(settings)
+        settings["rotation_basis"] = learned_basis
     source_overlap_tolerance = mm_to_internal(
         settings["source_overlap_tolerance_mm"]
     )
-
     context_lines = [
         u"Active View: {0}".format(
             get_element_name(active_view) or safe_text(active_view.ViewType)
         ),
-        u"Revit Link được xử lý: {0}".format(len(settings["link_items"])),
+        (
+            u"Nguồn Family: Model hiện tại (host)"
+            if host_mode else
+            u"Nguồn Family: Revit Link ({0} Link)".format(len(settings["link_items"]))
+        ),
         u"Model Group Type: {0}".format(settings["group_item"].display_name),
-        u"Điểm đặt: {0}".format(settings["anchor_mode"]),
-        u"Offset X / Y có dấu: {0:+.1f} / {1:+.1f} mm".format(
+        (
+            u"Cách đặt vị trí: Theo mẫu Group đã đặt (Offset tuyệt đối từ gốc Family)"
+            if placement_mode == "SAMPLE" else
+            u"Cách đặt vị trí: Theo góc neo {0} + Offset".format(settings["anchor_mode"])
+        ),
+        u"Offset X / Y / Z có dấu: {0:+.1f} / {1:+.1f} / {2:+.1f} mm".format(
             settings["offset_x_mm"],
-            settings["offset_y_mm"]
+            settings["offset_y_mm"],
+            settings.get("offset_z_mm", 0.0)
         ),
         u"Hiệu chỉnh góc: {0:.2f}°; cơ sở xoay: {1}".format(
             settings["rotation_offset_deg"],
@@ -2636,9 +3251,43 @@ def run_tool(settings, initial_notices=None):
             settings["source_overlap_tolerance_mm"]
         )
     ]
-
+    if placement_mode == "SAMPLE":
+        current_signature = u"{0:.2f}|{1:.2f}|{2:.2f}|{3:.2f}".format(
+            settings["offset_x_mm"],
+            settings["offset_y_mm"],
+            settings.get("offset_z_mm", 0.0),
+            settings["rotation_offset_deg"]
+        )
+        learned_signature = safe_text(settings.get("learned_sample_signature", u"")).strip()
+        learned_summary = safe_text(settings.get("learned_sample_summary", u"")).strip()
+        if not learned_signature:
+            context_lines.append(
+                u"NGUỒN OFFSET: NHẬP TAY - chưa từng học từ Group mẫu. "
+                u"Các số trên là số gõ trong giao diện, KHÔNG phải kết quả đọc từ Group mẫu."
+            )
+        elif learned_signature == current_signature:
+            context_lines.append(u"NGUỒN OFFSET: ĐÃ HỌC từ Group mẫu - {0}".format(learned_summary))
+        else:
+            context_lines.append(
+                u"NGUỒN OFFSET: ĐÃ HỌC nhưng đã bị SỬA TAY. Giá trị học (X|Y|Z|góc): {0}; "
+                u"giá trị đang dùng: {1}".format(learned_signature, current_signature)
+            )
+        for debug_line in safe_text(settings.get("learned_sample_debug", u"")).split(u" || "):
+            if debug_line.strip():
+                context_lines.append(u"    • Lần học: {0}".format(debug_line.strip()))
+    if host_mode:
+        context_lines.append(u"Bỏ Family nằm trong Model Group: {0}".format(
+            u"Có" if skip_group_members else u"Không"
+        ))
     filter_display = safe_text(settings["filter_text"]).strip()
-    if source_mode == "PICK":
+    if source_mode == "TYPES":
+        type_displays = list(settings.get("selected_type_displays", []) or [])
+        context_lines.append(u"Chọn theo Type: {0} Type".format(len(selected_type_keys)))
+        for display in type_displays[:30]:
+            context_lines.append(u"    • {0}".format(display))
+        if len(type_displays) > 30:
+            context_lines.append(u"    • ... và {0} Type khác".format(len(type_displays) - 30))
+    elif source_mode == "PICK":
         pick_description = u"Family pick chính xác: {0}".format(
             picked_family_name or u"(chưa xác định)"
         )
@@ -2657,11 +3306,9 @@ def run_tool(settings, initial_notices=None):
         )
     else:
         context_lines.append(u"Từ khóa lọc: để trống, lấy tất cả Family phù hợp")
-
     matched_items = settings.get("cached_matched_items")
     scan_diagnostics = settings.get("cached_scan_diagnostics")
     scan_cancelled = False
-
     expected_signature = make_scan_signature(
         settings["link_items"],
         active_view,
@@ -2672,14 +3319,14 @@ def run_tool(settings, initial_notices=None):
         source_mode,
         picked_family_name,
         picked_type_name,
-        pick_exact_type
+        pick_exact_type,
+        selected_type_keys,
+        skip_group_members
     )
-
     cache_is_valid = (
         matched_items is not None and
         settings.get("scan_signature") == expected_signature
     )
-
     if cache_is_valid:
         matched_items = list(matched_items)
         scan_diagnostics = dict(scan_diagnostics or new_scan_diagnostics())
@@ -2704,13 +3351,14 @@ def run_tool(settings, initial_notices=None):
                 source_mode,
                 picked_family_name,
                 picked_type_name,
-                pick_exact_type
+                pick_exact_type,
+                selected_type_keys,
+                skip_group_members
             )
         )
         report_notices.append(
             u"Không có cache hợp lệ nên tool đã quét một lần; progress chỉ đếm các Family đã khớp bộ lọc nguồn."
         )
-
     if scan_cancelled:
         show_output_report(
             u"Đã hủy khi quét Family",
@@ -2718,23 +3366,24 @@ def run_tool(settings, initial_notices=None):
             notices=report_notices
         )
         return
-
     # Lớp bảo vệ cuối: cache và danh sách quét đều phải qua chuẩn hóa lần nữa.
     matched_items, defensive_diagnostics = defensively_normalize_work_items(
         matched_items,
         settings["ignore_nested"],
         settings["source_dedup_enabled"],
-        source_overlap_tolerance
+        source_overlap_tolerance,
+        skip_group_members
     )
-
     if scan_diagnostics is None:
         scan_diagnostics = new_scan_diagnostics()
-
     # Chỉ cộng các loại trùng phát sinh trong lớp bảo vệ cuối; không cộng final_count.
     scan_diagnostics = dict(scan_diagnostics)
     scan_diagnostics["nested_skipped"] = int(
         scan_diagnostics.get("nested_skipped", 0)
     ) + int(defensive_diagnostics.get("nested_skipped", 0))
+    scan_diagnostics["group_member_skipped"] = int(
+        scan_diagnostics.get("group_member_skipped", 0)
+    ) + int(defensive_diagnostics.get("group_member_skipped", 0))
     scan_diagnostics["exact_source_duplicate_skipped"] = int(
         scan_diagnostics.get("exact_source_duplicate_skipped", 0)
     ) + int(defensive_diagnostics.get("exact_source_duplicate_skipped", 0))
@@ -2745,8 +3394,7 @@ def run_tool(settings, initial_notices=None):
         scan_diagnostics.get("duplicate_source_records", [])
     ) + list(defensive_diagnostics.get("duplicate_source_records", []))
     scan_diagnostics["final_count"] = len(matched_items)
-
-    if not cache_is_valid:
+    if not cache_is_valid and not host_mode:
         try:
             save_persistent_scan_cache(
                 settings["config"],
@@ -2762,7 +3410,34 @@ def run_tool(settings, initial_notices=None):
             report_notices.append(
                 u"Không lưu được cache bền: {0}".format(safe_text(cache_error))
             )
-
+    # Chế độ "Theo mẫu Group đã đặt": Family dùng để học vị trí đã có sẵn một
+    # Group mẫu tại đó, nên phải loại Family này khỏi danh sách đặt Group để
+    # tránh tạo thêm một Group chồng lên Group mẫu đã có. Việc loại bỏ này chỉ
+    # áp dụng cho bước đặt Group, không ảnh hưởng tới cache đã lưu ở trên (cache
+    # vẫn lưu đầy đủ tập Family khớp bộ lọc để tái sử dụng cho mọi placement_mode).
+    if placement_mode == "SAMPLE" and learned_sample_source_key:
+        filtered_items = []
+        sample_source_skipped_count = 0
+        for work_item in matched_items:
+            if family_source_key(work_item.link_item, work_item.family) == learned_sample_source_key:
+                sample_source_skipped_count += 1
+                continue
+            filtered_items.append(work_item)
+        matched_items = filtered_items
+        scan_diagnostics["final_count"] = len(matched_items)
+        if sample_source_skipped_count:
+            report_notices.append(
+                u"Đã bỏ qua {0} Family dùng để học vị trí mẫu khỏi danh sách đặt Group "
+                u"(Group mẫu đã có sẵn tại đó): {1}.".format(
+                    sample_source_skipped_count,
+                    safe_text(settings.get("learned_sample_description", u"")) or u"?"
+                )
+            )
+        else:
+            report_notices.append(
+                u"Family dùng để học vị trí mẫu không còn nằm trong danh sách Family nguồn hiện tại "
+                u"(có thể do bộ lọc/Type đã thay đổi); không có Family nào bị loại thêm."
+            )
     duplicate_source_records = list(
         scan_diagnostics.get("duplicate_source_records", [])
     )
@@ -2773,7 +3448,6 @@ def run_tool(settings, initial_notices=None):
             )
         )
         duplicate_source_records = duplicate_source_records[:100]
-
     if not matched_items:
         show_output_report(
             u"Không tìm thấy Family nguồn duy nhất phù hợp",
@@ -2781,13 +3455,13 @@ def run_tool(settings, initial_notices=None):
                 u"Group đã tạo: 0"
             ],
             notices=report_notices + [
-                u"Kiểm tra bộ lọc nguồn (từ khóa hoặc Family đã pick), nested Family, "
+                u"Kiểm tra bộ lọc nguồn (từ khóa, Family đã pick hoặc Type đã chọn), nested Family, "
+                u"Family nằm trong Model Group (Model hiện tại), "
                 u"dung sai nguồn chồng vị trí, Crop/Section Box, View Range và Visibility/Graphics của Revit Link."
             ],
             duplicate_source_records=duplicate_source_records
         )
         return
-
     work_items_to_process = list(matched_items)
     if settings["test_one"]:
         test_index = int(settings.get("test_family_index", 1))
@@ -2804,7 +3478,6 @@ def run_tool(settings, initial_notices=None):
                 duplicate_source_records=duplicate_source_records
             )
             return
-
         selected_work_item = matched_items[test_index - 1]
         work_items_to_process = [selected_work_item]
         report_notices.append(
@@ -2815,68 +3488,94 @@ def run_tool(settings, initial_notices=None):
                 describe_family(selected_work_item.family)
             )
         )
-
     offset_x = mm_to_internal(settings["offset_x_mm"])
     offset_y = mm_to_internal(settings["offset_y_mm"])
+    offset_z = mm_to_internal(settings.get("offset_z_mm", 0.0))
     duplicate_tolerance = mm_to_internal(settings["duplicate_tolerance_mm"])
     rotation_offset = math.radians(settings["rotation_offset_deg"])
-
     if settings["skip_duplicate"]:
         existing_group_points = collect_existing_group_points(group_type)
     else:
         existing_group_points = []
-
     created_count = 0
     existing_group_duplicate_count = 0
     fallback_bbox_count = 0
     mirrored_count = 0
+    rotation_readback_sample = None
+    rotation_readback_mismatch = 0
+    rotation_checked = 0
+    placement_shift_count = 0
+    placement_shift_max_mm = 0.0
+    placement_shift_z_max_mm = 0.0
     failed_items = []
     created_records = []
     cancelled = False
-
-    transaction_name = u"Test Place One Group From Linked Family"
-    if not settings["test_one"]:
-        transaction_name = u"Place Groups From Linked Families"
-
+    if host_mode:
+        transaction_name = u"Test Place One Group From Host Family"
+        if not settings["test_one"]:
+            transaction_name = u"Place Groups From Host Families"
+    else:
+        transaction_name = u"Test Place One Group From Linked Family"
+        if not settings["test_one"]:
+            transaction_name = u"Place Groups From Linked Families"
+    # Tham chiếu góc 0°: đặt thử một Group cùng Type rồi RollBack, để sau này đo lại
+    # góc xoay thực của các Group vừa tạo.
+    rotation_reference = None
+    rotation_reference_error = u""
+    if placement_mode == "SAMPLE" and work_items_to_process:
+        try:
+            first_item = work_items_to_process[0]
+            first_point, _unused = get_anchor_point(
+                first_item.family,
+                placement_mode,
+                settings["anchor_mode"],
+                offset_x,
+                offset_y,
+                offset_z,
+                settings["use_solid"]
+            )
+            rotation_reference = probe_default_group_vectors(
+                group_type,
+                first_item.link_item.transform.OfPoint(first_point)
+            )
+        except Exception as probe_error:
+            rotation_reference_error = safe_text(probe_error)
     transaction = DB.Transaction(doc, transaction_name)
-
     try:
         transaction.Start()
         total = len(work_items_to_process)
-
         with forms.ProgressBar(
             title=u"Đang đặt Group... {value} / {max_value}",
             cancellable=True,
             step=1
         ) as progress:
-
             for index, work_item in enumerate(work_items_to_process):
                 if progress.cancelled:
                     cancelled = True
                     break
-
                 family_instance = work_item.family
                 link_item = work_item.link_item
                 sub_transaction = DB.SubTransaction(doc)
                 sub_transaction.Start()
-
                 try:
                     link_anchor, used_solid = get_anchor_point(
                         family_instance,
+                        placement_mode,
                         settings["anchor_mode"],
                         offset_x,
                         offset_y,
+                        offset_z,
                         settings["use_solid"]
                     )
-
                     if link_anchor is None:
                         raise Exception(u"Không xác định được điểm đặt của Family.")
-
-                    if settings["use_solid"] and not used_solid:
+                    if (
+                        placement_mode != "SAMPLE" and
+                        settings["use_solid"] and
+                        not used_solid
+                    ):
                         fallback_bbox_count += 1
-
                     host_anchor = link_item.transform.OfPoint(link_anchor)
-
                     if settings["skip_duplicate"] and has_nearby_point(
                         host_anchor,
                         existing_group_points,
@@ -2891,11 +3590,9 @@ def run_tool(settings, initial_notices=None):
                         )
                         host_direction = link_item.transform.OfVector(link_direction)
                         angle = vector_angle_xy(host_direction) + rotation_offset
-
                         new_group = doc.Create.PlaceGroup(host_anchor, group_type)
                         if new_group is None:
                             raise Exception(u"Revit không tạo được Group.")
-
                         if abs(angle) > 0.0000001:
                             rotation_axis = DB.Line.CreateBound(
                                 host_anchor,
@@ -2907,7 +3604,48 @@ def run_tool(settings, initial_notices=None):
                                 rotation_axis,
                                 angle
                             )
-
+                        # Đo lại góc xoay thực của Group vừa tạo (từ vị trí phần tử bên trong).
+                        try:
+                            if rotation_reference and rotation_checked < 20:
+                                check_origin = get_group_origin_point(new_group)
+                                if check_origin is None:
+                                    check_origin = host_anchor
+                                estimate = estimate_group_rotation(
+                                    group_member_vectors(new_group, check_origin),
+                                    rotation_reference
+                                )
+                                if estimate is not None:
+                                    rotation_checked += 1
+                                    if rotation_readback_sample is None:
+                                        rotation_readback_sample = (angle, estimate[0])
+                                    if abs(normalize_angle_pi(estimate[0] - angle)) > math.radians(1.0):
+                                        rotation_readback_mismatch += 1
+                        except Exception:
+                            pass
+                        # Đọc lại điểm gốc THỰC; nếu Revit đặt lệch thì dời về đúng điểm yêu cầu.
+                        actual_point = host_anchor
+                        try:
+                            actual_origin = get_group_origin_point(new_group)
+                            if actual_origin is not None:
+                                shift = host_anchor - actual_origin
+                                if shift.GetLength() > mm_to_internal(0.5):
+                                    placement_shift_count += 1
+                                    placement_shift_max_mm = max(
+                                        placement_shift_max_mm,
+                                        internal_to_mm(shift.GetLength())
+                                    )
+                                    placement_shift_z_max_mm = max(
+                                        placement_shift_z_max_mm,
+                                        abs(internal_to_mm(shift.Z))
+                                    )
+                                    DB.ElementTransformUtils.MoveElement(
+                                        doc, new_group.Id, shift
+                                    )
+                                    actual_origin = get_group_origin_point(new_group)
+                                if actual_origin is not None:
+                                    actual_point = actual_origin
+                        except Exception:
+                            actual_point = host_anchor
                         is_mirrored = False
                         try:
                             is_mirrored = family_instance.Mirrored is True
@@ -2915,11 +3653,9 @@ def run_tool(settings, initial_notices=None):
                                 mirrored_count += 1
                         except Exception:
                             pass
-
                         source_point = work_item.get_source_point()
                         group_id = new_group.Id
                         group_id_value = get_id_value(group_id)
-
                         sub_transaction.Commit()
                         existing_group_points.append(host_anchor)
                         created_count += 1
@@ -2929,7 +3665,10 @@ def run_tool(settings, initial_notices=None):
                             "group_type_name": settings["group_item"].display_name,
                             "source_family": describe_family(family_instance),
                             "link_name": link_item.display_name,
-                            "link_instance_id": get_id_value(link_item.element.Id),
+                            "link_instance_id": (
+                                u"HOST" if is_host_source(link_item)
+                                else get_id_value(link_item.element.Id)
+                            ),
                             "family_id": get_family_id_value(family_instance),
                             "super_component_id": (
                                 get_super_component_id_value(family_instance)
@@ -2937,20 +3676,19 @@ def run_tool(settings, initial_notices=None):
                                 else u"-"
                             ),
                             "source_point": source_point,
-                            "point": host_anchor,
+                            "point": actual_point,
                             "angle_deg": format_angle_degrees(angle),
                             "anchor_mode": settings["anchor_mode"],
+                            "placement_mode": placement_mode,
                             "used_solid": used_solid,
                             "mirrored": is_mirrored
                         })
-
                 except Exception as item_error:
                     try:
                         if sub_transaction.GetStatus() == DB.TransactionStatus.Started:
                             sub_transaction.RollBack()
                     except Exception:
                         pass
-
                     failed_items.append(
                         u"{0} | {1}: {2}".format(
                             link_item.display_name,
@@ -2958,12 +3696,9 @@ def run_tool(settings, initial_notices=None):
                             safe_text(item_error)
                         )
                     )
-
                 progress.update_progress(index + 1, total)
-
             if progress.cancelled:
                 cancelled = True
-
         if cancelled:
             transaction.RollBack()
             show_output_report(
@@ -2976,16 +3711,13 @@ def run_tool(settings, initial_notices=None):
                 duplicate_source_records=duplicate_source_records
             )
             return
-
         transaction.Commit()
-
     except Exception:
         try:
             if transaction.GetStatus() == DB.TransactionStatus.Started:
                 transaction.RollBack()
         except Exception:
             pass
-
         show_output_report(
             u"Tool không thể hoàn thành",
             summary_lines=context_lines + scan_diagnostics_summary(scan_diagnostics) + [
@@ -2997,7 +3729,6 @@ def run_tool(settings, initial_notices=None):
             traceback_text=traceback.format_exc()
         )
         return
-
     result_lines = context_lines + scan_diagnostics_summary(scan_diagnostics) + [
         u"Group đã tạo: {0}".format(created_count),
         u"Bỏ qua vì Group cùng Type đã tồn tại: {0}".format(
@@ -3005,7 +3736,6 @@ def run_tool(settings, initial_notices=None):
         ),
         u"Không xử lý được: {0}".format(len(failed_items))
     ]
-
     if settings["test_one"]:
         if created_count == 1:
             status_title = u"Đã tạo 1 Group kiểm tra"
@@ -3021,21 +3751,44 @@ def run_tool(settings, initial_notices=None):
             status_title = u"Không tạo được Group kiểm tra"
     else:
         status_title = u"Đã hoàn thành tạo Group hàng loạt"
-
     if fallback_bbox_count:
         report_notices.append(
             u"Có {0} Family không đọc được Solid và đã dùng BoundingBox dự phòng.".format(
                 fallback_bbox_count
             )
         )
-
+    if rotation_readback_sample is not None:
+        report_notices.append(
+            u"Đo lại góc xoay Group vừa tạo (từ vị trí phần tử bên trong): đã áp {0:.2f}°, đo được {1:.2f}°{2}.".format(
+                math.degrees(normalize_angle_pi(rotation_readback_sample[0])),
+                math.degrees(normalize_angle_pi(rotation_readback_sample[1])),
+                u" (khớp)" if not rotation_readback_mismatch else
+                u" - LỆCH ở {0} Group".format(rotation_readback_mismatch)
+            )
+        )
+    elif placement_mode == "SAMPLE":
+        report_notices.append(
+            u"Không đo lại được góc xoay của Group vừa tạo{0}.".format(
+                (u": " + rotation_reference_error) if rotation_reference_error else u""
+            )
+        )
+    if placement_shift_count:
+        report_notices.append(
+            u"Revit đặt {0} Group lệch khỏi điểm yêu cầu (tối đa {1:.1f} mm, riêng Z tối đa {2:.1f} mm); "
+            u"tool đã dời về đúng điểm yêu cầu.".format(
+                placement_shift_count, placement_shift_max_mm, placement_shift_z_max_mm
+            )
+        )
+    elif created_count:
+        report_notices.append(
+            u"Đã đọc lại điểm gốc thực của các Group vừa tạo: trùng điểm yêu cầu (sai lệch ≤ 0.5 mm)."
+        )
     if mirrored_count:
         report_notices.append(
             u"Có {0} Family nguồn bị Mirror. Tool đã xoay Group nhưng chưa mirror hình học Group.".format(
                 mirrored_count
             )
         )
-
     show_output_report(
         status_title,
         summary_lines=result_lines,
@@ -3044,19 +3797,142 @@ def run_tool(settings, initial_notices=None):
         created_records=created_records,
         duplicate_source_records=duplicate_source_records
     )
-
-
+# ============================================================
+# THAO TÁC PICK NGOÀI CỬA SỔ
+# ============================================================
+def handle_window_action(action, window, config):
+    """
+    Thực hiện thao tác cần pick trong Revit SAU KHI cửa sổ đã đóng, ghi kết quả vào
+    config để cửa sổ mở lại khôi phục. Trả về
+    (status_text, sample_status_text, link_items, picked_link_name).
+    """
+    link_items = list(window.link_items)
+    picked_link_name = window.picked_link_name
+    status = None
+    sample_status = None
+    payload = window.pending_payload or {}
+    source_kind = payload.get("source_kind", "LINK")
+    step = u""
+    try:
+        if action == "PICK_LINKS":
+            step = u"pick Revit Link"
+            picked_items = pick_link_items()
+            if not picked_items:
+                status = u"Không có Revit Link mới được chọn; giữ danh sách cũ."
+            else:
+                visible_items, hidden_items = keep_only_links_visible_in_active_view(
+                    picked_items,
+                    active_view
+                )
+                if not visible_items:
+                    status = u"Các Revit Link đã pick không hiển thị trong Active View."
+                else:
+                    link_items = visible_items
+                    config.source_document_mode = "LINK"
+                    status = u"Đã chọn {0} Revit Link.".format(len(visible_items))
+                    if hidden_items:
+                        status += u" Bỏ qua {0} Link không hiển thị trong Active View.".format(
+                            len(hidden_items)
+                        )
+        elif action == "PICK_FAMILY":
+            step = u"pick Family"
+            if source_kind == "HOST":
+                family_instance = pick_host_family_instance()
+                source_name = window.host_item.display_name
+            else:
+                link_item, family_instance = pick_linked_family_instance(link_items)
+                source_name = link_item.display_name
+            family_name = get_family_name(family_instance)
+            if not family_name:
+                raise ValueError(u"Không đọc được Family Name của phần tử đã pick.")
+            config.picked_family_name = family_name
+            config.picked_type_name = get_family_type_name(family_instance)
+            config.source_filter_mode = "PICK"
+            picked_link_name = source_name
+            status = u"Đã pick Family '{0}'. Bấm Kiểm tra số lượng hoặc Bắt đầu.".format(
+                family_name
+            )
+        elif action == "LEARN_SAMPLE":
+            step = u"pick Group mẫu"
+            sample_group = pick_sample_group()
+            step = u"pick Family tương ứng với Group mẫu"
+            if source_kind == "HOST":
+                family_instance = pick_host_family_instance()
+                source_item = window.host_item
+            else:
+                source_item, family_instance = pick_linked_family_instance(link_items)
+            step = u"tính Offset từ Group mẫu và Family"
+            learned = compute_learned_placement(
+                sample_group,
+                family_instance,
+                payload.get("rotation_basis", "HAND"),
+                source_item
+            )
+            description = describe_family(family_instance)
+            summary = (
+                u"X={0:.1f}mm, Y={1:.1f}mm, Z={2:.1f}mm, góc={3:.2f}° (Family mẫu: {4})"
+            ).format(
+                learned["offset_x_mm"],
+                learned["offset_y_mm"],
+                learned["offset_z_mm"],
+                learned["rotation_offset_deg"],
+                description
+            )
+            config.offset_x_mm = u"{0:.2f}".format(learned["offset_x_mm"])
+            config.offset_y_mm = u"{0:.2f}".format(learned["offset_y_mm"])
+            config.offset_z_mm = u"{0:.2f}".format(learned["offset_z_mm"])
+            config.rotation_offset_deg = u"{0:.2f}".format(learned["rotation_offset_deg"])
+            config.placement_mode = "SAMPLE"
+            config.learned_sample_source_key = family_source_key(source_item, family_instance)
+            config.learned_sample_description = description
+            config.learned_sample_summary = summary
+            config.learned_sample_signature = u"{0:.2f}|{1:.2f}|{2:.2f}|{3:.2f}".format(
+                learned["offset_x_mm"],
+                learned["offset_y_mm"],
+                learned["offset_z_mm"],
+                learned["rotation_offset_deg"]
+            )
+            config.learned_sample_debug = u" || ".join(learned.get("debug", []))
+            config.learned_rotation_basis = payload.get("rotation_basis", "HAND")
+            status = (
+                u"ĐÃ HỌC từ Group mẫu: {0}. Family mẫu sẽ tự động bị bỏ qua khi đặt "
+                u"Group vì đã có Group mẫu sẵn tại đó."
+            ).format(summary)
+            if learned["notices"]:
+                status += u" " + u" ".join(learned["notices"])
+            sample_status = status
+    except OperationCanceledException:
+        status = u"Đã hủy ở bước '{0}' (Esc/Cancel); chưa có thay đổi.".format(step)
+        if action == "LEARN_SAMPLE":
+            sample_status = (
+                u"Chưa học được: đã hủy ở bước '{0}'. Hãy bấm lại và pick đủ 2 bước: "
+                u"Group mẫu trước, rồi Family tương ứng."
+            ).format(step)
+    except Exception as ex:
+        trace_tail = u""
+        try:
+            trace_lines = [
+                line.strip() for line in traceback.format_exc().strip().splitlines()
+                if line.strip()
+            ]
+            trace_tail = u" | ".join(trace_lines[-3:])
+        except Exception:
+            pass
+        status = u"Lỗi ở bước '{0}': {1}. Chi tiết: {2}".format(
+            step, safe_text(ex), safe_text(trace_tail)
+        )
+        if action == "LEARN_SAMPLE":
+            sample_status = u"Chưa học được. " + status
+    return status, sample_status, link_items, picked_link_name
 # ============================================================
 # KHỞI CHẠY
 # ============================================================
-
 if doc is None:
     show_output_report(
         u"Không thể chạy tool",
         summary_lines=[u"Không có Revit document đang mở."]
     )
     script.exit()
-
 if doc.IsFamilyDocument:
     show_output_report(
         u"Không thể chạy tool",
@@ -3065,7 +3941,6 @@ if doc.IsFamilyDocument:
         ]
     )
     script.exit()
-
 if active_view is None or active_view.IsTemplate:
     show_output_report(
         u"Không thể chạy tool",
@@ -3074,42 +3949,6 @@ if active_view is None or active_view.IsTemplate:
         ]
     )
     script.exit()
-
-selected_links = pick_link_items()
-if not selected_links:
-    script.exit()
-
-selected_links, hidden_links = keep_only_links_visible_in_active_view(
-    selected_links,
-    active_view
-)
-
-if not selected_links:
-    hidden_names = u"; ".join(
-        [item.display_name for item in hidden_links]
-    )
-    show_output_report(
-        u"Không có Revit Link hợp lệ",
-        summary_lines=[
-            u"Các Revit Link đã pick không hiển thị trong Active View.",
-            u"Link đã pick: {0}".format(hidden_names or u"Không xác định")
-        ],
-        notices=[
-            u"Bật Revit Link trong Visibility/Graphics hoặc chọn Link khác."
-        ]
-    )
-    script.exit()
-
-if hidden_links:
-    hidden_names = u"; ".join(
-        [item.display_name for item in hidden_links]
-    )
-    startup_notices.append(
-        u"Các Link không hiển thị trong Active View đã bị bỏ qua: {0}".format(
-            hidden_names
-        )
-    )
-
 group_types = collect_model_group_types()
 if not group_types:
     show_output_report(
@@ -3122,10 +3961,8 @@ if not group_types:
         ]
     )
     script.exit()
-
 config = script.get_config()
 xaml_path = script.get_bundle_file("ui.xaml")
-
 if not xaml_path or not os.path.exists(xaml_path):
     show_output_report(
         u"Thiếu file giao diện",
@@ -3134,19 +3971,34 @@ if not xaml_path or not os.path.exists(xaml_path):
         ]
     )
     script.exit()
-
-window = SettingsWindow(
-    xaml_path,
-    selected_links,
-    group_types,
-    config,
-    active_view
-)
-window.ShowDialog()
-
+# Vòng lặp: mở cửa sổ; nếu người dùng bấm nút cần pick trong Revit thì cửa sổ đóng,
+# thao tác pick chạy ở đây, rồi cửa sổ mở lại với trạng thái cũ cộng kết quả mới.
+window_link_items = []
+window_status = None
+window_sample_status = None
+window_picked_link_name = u""
+while True:
+    window = SettingsWindow(
+        xaml_path,
+        window_link_items,
+        group_types,
+        config,
+        active_view,
+        window_status,
+        window_sample_status,
+        window_picked_link_name
+    )
+    window.ShowDialog()
+    pending_action = window.pending_action
+    if not pending_action:
+        break
+    (
+        window_status,
+        window_sample_status,
+        window_link_items,
+        window_picked_link_name
+    ) = handle_window_action(pending_action, window, config)
 if window.result is None:
     script.exit()
-
 save_user_config(config, window.result)
 run_tool(window.result, startup_notices)
-

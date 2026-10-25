@@ -1084,13 +1084,90 @@ def get_pinned_elements(elements):
 
 
 # ============================================================
+# AXIS CONNECTIONS
+# ============================================================
+def get_axis_connection_pairs(elements, axis_pipe):
+    """Find physical connector pairs between selection and the fixed axis Pipe."""
+    pairs = []
+    seen = set()
+    if axis_pipe is None:
+        return pairs
+
+    axis_id = eid_value(axis_pipe.Id)
+    for elem in elements:
+        elem_id = eid_value(elem.Id)
+        cm = get_connector_manager(elem)
+        if cm is None:
+            continue
+        try:
+            connectors = cm.Connectors
+        except:
+            continue
+
+        for conn in connectors:
+            if conn is None or not is_physical_connector(conn):
+                continue
+            try:
+                if not conn.IsConnected:
+                    continue
+                refs = conn.AllRefs
+            except:
+                continue
+
+            for axis_conn in refs:
+                if axis_conn is None or not is_physical_connector(axis_conn):
+                    continue
+                try:
+                    owner = axis_conn.Owner
+                except:
+                    owner = None
+                if owner is None or eid_value(owner.Id) != axis_id:
+                    continue
+                try:
+                    origin = conn.Origin
+                    key = (elem_id, round(origin.X, 9), round(origin.Y, 9), round(origin.Z, 9))
+                except:
+                    key = (elem_id, len(pairs))
+                if key not in seen:
+                    seen.add(key)
+                    pairs.append((conn, axis_conn))
+    return pairs
+
+
+def disconnect_pairs(pairs):
+    """Temporarily release only the connection to the fixed axis Pipe."""
+    disconnected = []
+    for conn, axis_conn in pairs:
+        try:
+            if conn.IsConnectedTo(axis_conn):
+                conn.DisconnectFrom(axis_conn)
+                disconnected.append((conn, axis_conn))
+        except:
+            pass
+    return disconnected
+
+
+def reconnect_pairs(pairs):
+    """Reconnect the same connector pairs after rotation."""
+    errors = []
+    for conn, axis_conn in pairs:
+        try:
+            if not conn.IsConnectedTo(axis_conn):
+                conn.ConnectTo(axis_conn)
+        except Exception as ex:
+            errors.append(str(ex))
+    return errors
+
+
+# ============================================================
 # ROTATE
 # ============================================================
 
 def rotate_elements(
     elements,
     axis,
-    angle_deg
+    angle_deg,
+    axis_pipe
 ):
 
     if not elements:
@@ -1125,12 +1202,28 @@ def rotate_elements(
         transaction.Start()
         started = True
 
+        # Revit can lock a connected Tee/Fitting through its connector.
+        # Disconnect only from the fixed axis Pipe, rotate all selected
+        # elements together, then reconnect inside the same transaction.
+        axis_pairs = get_axis_connection_pairs(elements, axis_pipe)
+        disconnected = disconnect_pairs(axis_pairs)
+        if disconnected:
+            doc.Regenerate()
+
         DB.ElementTransformUtils.RotateElements(
             doc,
             ids,
             axis,
             angle_rad
         )
+        doc.Regenerate()
+
+        reconnect_errors = reconnect_pairs(disconnected)
+        if reconnect_errors:
+            raise Exception(
+                "Không thể nối lại fitting với Pipe trục: "
+                + " | ".join(reconnect_errors[:3])
+            )
 
         transaction.Commit()
 
@@ -1284,7 +1377,8 @@ def main():
     success = rotate_elements(
         selected,
         axis,
-        angle_deg
+        angle_deg,
+        axis_pipe
     )
 
     if not success:

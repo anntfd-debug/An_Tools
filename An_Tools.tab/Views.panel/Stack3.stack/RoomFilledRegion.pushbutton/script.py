@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Room Filled Region From Multiple Links
+Room Filled Region From Multiple Links - V1.6 Compatibility Fix
 Compatible with pyRevit + IronPython 2.7 / Revit 2019-2026.
 
 Features:
@@ -11,6 +11,9 @@ Features:
 - Optionally write linked Room Name to the Filled Region instance Comments parameter.
 - Optionally write the active view Level name to a selected writable Filled Region instance Text parameter.
 - Show one pyRevit Output window only, with Element ID and built-in zoom icon.
+- Revit 2024-2026: primary Room source is the link elements visible in the active host view.
+- Reads Active View + View Template link overrides; manual Level/Phase filters are skipped for host-view-visible Rooms.
+- Crop test uses the transformed Room boundary instead of Room bounding box to avoid false rejection.
 """
 
 import clr
@@ -70,6 +73,20 @@ def mm_to_internal(value_mm):
     except Exception:
         return DB.UnitUtils.ConvertToInternalUnits(
             value_mm,
+            DB.DisplayUnitType.DUT_MILLIMETERS
+        )
+
+
+def internal_to_mm(value_internal):
+    value_internal = float(value_internal)
+    try:
+        return DB.UnitUtils.ConvertFromInternalUnits(
+            value_internal,
+            DB.UnitTypeId.Millimeters
+        )
+    except Exception:
+        return DB.UnitUtils.ConvertFromInternalUnits(
+            value_internal,
             DB.DisplayUnitType.DUT_MILLIMETERS
         )
 
@@ -964,15 +981,34 @@ def keyword_matches(name, keywords):
     return False
 
 
-def get_active_view_phase_name():
+def get_view_phase_id(source_view):
+    if source_view is None:
+        return None
     try:
-        parameter = view.get_Parameter(DB.BuiltInParameter.VIEW_PHASE)
+        parameter = source_view.get_Parameter(DB.BuiltInParameter.VIEW_PHASE)
         if parameter is None:
+            return None
+        phase_id = parameter.AsElementId()
+        if phase_id is None or same_element_id(
+                phase_id, DB.ElementId.InvalidElementId):
+            return None
+        return phase_id
+    except Exception:
+        return None
+
+
+def get_view_phase_name(source_view, source_doc):
+    try:
+        phase_id = get_view_phase_id(source_view)
+        if phase_id is None:
             return u""
-        phase = doc.GetElement(parameter.AsElementId())
-        return get_element_name(phase)
+        return get_element_name(source_doc.GetElement(phase_id))
     except Exception:
         return u""
+
+
+def get_active_view_phase_name():
+    return get_view_phase_name(view, doc)
 
 
 def find_link_phase_id_by_name(link_doc, phase_name):
@@ -999,8 +1035,377 @@ def room_phase_matches(room, target_phase_id):
         return True
 
 
-def room_matches_active_level(room, link_doc, link_transform, tolerance_internal):
+def _enum_matches(value, expected):
+    """Robust .NET enum comparison for IronPython / PythonNet variations."""
+    if value is None or expected is None:
+        return False
     try:
+        if value == expected:
+            return True
+    except Exception:
+        pass
+    try:
+        return int(System.Convert.ToInt32(value)) == int(System.Convert.ToInt32(expected))
+    except Exception:
+        pass
+    try:
+        left = safe_text(value).replace(u" ", u"").lower()
+        right = safe_text(expected).replace(u" ", u"").lower()
+        if left == right:
+            return True
+        # Some Python/.NET bridges return "LinkVisibility.ByLinkView".
+        return left.endswith(u"." + right)
+    except Exception:
+        return False
+
+
+def _safe_link_setting_text(settings, property_name):
+    try:
+        return safe_text(getattr(settings, property_name))
+    except Exception:
+        return u"<unreadable>"
+
+
+def _get_active_view_template():
+    try:
+        template_id = view.ViewTemplateId
+        if template_id is None or same_element_id(
+                template_id, DB.ElementId.InvalidElementId):
+            return None
+        template_view = doc.GetElement(template_id)
+        if isinstance(template_view, DB.View):
+            return template_view
+    except Exception:
+        pass
+    return None
+
+
+def _read_link_graphics_settings(source_view, link_id):
+    if source_view is None or not hasattr(source_view, "GetLinkOverrides"):
+        return None
+    try:
+        return source_view.GetLinkOverrides(link_id)
+    except Exception:
+        return None
+
+
+def _inspect_link_graphics_candidate(
+        settings,
+        source_label,
+        link_doc):
+    """Return a normalized candidate dictionary for one RevitLinkGraphicsSettings."""
+    if settings is None:
+        return None
+
+    candidate = {
+        "settings": settings,
+        "source": source_label,
+        "link_visibility_text": _safe_link_setting_text(
+            settings, "LinkVisibilityType"
+        ),
+        "view_range_text": _safe_link_setting_text(settings, "ViewRange"),
+        "view_filter_text": _safe_link_setting_text(
+            settings, "ViewFilterType"
+        ),
+        "linked_view_id": None,
+        "linked_view_id_text": u"",
+        "linked_view": None,
+        "usable_linked_view": False,
+        "reason": u"",
+    }
+
+    try:
+        link_visibility = settings.LinkVisibilityType
+    except Exception:
+        link_visibility = None
+    try:
+        view_range = settings.ViewRange
+    except Exception:
+        view_range = None
+    try:
+        view_filter_type = settings.ViewFilterType
+    except Exception:
+        view_filter_type = None
+
+    try:
+        candidate_id = settings.LinkedViewId
+        if candidate_id is not None and not same_element_id(
+                candidate_id, DB.ElementId.InvalidElementId):
+            candidate["linked_view_id"] = candidate_id
+            try:
+                candidate["linked_view_id_text"] = safe_text(
+                    element_id_value(candidate_id)
+                )
+            except Exception:
+                candidate["linked_view_id_text"] = safe_text(candidate_id)
+    except Exception:
+        pass
+
+    linked_view = None
+    if candidate["linked_view_id"] is not None:
+        try:
+            linked_view = link_doc.GetElement(candidate["linked_view_id"])
+        except Exception:
+            linked_view = None
+    candidate["linked_view"] = linked_view
+
+    by_link_visibility = _enum_matches(
+        link_visibility, DB.LinkVisibility.ByLinkView
+    )
+    custom_visibility = _enum_matches(
+        link_visibility, DB.LinkVisibility.Custom
+    )
+    by_link_view_range = _enum_matches(
+        view_range, DB.LinkVisibility.ByLinkView
+    )
+    by_link_filter = _enum_matches(
+        view_filter_type, DB.LinkVisibility.ByLinkView
+    )
+
+    if linked_view is not None and by_link_visibility:
+        candidate["usable_linked_view"] = True
+        candidate["reason"] = u"LinkVisibilityType=ByLinkView"
+    elif linked_view is not None and custom_visibility and by_link_view_range:
+        candidate["usable_linked_view"] = True
+        candidate["reason"] = u"Custom + ViewRange=ByLinkView"
+    elif linked_view is not None and by_link_view_range:
+        candidate["usable_linked_view"] = True
+        candidate["reason"] = u"ViewRange=ByLinkView"
+    elif linked_view is not None and by_link_filter:
+        # A linked view is still materially controlling visibility/filtering.
+        # Use it as the target context rather than silently falling back to
+        # the active host Level.
+        candidate["usable_linked_view"] = True
+        candidate["reason"] = u"ViewFilterType=ByLinkView"
+    elif linked_view is not None:
+        candidate["reason"] = u"Có LinkedViewId nhưng chưa thấy thuộc tính ByLinkView"
+    else:
+        candidate["reason"] = u"LinkedViewId không hợp lệ/không đọc được"
+
+    return candidate
+
+
+def get_effective_link_view_context(link_instance, link_doc):
+    """
+    Resolve the linked-view context from BOTH the active view and its View
+    Template.  A View Template can own the Revit Links VG settings, in which
+    case querying only the active view can look like By Host View.
+
+    Candidate priority:
+      1) Active View - instance override
+      2) View Template - instance override
+      3) Active View - link type override
+      4) View Template - link type override
+
+    We scan all candidates and prefer the first one that contains a usable
+    LinkedViewId controlled by a ByLinkView setting.
+    """
+    result = {
+        "is_by_linked_view": False,
+        "linked_view": None,
+        "linked_view_id": None,
+        "linked_view_name": u"",
+        "linked_level": None,
+        "linked_level_name": u"",
+        "linked_phase_id": None,
+        "linked_phase_name": u"",
+        "display_mode": u"By Host View / legacy",
+        "override_source": u"",
+        "link_visibility_text": u"",
+        "view_range_text": u"",
+        "view_filter_text": u"",
+        "linked_view_id_text": u"",
+        "detection_reason": u"",
+        "all_candidates_diag": u"",
+    }
+
+    if not hasattr(view, "GetLinkOverrides"):
+        result["detection_reason"] = u"GetLinkOverrides API không có"
+        return result
+
+    template_view = _get_active_view_template()
+    try:
+        type_id = link_instance.GetTypeId()
+    except Exception:
+        type_id = None
+
+    raw_candidates = []
+    raw_candidates.append((
+        u"ActiveView.Instance",
+        _read_link_graphics_settings(view, link_instance.Id)
+    ))
+    if template_view is not None:
+        raw_candidates.append((
+            u"ViewTemplate.Instance",
+            _read_link_graphics_settings(template_view, link_instance.Id)
+        ))
+    if type_id is not None:
+        raw_candidates.append((
+            u"ActiveView.Type",
+            _read_link_graphics_settings(view, type_id)
+        ))
+        if template_view is not None:
+            raw_candidates.append((
+                u"ViewTemplate.Type",
+                _read_link_graphics_settings(template_view, type_id)
+            ))
+
+    candidates = []
+    for source_label, settings in raw_candidates:
+        candidate = _inspect_link_graphics_candidate(
+            settings,
+            source_label,
+            link_doc
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    diag_parts = []
+    for candidate in candidates:
+        diag_parts.append(
+            u"{}: LinkVisibilityType={} | ViewRange={} | "
+            u"ViewFilterType={} | LinkedViewId={} | {}".format(
+                candidate["source"],
+                candidate["link_visibility_text"] or u"<none>",
+                candidate["view_range_text"] or u"<none>",
+                candidate["view_filter_text"] or u"<none>",
+                candidate["linked_view_id_text"] or u"<none>",
+                candidate["reason"] or u"<none>"
+            )
+        )
+    result["all_candidates_diag"] = u" || ".join(diag_parts)
+
+    chosen = None
+    for candidate in candidates:
+        if candidate.get("usable_linked_view"):
+            chosen = candidate
+            break
+
+    # Preserve one candidate for useful diagnostics even if none resolves.
+    if chosen is None and candidates:
+        chosen = candidates[0]
+
+    if chosen is None:
+        result["detection_reason"] = u"Không có Link Graphics override đọc được"
+        return result
+
+    result["override_source"] = chosen["source"]
+    result["link_visibility_text"] = chosen["link_visibility_text"]
+    result["view_range_text"] = chosen["view_range_text"]
+    result["view_filter_text"] = chosen["view_filter_text"]
+    result["linked_view_id"] = chosen["linked_view_id"]
+    result["linked_view_id_text"] = chosen["linked_view_id_text"]
+    result["linked_view"] = chosen["linked_view"]
+    result["display_mode"] = (
+        chosen["link_visibility_text"] or u"Custom / unknown"
+    )
+    result["detection_reason"] = chosen["reason"]
+
+    if chosen.get("usable_linked_view") and chosen.get("linked_view") is not None:
+        linked_view = chosen["linked_view"]
+        result["is_by_linked_view"] = True
+        result["linked_view_name"] = get_element_name(linked_view)
+        try:
+            linked_level = linked_view.GenLevel
+        except Exception:
+            linked_level = None
+        result["linked_level"] = linked_level
+        result["linked_level_name"] = get_element_name(linked_level)
+        result["linked_phase_id"] = get_view_phase_id(linked_view)
+        result["linked_phase_name"] = get_view_phase_name(
+            linked_view,
+            link_doc
+        )
+
+    for candidate in candidates:
+        settings = candidate.get("settings")
+        try:
+            settings.Dispose()
+        except Exception:
+            pass
+
+    return result
+
+
+def collect_rooms_visible_in_host_view(link_instance):
+    """
+    Revit 2024+ definitive visibility source.
+
+    Autodesk added FilteredElementCollector(hostDoc, hostViewId, linkInstanceId)
+    specifically to iterate elements of one link instance whose graphics may be
+    visible in a host view.  This already accounts for By Linked View, view
+    templates, phase/filter graphics, and per-instance link settings.
+
+    The 2-argument warm-up collector is intentional.  It avoids a known
+    2025.4/2026 instability seen in some projects before constructing the
+    3-argument linked-view collector.  Both collectors are explicitly disposed.
+    """
+    result = {
+        "ok": False,
+        "rooms": [],
+        "reason": u"",
+    }
+
+    warmup = None
+    linked_collector = None
+    try:
+        # Warm the host view collector before linked-view iteration.
+        warmup = DB.FilteredElementCollector(doc, view.Id)
+        warmup.WhereElementIsNotElementType()
+        try:
+            warmup.GetElementCount()
+        except Exception:
+            pass
+
+        linked_collector = DB.FilteredElementCollector(
+            doc,
+            view.Id,
+            link_instance.Id
+        )
+        linked_collector.OfCategory(DB.BuiltInCategory.OST_Rooms)
+        linked_collector.WhereElementIsNotElementType()
+
+        rooms = list(linked_collector)
+        result["ok"] = True
+        result["rooms"] = rooms
+        result["reason"] = (
+            u"FilteredElementCollector(host, view, link) -> {} Room visible"
+        ).format(len(rooms))
+    except Exception as error:
+        result["reason"] = u"Visible-link collector fallback: {}".format(
+            safe_text(error)
+        )
+    finally:
+        if linked_collector is not None:
+            try:
+                linked_collector.Dispose()
+            except Exception:
+                pass
+        if warmup is not None:
+            try:
+                warmup.Dispose()
+            except Exception:
+                pass
+
+    return result
+
+
+def room_matches_target_level(
+        room,
+        link_doc,
+        link_transform,
+        tolerance_internal,
+        link_view_context):
+    """
+    By Linked View -> compare the Room.LevelId directly with Linked View.GenLevel.
+    Otherwise -> preserve the old host active Level elevation+tolerance behavior.
+    """
+    try:
+        if link_view_context.get("is_by_linked_view"):
+            target_level = link_view_context.get("linked_level")
+            if target_level is not None:
+                return same_element_id(room.LevelId, target_level.Id)
+
         linked_level = link_doc.GetElement(room.LevelId)
         if linked_level is None:
             return True
@@ -1011,6 +1416,107 @@ def room_matches_active_level(room, link_doc, link_transform, tolerance_internal
         return abs(host_level_point.Z - active_level_z) <= tolerance_internal
     except Exception:
         return True
+
+
+def get_room_phase_name(room, link_doc):
+    try:
+        parameter = room.get_Parameter(DB.BuiltInParameter.ROOM_PHASE)
+        if parameter is None:
+            return u""
+        phase = link_doc.GetElement(parameter.AsElementId())
+        return get_element_name(phase)
+    except Exception:
+        return u""
+
+
+def get_room_level_diagnostic(room, link_doc, link_transform):
+    result = {
+        "level_name": u"<không đọc được>",
+        "linked_z_mm": None,
+        "host_z_mm": None,
+        "active_z_mm": None,
+        "delta_mm": None,
+    }
+    try:
+        linked_level = link_doc.GetElement(room.LevelId)
+        if linked_level is None:
+            return result
+
+        result["level_name"] = get_element_name(linked_level) or u"<không tên>"
+        result["linked_z_mm"] = internal_to_mm(linked_level.Elevation)
+
+        linked_level_point = DB.XYZ(0.0, 0.0, linked_level.Elevation)
+        host_level_point = link_transform.OfPoint(linked_level_point)
+        active_level_z = view.GenLevel.Elevation
+
+        result["host_z_mm"] = internal_to_mm(host_level_point.Z)
+        result["active_z_mm"] = internal_to_mm(active_level_z)
+        result["delta_mm"] = internal_to_mm(
+            abs(host_level_point.Z - active_level_z)
+        )
+    except Exception:
+        pass
+    return result
+
+
+def format_room_level_diagnostic(
+        room,
+        link_doc,
+        link_transform,
+        tolerance_mm,
+        link_view_context=None,
+        visibility_source_mode=None):
+    data = get_room_level_diagnostic(room, link_doc, link_transform)
+
+    def fmt(value):
+        if value is None:
+            return u"?"
+        return u"{:.1f}".format(value)
+
+    base = (
+        u"Room Level='{}' | Link Z={} mm | Host Z={} mm | "
+        u"Active '{}' Z={} mm | Δ={} mm | tolerance={} mm"
+    ).format(
+        data["level_name"],
+        fmt(data["linked_z_mm"]),
+        fmt(data["host_z_mm"]),
+        ACTIVE_LEVEL_NAME,
+        fmt(data["active_z_mm"]),
+        fmt(data["delta_mm"]),
+        u"{:.1f}".format(float(tolerance_mm))
+    )
+
+    if visibility_source_mode == u"host_view_visible":
+        return (
+            u"{} | TARGET=Visible in Host View | Level filter=SKIP"
+        ).format(base)
+
+    if link_view_context and link_view_context.get("is_by_linked_view"):
+        return (
+            u"{} | TARGET=By Linked View '{}' | Target Level='{}'"
+        ).format(
+            base,
+            link_view_context.get("linked_view_name") or u"<không tên>",
+            link_view_context.get("linked_level_name") or u"<không đọc được>"
+        )
+    return u"{} | TARGET=Active Host Level".format(base)
+
+
+def build_room_diagnostic_item(status, link_name, room, detail):
+    number = room_number(room)
+    name = room_name(room)
+    label = u"{} - {}".format(number, name).strip(u" -")
+    try:
+        room_id_value = element_id_value(room.Id)
+    except Exception:
+        room_id_value = -1
+    return (
+        safe_text(status),
+        safe_text(link_name),
+        label or u"<Room không tên>",
+        room_id_value,
+        safe_text(detail)
+    )
 
 
 def bbox_corners(bbox):
@@ -1024,29 +1530,44 @@ def bbox_corners(bbox):
     return result
 
 
-def room_intersects_active_crop(room, link_transform, crop_only):
+def curve_loops_intersect_active_crop(curve_loops, crop_only):
+    """
+    Conservative host crop test based on the actual transformed Room boundary.
+
+    The old version tested room.get_BoundingBox(None) in the linked document and
+    could reject Rooms that were still visible/selectable.  V1.3 tests the
+    Filled Region candidate curves after they have already been transformed into
+    host coordinates.  The crop BoundingBox is used only as a conservative
+    envelope, so non-rectangular/split crops may allow extra candidates but will
+    not wrongly reject a Room merely because its linked Room bbox is misleading.
+    """
     if not crop_only:
         return True
 
     try:
         if not view.CropBoxActive:
             return True
-
-        room_bbox = room.get_BoundingBox(None)
         crop_bbox = view.CropBox
-        if room_bbox is None or crop_bbox is None:
+        if crop_bbox is None or curve_loops is None:
             return True
 
         crop_inverse = crop_bbox.Transform.Inverse
-        local_points = []
-        for point in bbox_corners(room_bbox):
-            host_point = link_transform.OfPoint(point)
-            local_points.append(crop_inverse.OfPoint(host_point))
+        xs = []
+        ys = []
+        for curve_loop in curve_loops:
+            for curve in curve_loop:
+                for point in iter_curve_points(curve):
+                    local_point = crop_inverse.OfPoint(point)
+                    xs.append(local_point.X)
+                    ys.append(local_point.Y)
 
-        room_min_x = min([point.X for point in local_points])
-        room_max_x = max([point.X for point in local_points])
-        room_min_y = min([point.Y for point in local_points])
-        room_max_y = max([point.Y for point in local_points])
+        if not xs or not ys:
+            return True
+
+        room_min_x = min(xs)
+        room_max_x = max(xs)
+        room_min_y = min(ys)
+        room_max_y = max(ys)
 
         crop_min_x = crop_bbox.Min.X
         crop_max_x = crop_bbox.Max.X
@@ -1421,7 +1942,8 @@ def show_pyrevit_result(
         summary_lines,
         created_items,
         warning_items,
-        error_items):
+        error_items,
+        diagnostic_items):
     output = script.get_output()
 
     try:
@@ -1503,6 +2025,30 @@ def show_pyrevit_result(
                 )
             )
 
+    if diagnostic_items:
+        output.print_md(u"---")
+        output.print_md(
+            u"## Chẩn đoán Room khớp từ khóa ({})".format(
+                len(diagnostic_items)
+            )
+        )
+        output.print_md(
+            u"Các Room dưới đây đã khớp từ khóa. Trạng thái cho biết chính xác "
+            u"Room dừng ở bước nào hoặc đã tạo Filled Region thành công."
+        )
+        for index, item in enumerate(diagnostic_items, 1):
+            status, link_name, room_label, room_id_value, detail = item
+            output.print_md(
+                u"{}. **[{}]** {} | {} | Linked Room ID {} — {}".format(
+                    index,
+                    clean_output_text(status),
+                    clean_output_text(link_name),
+                    clean_output_text(room_label),
+                    room_id_value,
+                    clean_output_text(detail)
+                )
+            )
+
     try:
         output.show()
     except Exception:
@@ -1522,9 +2068,19 @@ active_phase_name = get_active_view_phase_name()
 
 room_data_items = []
 failed_items = list(skipped_links)
+diagnostic_items = []
 matched_rooms_count = 0
 scanned_rooms_count = 0
+rooms_without_area_count = 0
 rooms_without_filter_parameter_count = 0
+keyword_matched_count = 0
+phase_rejected_count = 0
+level_rejected_count = 0
+crop_rejected_count = 0
+boundary_rejected_count = 0
+create_failed_count = 0
+
+link_context_summaries = []
 
 for context in link_contexts:
     link_instance = context["instance"]
@@ -1532,30 +2088,111 @@ for context in link_contexts:
     link_transform = context["transform"]
     link_name = context["name"]
 
-    link_phase_id = None
-    if window.match_phase:
-        link_phase_id = find_link_phase_id_by_name(
-            link_doc,
-            active_phase_name
+    # Revit 2024+ can expose the actual "By Linked View" selected in VG.
+    # Revit 2019-2023 (or unreadable overrides) safely falls back to the old
+    # Active Host Level logic.
+    link_view_context = get_effective_link_view_context(
+        link_instance,
+        link_doc
+    )
+
+    graphics_diag = (
+        u"source={} | LinkVisibilityType={} | ViewRange={} | "
+        u"ViewFilterType={} | LinkedViewId={} | detect={} | candidates={}"
+    ).format(
+        link_view_context.get("override_source") or u"<none>",
+        link_view_context.get("link_visibility_text") or u"<none>",
+        link_view_context.get("view_range_text") or u"<none>",
+        link_view_context.get("view_filter_text") or u"<none>",
+        link_view_context.get("linked_view_id_text") or u"<none>",
+        link_view_context.get("detection_reason") or u"<none>",
+        link_view_context.get("all_candidates_diag") or u"<none>"
+    )
+
+    if link_view_context.get("is_by_linked_view"):
+        link_context_summaries.append(
+            u"{} -> By Linked View '{}' | Level='{}' | Phase='{}' | {}".format(
+                link_name,
+                link_view_context.get("linked_view_name") or u"<không tên>",
+                link_view_context.get("linked_level_name") or u"<không đọc được>",
+                link_view_context.get("linked_phase_name") or u"<không đọc được>",
+                graphics_diag
+            )
+        )
+    else:
+        link_context_summaries.append(
+            u"{} -> {} | target Active Host Level='{}' | Phase='{}' | {}".format(
+                link_name,
+                link_view_context.get("display_mode") or u"By Host View / legacy",
+                ACTIVE_LEVEL_NAME or u"<không đọc được>",
+                active_phase_name or u"<không đọc được>",
+                graphics_diag
+            )
         )
 
-    try:
-        all_rooms = list(
-            DB.FilteredElementCollector(link_doc)
-              .OfCategory(DB.BuiltInCategory.OST_Rooms)
-              .WhereElementIsNotElementType()
+    link_phase_id = None
+    phase_reference_name = active_phase_name
+    phase_reference_label = u"Active Host View"
+    if window.match_phase:
+        if link_view_context.get("is_by_linked_view"):
+            link_phase_id = link_view_context.get("linked_phase_id")
+            phase_reference_name = link_view_context.get("linked_phase_name")
+            phase_reference_label = u"Linked View '{}'".format(
+                link_view_context.get("linked_view_name") or u"<không tên>"
+            )
+        else:
+            link_phase_id = find_link_phase_id_by_name(
+                link_doc,
+                active_phase_name
+            )
+
+    # Primary source on Revit 2024+: let Revit itself tell us which linked
+    # Room elements may be visible in THIS host view.  This avoids guessing
+    # Level/Phase when By Linked View is controlled by a View Template or
+    # nested link graphics.
+    visible_room_result = collect_rooms_visible_in_host_view(link_instance)
+    use_host_view_visible_rooms = bool(visible_room_result.get("ok"))
+
+    if use_host_view_visible_rooms:
+        all_rooms = visible_room_result.get("rooms") or []
+        room_source_label = u"VISIBLE_IN_HOST_VIEW"
+        link_context_summaries.append(
+            u"{} -> Room source={} | {}".format(
+                link_name,
+                room_source_label,
+                visible_room_result.get("reason") or u""
+            )
         )
-    except Exception as collector_error:
-        failed_items.append((
-            link_name,
-            u"Không thể thu thập Room: {}".format(safe_text(collector_error))
-        ))
-        continue
+    else:
+        room_source_label = u"FULL_LINK_FALLBACK"
+        try:
+            all_rooms = list(
+                DB.FilteredElementCollector(link_doc)
+                  .OfCategory(DB.BuiltInCategory.OST_Rooms)
+                  .WhereElementIsNotElementType()
+            )
+        except Exception as collector_error:
+            failed_items.append((
+                link_name,
+                u"Không thể thu thập Room: {}".format(
+                    safe_text(collector_error)
+                )
+            ))
+            continue
+
+        link_context_summaries.append(
+            u"{} -> Room source={} | {}".format(
+                link_name,
+                room_source_label,
+                visible_room_result.get("reason") or u""
+            )
+        )
 
     scanned_rooms_count += len(all_rooms)
 
     for room in all_rooms:
         if not room_has_area(room):
+            rooms_without_area_count += 1
             continue
 
         filter_parameter, filter_value = room_filter_parameter_value(
@@ -1568,40 +2205,107 @@ for context in link_contexts:
             continue
         if not keyword_matches(filter_value, keywords):
             continue
-        if not room_phase_matches(room, link_phase_id):
-            continue
-        if not room_matches_active_level(
+
+        keyword_matched_count += 1
+
+        room_phase_value = get_room_phase_name(room, link_doc)
+
+        # When the 3-argument collector succeeded, Revit has already evaluated
+        # the link's effective host-view visibility context.  Do NOT apply our
+        # own host Phase or host Level filter again; doing so is exactly what
+        # removed E-01 Rooms while the link was displayed By Linked View.
+        if not use_host_view_visible_rooms:
+            if not room_phase_matches(room, link_phase_id):
+                phase_rejected_count += 1
+                diagnostic_items.append(
+                    build_room_diagnostic_item(
+                        u"LOẠI - PHASE",
+                        link_name,
+                        room,
+                        u"Room Phase='{}' | Target Phase='{}' từ {}".format(
+                            room_phase_value or u"<không đọc được>",
+                            phase_reference_name or u"<không đọc được>",
+                            phase_reference_label
+                        )
+                    )
+                )
+                continue
+
+        level_detail = format_room_level_diagnostic(
             room,
             link_doc,
             link_transform,
-            level_tolerance
-        ):
-            continue
-        if not room_intersects_active_crop(
-            room,
-            link_transform,
-            window.crop_only
-        ):
-            continue
+            window.level_tolerance_mm,
+            link_view_context,
+            u"host_view_visible" if use_host_view_visible_rooms else None
+        )
 
-        matched_rooms_count += 1
+        if not use_host_view_visible_rooms:
+            if not room_matches_target_level(
+                room,
+                link_doc,
+                link_transform,
+                level_tolerance,
+                link_view_context
+            ):
+                level_rejected_count += 1
+                diagnostic_items.append(
+                    build_room_diagnostic_item(
+                        u"LOẠI - LEVEL",
+                        link_name,
+                        room,
+                        level_detail
+                    )
+                )
+                continue
+
         number = room_number(room)
         name = room_name(room)
         room_label = u"{} - {}".format(number, name).strip(u" -")
         full_label = room_label
 
         try:
+            # Build the actual transformed boundary first.  Crop checking is
+            # performed on these host-coordinate curves, not on Room bbox.
             curve_loops = get_room_curve_loops(
                 room,
                 window.boundary_location,
                 link_transform
             )
             if curve_loops is None or curve_loops.Count == 0:
+                boundary_rejected_count += 1
+                diagnostic_items.append(
+                    build_room_diagnostic_item(
+                        u"LOẠI - BOUNDARY",
+                        link_name,
+                        room,
+                        u"Room không có đường bao hợp lệ | {}".format(
+                            level_detail
+                        )
+                    )
+                )
                 failed_items.append((
                     full_label,
                     u"Room không có đường bao hợp lệ"
                 ))
                 continue
+
+            if not curve_loops_intersect_active_crop(
+                    curve_loops,
+                    window.crop_only):
+                crop_rejected_count += 1
+                diagnostic_items.append(
+                    build_room_diagnostic_item(
+                        u"LOẠI - CROP",
+                        link_name,
+                        room,
+                        u"Boundary Room sau Transform nằm ngoài envelope CropBox "
+                        u"của Active View host | {}".format(level_detail)
+                    )
+                )
+                continue
+
+            matched_rooms_count += 1
 
             room_data_items.append({
                 "room": room,
@@ -1611,8 +2315,23 @@ for context in link_contexts:
                 "curve_loops": curve_loops,
                 "bounds": curve_loops_xy_bounds(curve_loops),
                 "marker": build_region_marker(link_instance, room),
+                "diagnostic_link_name": link_name,
+                "diagnostic_level_detail": level_detail,
+                "diagnostic_phase_name": room_phase_value,
             })
         except Exception as room_error:
+            boundary_rejected_count += 1
+            diagnostic_items.append(
+                build_room_diagnostic_item(
+                    u"LỖI - BOUNDARY",
+                    link_name,
+                    room,
+                    u"{} | {}".format(
+                        safe_text(room_error),
+                        level_detail
+                    )
+                )
+            )
             failed_items.append((full_label, safe_text(room_error)))
 
 regions_to_delete = []
@@ -1719,7 +2438,31 @@ if has_transaction_work:
                             ))
 
                     created_items.append((region, room_data["label"]))
+                    diagnostic_items.append(
+                        build_room_diagnostic_item(
+                            u"TẠO OK",
+                            room_data["diagnostic_link_name"],
+                            room_data["room"],
+                            u"Filled Region ID {} | Phase='{}' | {}".format(
+                                element_id_value(region.Id),
+                                room_data["diagnostic_phase_name"] or u"<không đọc được>",
+                                room_data["diagnostic_level_detail"]
+                            )
+                        )
+                    )
                 except Exception as create_error:
+                    create_failed_count += 1
+                    diagnostic_items.append(
+                        build_room_diagnostic_item(
+                            u"LỖI - CREATE",
+                            room_data["diagnostic_link_name"],
+                            room_data["room"],
+                            u"{} | {}".format(
+                                safe_text(create_error),
+                                room_data["diagnostic_level_detail"]
+                            )
+                        )
+                    )
                     failed_items.append((
                         room_data["label"],
                         safe_text(create_error)
@@ -1735,11 +2478,34 @@ if has_transaction_work:
         ))
         created_items = []
         warning_items = []
+        diagnostic_items = [
+            item for item in diagnostic_items
+            if item[0] != u"TẠO OK"
+        ]
+        diagnostic_items.append((
+            u"LỖI - TRANSACTION ROLLBACK",
+            u"Host model",
+            u"Toàn bộ lần chạy",
+            -1,
+            u"Transaction bị rollback; mọi trạng thái TẠO OK trước đó không còn hiệu lực."
+        ))
         deleted_count = 0
         comments_updated_count = 0
         comments_failed_count = 0
         level_updated_count = 0
         level_failed_count = 0
+
+if window.operation_mode == MODE_DELETE_ONLY:
+    for room_data in room_data_items:
+        diagnostic_items.append(
+            build_room_diagnostic_item(
+                u"ĐỦ ĐIỀU KIỆN - DELETE ONLY",
+                room_data["diagnostic_link_name"],
+                room_data["room"],
+                room_data["diagnostic_level_detail"]
+            )
+        )
+
 
 mode_labels = {
     MODE_REPLACE: u"Xóa vùng cũ và tạo lại",
@@ -1759,9 +2525,23 @@ summary_lines = [
         selected_link_count,
         loaded_link_count
     ),
-    u"Room đã quét: {} | phù hợp: {}".format(
+    u"Room đã quét: {} | có Area: {}".format(
         scanned_rooms_count,
+        scanned_rooms_count - rooms_without_area_count
+    ),
+    u"Khớp từ khóa: {} | qua Phase: {} | qua Level: {} | qua Crop: {}".format(
+        keyword_matched_count,
+        keyword_matched_count - phase_rejected_count,
+        keyword_matched_count - phase_rejected_count - level_rejected_count,
         matched_rooms_count
+    ),
+    u"Bị loại: Area {} | Phase {} | Level {} | Crop {} | Boundary {} | Create {}".format(
+        rooms_without_area_count,
+        phase_rejected_count,
+        level_rejected_count,
+        crop_rejected_count,
+        boundary_rejected_count,
+        create_failed_count
     ),
     u"Parameter dùng để lọc: {} [{} | {}]".format(
         window.room_filter_parameter["name"],
@@ -1772,6 +2552,11 @@ summary_lines = [
         rooms_without_filter_parameter_count
     ),
     u"Từ khóa: {}".format(window.keyword_text),
+    u"Bộ lọc: Match Phase={} | Crop Only={} | Level tolerance={} mm (tolerance chỉ dùng khi không phải By Linked View)".format(
+        u"Bật" if window.match_phase else u"Tắt",
+        u"Bật" if window.crop_only else u"Tắt",
+        u"{:.1f}".format(float(window.level_tolerance_mm))
+    ),
     u"Đã xóa: {} Filled Region".format(deleted_count),
     u"Đã tạo: {} Filled Region".format(len(created_items)),
     u"Điền Room Name vào Comments: {}".format(
@@ -1805,6 +2590,12 @@ summary_lines = [
     ),
 ]
 
+if link_context_summaries:
+    for context_summary in link_context_summaries:
+        summary_lines.append(
+            u"Link display target: {}".format(context_summary)
+        )
+
 if selected_link_names:
     summary_lines.append(
         u"Links: {}".format(u"; ".join(selected_link_names))
@@ -1818,5 +2609,6 @@ show_pyrevit_result(
     summary_lines,
     created_items,
     warning_items,
-    failed_items
+    failed_items,
+    diagnostic_items
 )

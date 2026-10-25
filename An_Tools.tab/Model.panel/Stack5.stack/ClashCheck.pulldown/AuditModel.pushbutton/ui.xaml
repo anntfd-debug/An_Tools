@@ -1,7 +1,7 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Linked Clash Checker V2.8"
-        Width="740" Height="920"
+        Title="Linked Clash Checker V3.0"
+        Width="740" Height="960"
         MinWidth="700" MinHeight="760"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResize">
@@ -11,8 +11,8 @@
             <Border BorderBrush="#4472C4" BorderThickness="2" CornerRadius="6"
                     Background="#DDEBF7" Padding="10" Margin="0,0,0,12">
                 <StackPanel>
-                    <TextBlock Text="V2.8 - ACTIVE VIEW REGION + PIPE DIRECTION + GROUPED CLASH"
-                               FontSize="20" FontWeight="Bold" Foreground="#203864"/>
+                    <TextBlock Text="V3.0 - FIRE RATED DOOR + ACTIVE VIEW REGION + PIPE DIRECTION"
+                               FontSize="20" FontWeight="Bold" Foreground="#203864" TextWrapping="Wrap"/>
                     <TextBlock Text="Scope: Entire Model / Active View / Pick Region in Active View. Region chỉ giới hạn MEP Host dùng để clash."
                                Margin="0,3,0,0" FontWeight="SemiBold" TextWrapping="Wrap"/>
                 </StackPanel>
@@ -32,7 +32,7 @@
                     <TextBlock Text="INSPECTION MODE - SELECT / ZOOM"
                                FontSize="17" FontWeight="Bold" Foreground="#9E480E"/>
                     <TextBlock x:Name="tb_ui_version"
-                               Text="UI V2.8 - Active View Region ready"
+                               Text="UI V3.0 - Fire Rated Door ready"
                                Margin="0,2,0,8" FontWeight="SemiBold" Foreground="#9E480E"/>
 
                     <CheckBox x:Name="cb_inspection_mode"
@@ -55,6 +55,7 @@
                                 <ComboBoxItem Content="Structural Framing" Tag="beam"/>
                                 <ComboBoxItem Content="Structural Column" Tag="column"/>
                                 <ComboBoxItem Content="Fire Rated Wall" Tag="firewall"/>
+                                <ComboBoxItem Content="Fire Rated Door" Tag="firedoor"/>
                             </ComboBox>
                         </Grid>
                         <TextBlock Margin="0,8,0,0" Foreground="#666666" TextWrapping="Wrap"
@@ -105,6 +106,7 @@
                     <CheckBox x:Name="cb_beam" Content="Structural Framing (Beam / Brace)" Margin="14,2,0,2"/>
                     <CheckBox x:Name="cb_column" Content="Structural Column" Margin="14,2,0,2"/>
                     <CheckBox x:Name="cb_firewall" Content="Fire Rated Wall" Margin="14,2,0,2"/>
+                    <CheckBox x:Name="cb_firedoor" Content="Fire Rated Door (lọc theo Door Type Name)" Margin="14,2,0,2"/>
 
                     <TextBlock Text="Room Name keywords:" Margin="14,12,0,3" FontWeight="SemiBold"/>
                     <TextBox x:Name="tb_keywords" Margin="14,0,0,0" MinHeight="58"
@@ -112,6 +114,13 @@
                              VerticalScrollBarVisibility="Auto"/>
                     <TextBlock Margin="14,4,0,0" Foreground="Gray" TextWrapping="Wrap"
                                Text="Nhiều từ khóa: ngăn cách bằng dấu phẩy, dấu chấm phẩy, | hoặc xuống dòng. Có fuzzy matching."/>
+
+                    <TextBlock Text="Fire Rated Door - Type Name keywords:" Margin="14,12,0,3" FontWeight="SemiBold"/>
+                    <TextBox x:Name="tb_door_keywords" Margin="14,0,0,0" MinHeight="40"
+                             AcceptsReturn="True" TextWrapping="Wrap"
+                             VerticalScrollBarVisibility="Auto"/>
+                    <TextBlock Margin="14,4,0,0" Foreground="Gray" TextWrapping="Wrap"
+                               Text="Mặc định: Fire Rated, 2HR, HR. Match theo từ (không fuzzy): HR khớp 2HR / 1.5HR / 2 HR nhưng không khớp THREE, CHROME. Type Name chứa Non Fire Rated / Not Rated / NFR sẽ bị loại."/>
                 </StackPanel>
             </GroupBox>
 
@@ -136,7 +145,7 @@
             <GroupBox Header="5. ZOOM LINKED TARGET SAU CLASH" Margin="0,0,0,10">
                 <StackPanel Margin="10">
                     <CheckBox x:Name="cb_zoom_linked_after_clash"
-                              Content="Sau RUN CHECK: Select + Zoom các Room / Beam / Column / Fire Wall thực sự có clash"
+                              Content="Sau RUN CHECK: Select + Zoom các Room / Beam / Column / Fire Wall / Fire Door thực sự có clash"
                               FontWeight="Bold"/>
                     <TextBlock Margin="16,6,0,0" Foreground="Gray" TextWrapping="Wrap"
                                Text="Chỉ áp dụng Clash Mode. Tool dùng linked Reference để select đối tượng trong Revit Link và zoom bounding box đã transform về host. Nếu tắt, output host vẫn clickable như trước."/>
@@ -145,7 +154,7 @@
 
             <GroupBox Header="LINK ĐANG DÙNG" Margin="0,0,0,12">
                 <StackPanel Margin="10">
-                    <TextBlock Text="Architecture / Room + Fire Wall:" FontWeight="SemiBold"/>
+                    <TextBlock Text="Architecture / Room + Fire Wall + Fire Door:" FontWeight="SemiBold"/>
                     <TextBlock x:Name="tb_arch_links" Margin="12,2,0,6" TextWrapping="Wrap"/>
                     <TextBlock Text="Structure:" FontWeight="SemiBold"/>
                     <TextBlock x:Name="tb_struct_links" Margin="12,2,0,0" TextWrapping="Wrap"/>

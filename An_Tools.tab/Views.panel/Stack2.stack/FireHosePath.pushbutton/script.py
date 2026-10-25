@@ -879,7 +879,13 @@ if cell_count > MAX_GRID_CELLS:
     )
 
 try:
-    level_elevation = view.GenLevel.Elevation
+    # FIX: Level.Elevation depends on the level type 'Elevation Base'
+    # (Project Base Point or Survey Point / AHD RL). Geometry and BoundingBox Z
+    # values are always internal coordinates, so ProjectElevation must be used.
+    # With Survey Point levels the old value moved the 0-2000 mm analysis band
+    # far away from the real walls, so no wall/column/equipment was collected
+    # and every route was drawn straight through the walls.
+    level_elevation = view.GenLevel.ProjectElevation
 except Exception:
     level_elevation = base_point.Z
 
@@ -1349,9 +1355,13 @@ def create_door_portal_record(insert, host_wall, source_view, external_transform
     # Half a grid cell is then added only for raster quantisation, so a normal
     # 800-900 mm door is not lost when its centre falls between grid columns.
     physical_usable_half_width = max(0.0, width * 0.5 - clearance)
+    # FIX: the old '+ half_cell + 25 mm' widened the carved opening beyond the
+    # door jambs (about 225 mm each side with a 400 mm grid), so routes could
+    # pass through the wall next to the door. Keep the clear width only; the
+    # half_cell * 1.05 minimum still guarantees one raster column of cells.
     portal_half_width = max(
-        half_cell * 0.55,
-        physical_usable_half_width + half_cell + mm_to_ft(DOOR_PORTAL_WIDTH_EXTRA_MM)
+        half_cell * 1.05,
+        physical_usable_half_width
     )
 
     # The portal must cross the entire inflated wall band and reach at least
@@ -1378,6 +1388,8 @@ def create_door_portal_record(insert, host_wall, source_view, external_transform
         'insert_id': eid_int(insert.Id),
         'wall_id': eid_int(host_wall.Id),
         'source_key': source_key,
+        'wall_key': (source_key, eid_int(host_wall.Id)),
+        'wall_width': wall_width,
     }
 
 
@@ -1809,6 +1821,9 @@ def collect_source_obstacles(source_doc, external_transform, is_host, link_insta
 
             radius = wall_width * 0.5 + clearance + half_diag
             radius_sq = radius * radius
+            physical_radius = wall_width * 0.5 + clearance
+            physical_radius_sq = physical_radius * physical_radius
+            wall_key = (source_key, eid_int(wall.Id))
             previous_uv = xyz_to_uv(transform_point(tess_points[0], external_transform))
             added = False
 
@@ -1829,7 +1844,9 @@ def collect_source_obstacles(source_doc, external_transform, is_host, link_insta
                             ax, ay, bx, by,
                             radius_sq,
                             seg_min_u, seg_max_u,
-                            seg_min_v, seg_max_v
+                            seg_min_v, seg_max_v,
+                            wall_key,
+                            physical_radius_sq
                         ))
                         obstacle_stats['wall_segments'] += 1
                         added = True
@@ -2178,6 +2195,77 @@ def carve_door_portal(portal):
     return carved
 
 
+def reblock_other_walls_in_portal(portal):
+    """Restore wall cells that a door portal cleared from a DIFFERENT wall.
+
+    The wall raster is one shared mask. A portal near a wall junction or next to
+    a collinear wall continuation used to clear those other walls too, creating
+    a hole beside the door. A cleared cell is re-blocked when it is physically
+    close to another wall whose body lies outside the selected door opening.
+    """
+    host_key = portal.get('wall_key')
+    host_half = portal.get('wall_width', mm_to_ft(200.0)) * 0.5
+    door_half = portal.get('physical_width', mm_to_ft(DOOR_DEFAULT_WIDTH_MM)) * 0.5
+    tangent_u = portal['tangent_u']
+    tangent_v = portal['tangent_v']
+    normal_u = portal['normal_u']
+    normal_v = portal['normal_v']
+    extent_u = abs(tangent_u) * portal['half_width'] + abs(normal_u) * portal['half_depth']
+    extent_v = abs(tangent_v) * portal['half_width'] + abs(normal_v) * portal['half_depth']
+    p_u0 = portal['center_u'] - extent_u - half_cell
+    p_u1 = portal['center_u'] + extent_u + half_cell
+    p_v0 = portal['center_v'] - extent_v - half_cell
+    p_v1 = portal['center_v'] + extent_v + half_cell
+
+    nearby = []
+    for segment in wall_segments:
+        if len(segment) < 11 or segment[9] == host_key:
+            continue
+        if segment[6] < p_u0 or segment[5] > p_u1 or segment[8] < p_v0 or segment[7] > p_v1:
+            continue
+        nearby.append(segment)
+    if not nearby:
+        return 0
+
+    i0, i1, j0, j1 = grid_range_from_bbox(p_u0, p_u1, p_v0, p_v1)
+    restored = 0
+    for j in range(j0, j1 + 1):
+        center_v = min_v + (j + 0.5) * cell
+        for i in range(i0, i1 + 1):
+            index = j * nu + i
+            if not inside[index] or wall_blocked[index]:
+                continue
+            center_u = min_u + (i + 0.5) * cell
+            if not portal_contains_point(portal, center_u, center_v, half_cell * 0.10):
+                continue
+            for segment in nearby:
+                ax, ay, bx, by = segment[0], segment[1], segment[2], segment[3]
+                if point_segment_distance_sq(center_u, center_v, ax, ay, bx, by) > segment[10]:
+                    continue
+                # Closest point on the other wall's location line.
+                vx = bx - ax
+                vy = by - ay
+                vv = vx * vx + vy * vy
+                t = 0.0 if vv < 1.0e-16 else clamp(
+                    ((center_u - ax) * vx + (center_v - ay) * vy) / vv, 0.0, 1.0
+                )
+                qx = ax + t * vx - portal['center_u']
+                qy = ay + t * vy - portal['center_v']
+                q_normal = abs(qx * normal_u + qy * normal_v)
+                q_along = abs(qx * tangent_u + qy * tangent_v)
+                # Ignore only the part of a joined wall that lies inside the
+                # host-wall band AND inside the door opening.
+                if q_normal <= host_half + 1.0e-6 and q_along <= door_half + 1.0e-6:
+                    continue
+                wall_blocked[index] = 1
+                restored += 1
+                break
+    obstacle_stats['door_portal_cells_reblocked'] = (
+        obstacle_stats.get('door_portal_cells_reblocked', 0) + restored
+    )
+    return restored
+
+
 def rasterize_fallback_box(box):
     # Fallback is intentionally conservative because no valid Solid was found.
     u0 = box[0] - clearance
@@ -2420,6 +2508,10 @@ if total_obstacle_items > 0:
             if progress.cancelled:
                 script.exit()
 
+        # FIX: never let one door portal open a neighbouring/joined wall.
+        for door_portal in door_portals:
+            reblock_other_walls_in_portal(door_portal)
+
         # Merge the final wall mask into the global obstacle mask.
         for index in inside_indices:
             if wall_blocked[index]:
@@ -2441,6 +2533,26 @@ if total_obstacle_items > 0:
 
 # Release potentially large transient Solid cache before path calculation.
 cell_prism_cache.clear()
+
+# FIX: a run without any wall obstacle can only produce straight lines through
+# walls. Stop and explain instead of silently creating invalid routes.
+if obstacle_stats['walls'] == 0:
+    continue_without_walls = forms.alert(
+        'No wall was collected inside the selected compartment.\n\n'
+        'Routes would be drawn straight through walls.\n'
+        'Check: linked architectural model is loaded and visible in this view, '
+        'walls overlap {0:.0f} to {1:.0f} mm above the view level '
+        '(ProjectElevation = {2:.0f} mm), and the Filled Region covers the walls.\n\n'
+        'Continue anyway?'.format(
+            ANALYSIS_BOTTOM_MM,
+            ANALYSIS_TOP_MM,
+            ft_to_mm(level_elevation)
+        ),
+        yes=True,
+        no=True
+    )
+    if not continue_without_walls:
+        script.exit()
 
 walkable = bytearray(cell_count)
 walkable_indices = []
@@ -3692,6 +3804,114 @@ def raster_index_is_walkable(index):
     )
 
 
+def uv_segment_is_walkable(point_a, point_b):
+    """Raster test for an arbitrary UV chord (used for off-grid door centres)."""
+    distance = uv_distance(point_a, point_b)
+    sample_step = max(mm_to_ft(25.0), cell * PATH_GUIDE_SAMPLE_STEP_FACTOR)
+    sample_count = max(1, int(math.ceil(distance / sample_step)))
+    previous_i = None
+    previous_j = None
+    for sample_number in range(sample_count + 1):
+        factor = sample_number / float(sample_count)
+        u_value = point_a[0] + (point_b[0] - point_a[0]) * factor
+        v_value = point_a[1] + (point_b[1] - point_a[1]) * factor
+        i = int(math.floor((u_value - min_u) / cell))
+        j = int(math.floor((v_value - min_v) / cell))
+        if i < 0 or i >= nu or j < 0 or j >= nv:
+            return False
+        index = j * nu + i
+        if not walkable[index]:
+            return False
+        if previous_i is not None and i != previous_i and j != previous_j:
+            side_a = previous_j * nu + i
+            side_b = j * nu + previous_i
+            if not walkable[side_a] or not walkable[side_b]:
+                return False
+        previous_i = i
+        previous_j = j
+    return True
+
+
+def uv_to_grid_index(point_uv):
+    i = int(math.floor((point_uv[0] - min_u) / cell))
+    j = int(math.floor((point_uv[1] - min_v) / cell))
+    i = max(0, min(nu - 1, i))
+    j = max(0, min(nv - 1, j))
+    return j * nu + i
+
+
+DOOR_CENTRE_APPROACH_MIN_MM = 550.0
+
+
+def find_route_door_crossings(path_indices):
+    """Return [(path_position, portal, travel_sign)] for every doorway crossed.
+
+    A crossing is a sign change of the signed distance to the door wall plane
+    between two consecutive Dijkstra cells, inside the portal width.
+    """
+    crossings = []
+    if not door_portals or len(path_indices) < 2:
+        return crossings
+    used = set()
+    for position in range(1, len(path_indices)):
+        point_a = grid_index_to_uv(path_indices[position - 1])
+        point_b = grid_index_to_uv(path_indices[position])
+        for portal_number, portal in enumerate(door_portals):
+            if portal_number in used:
+                continue
+            if not (
+                portal_contains_point(portal, point_a[0], point_a[1], half_cell) or
+                portal_contains_point(portal, point_b[0], point_b[1], half_cell)
+            ):
+                continue
+            normal_a = (
+                (point_a[0] - portal['center_u']) * portal['normal_u'] +
+                (point_a[1] - portal['center_v']) * portal['normal_v']
+            )
+            normal_b = (
+                (point_b[0] - portal['center_u']) * portal['normal_u'] +
+                (point_b[1] - portal['center_v']) * portal['normal_v']
+            )
+            if normal_a == 0.0 and normal_b == 0.0:
+                continue
+            if (normal_a < 0.0) == (normal_b < 0.0) and normal_a != 0.0 and normal_b != 0.0:
+                continue
+            denominator = normal_b - normal_a
+            factor = 0.5 if abs(denominator) < 1.0e-12 else clamp(-normal_a / denominator, 0.0, 1.0)
+            cross_u = point_a[0] + (point_b[0] - point_a[0]) * factor
+            cross_v = point_a[1] + (point_b[1] - point_a[1]) * factor
+            along = (
+                (cross_u - portal['center_u']) * portal['tangent_u'] +
+                (cross_v - portal['center_v']) * portal['tangent_v']
+            )
+            if abs(along) > portal['half_width'] + half_cell:
+                continue
+            chosen = position if abs(normal_b) <= abs(normal_a) else position - 1
+            travel_sign = 1.0 if normal_b > normal_a else -1.0
+            used.add(portal_number)
+            crossings.append((chosen, portal, travel_sign))
+            break
+    return crossings
+
+
+def door_centre_control_points(portal, travel_sign):
+    """Approach point, exact door centre and exit point along the door normal."""
+    distance = max(
+        mm_to_ft(DOOR_CENTRE_APPROACH_MIN_MM),
+        portal.get('wall_width', mm_to_ft(200.0)) * 0.5 + clearance + half_cell
+    )
+    centre = (portal['center_u'], portal['center_v'])
+    approach = (
+        centre[0] - portal['normal_u'] * travel_sign * distance,
+        centre[1] - portal['normal_v'] * travel_sign * distance
+    )
+    exit_point = (
+        centre[0] + portal['normal_u'] * travel_sign * distance,
+        centre[1] + portal['normal_v'] * travel_sign * distance
+    )
+    return approach, centre, exit_point
+
+
 def raster_segment_is_walkable(index_a, index_b):
     """Check a straight guide chord against the custom obstacle raster.
 
@@ -4279,6 +4499,17 @@ def prepare_actual_route_control_points(path_indices, source):
         raise Exception('One or more mandatory picked points have no ordered Dijkstra cell on the route.')
     mandatory_positions.extend(point_positions or [])
 
+    # FIX: every doorway crossed by the Dijkstra route becomes a mandatory
+    # split. Its grid cell is later replaced by approach -> exact door centre
+    # -> exit, so the native Path of Travel passes through the door centre
+    # perpendicular to the wall instead of cutting the jamb diagonally.
+    door_crossings = find_route_door_crossings(cleaned)
+    door_by_position = {}
+    for crossing_position, crossing_portal, travel_sign in door_crossings:
+        if 0 < crossing_position < len(cleaned) - 1:
+            door_by_position[crossing_position] = (crossing_portal, travel_sign)
+    mandatory_positions.extend(door_by_position.keys())
+
     mandatory_positions = sorted(set(mandatory_positions))
     point_position_set = set(point_positions or [])
     control_positions, deviation_factor = build_visibility_control_positions(
@@ -4288,52 +4519,94 @@ def prepare_actual_route_control_points(path_indices, source):
 
     if len(control_positions) < 2:
         raise Exception('Waypoint compression removed too many native controls.')
-    if len(control_positions) > PATH_GUIDE_MAX_CONTROLS:
+
+    # Build control list: [uv, role, removable]
+    controls = []
+    for path_position in control_positions:
+        index = cleaned[path_position]
+        grid_uv = grid_index_to_uv(index)
+        if path_position == 0:
+            controls.append([grid_uv, 'start', False])
+        elif path_position == len(cleaned) - 1:
+            controls.append([grid_uv, 'end', False])
+        elif path_position in door_by_position:
+            portal, travel_sign = door_by_position[path_position]
+            approach, centre, exit_point = door_centre_control_points(portal, travel_sign)
+            controls.append([approach, 'door_approach', True])
+            controls.append([centre, 'door_centre', False, grid_uv])
+            controls.append([exit_point, 'door_exit', True])
+        elif path_position in point_position_set:
+            controls.append([grid_uv, 'force_point', False])
+        else:
+            controls.append([grid_uv, 'dijkstra_guide', True])
+
+    minimum_spacing = mm_to_ft(PATH_CONTROL_MIN_SPACING_MM)
+
+    def chord_ok(position_a, position_b):
+        return uv_segment_is_walkable(controls[position_a][0], controls[position_b][0])
+
+    # Repair loop: remove removable controls that are too close or whose
+    # chords leave the raster; if a door centre itself cannot be connected,
+    # fall back to the original (always valid) Dijkstra grid cell.
+    guard = 0
+    changed = True
+    while changed:
+        changed = False
+        guard += 1
+        if guard > 5000:
+            raise Exception('Door-centre control repair did not converge.')
+        for position in range(len(controls) - 1):
+            too_close = uv_distance(controls[position][0], controls[position + 1][0]) < minimum_spacing - 1.0e-9
+            blocked_chord = not chord_ok(position, position + 1)
+            if not too_close and not blocked_chord:
+                continue
+            removed = False
+            # Prefer removing a guide first, then a door approach/exit.
+            for priority in ('dijkstra_guide', 'door_approach', 'door_exit'):
+                for candidate in (position + 1, position):
+                    if candidate <= 0 or candidate >= len(controls) - 1:
+                        continue
+                    if controls[candidate][1] != priority or not controls[candidate][2]:
+                        continue
+                    if uv_distance(controls[candidate - 1][0], controls[candidate + 1][0]) < minimum_spacing - 1.0e-9:
+                        continue
+                    if not uv_segment_is_walkable(controls[candidate - 1][0], controls[candidate + 1][0]):
+                        continue
+                    controls.pop(candidate)
+                    removed = True
+                    break
+                if removed:
+                    break
+            if not removed:
+                # Last resort: move a door centre back to its Dijkstra cell.
+                for candidate in (position, position + 1):
+                    if controls[candidate][1] == 'door_centre' and len(controls[candidate]) > 3:
+                        controls[candidate] = [controls[candidate][3], 'door_cell', False]
+                        removed = True
+                        break
+            if not removed:
+                raise Exception(
+                    'Cannot build raster-safe controls near control {0} ({1:.0f} mm, {2}).'.format(
+                        position + 1,
+                        ft_to_mm(uv_distance(controls[position][0], controls[position + 1][0])),
+                        'blocked chord' if blocked_chord else 'too close'
+                    )
+                )
+            changed = True
+            break
+
+    if len(controls) > PATH_GUIDE_MAX_CONTROLS:
         raise Exception(
             'The route still requires more than {0} controls after visibility '
             'compression.'.format(PATH_GUIDE_MAX_CONTROLS)
         )
 
-    minimum_spacing = mm_to_ft(PATH_CONTROL_MIN_SPACING_MM)
-    points_uv = []
-    roles = []
-    control_indices = []
-    for position_number, path_position in enumerate(control_positions):
-        index = cleaned[path_position]
-        point_uv = grid_index_to_uv(index)
-        if points_uv:
-            spacing = uv_distance(points_uv[-1], point_uv)
-            if spacing < minimum_spacing - 1.0e-9:
-                raise Exception(
-                    'Automatic close-control repair could not resolve positions '
-                    '{0} and {1} ({2:.0f} mm).'.format(
-                        position_number,
-                        position_number + 1,
-                        ft_to_mm(spacing)
-                    )
-                )
+    points_uv = [item[0] for item in controls]
+    roles = [item[1] for item in controls]
+    control_indices = [uv_to_grid_index(item[0]) for item in controls]
 
-        if path_position == 0:
-            role = 'start'
-        elif path_position == len(cleaned) - 1:
-            role = 'end'
-        elif path_position in point_position_set:
-            role = 'force_point'
-        else:
-            role = 'dijkstra_guide'
-
-        points_uv.append(point_uv)
-        roles.append(role)
-        control_indices.append(index)
-
-    for control_number in range(len(control_indices) - 1):
-        if not raster_segment_is_walkable(
-            control_indices[control_number],
-            control_indices[control_number + 1]
-        ):
-            raise Exception(
-                'A compressed native control chord leaves the Dijkstra walkable corridor.'
-            )
+    if source is not None:
+        source['door_centre_count'] = len([role for role in roles if role == 'door_centre'])
 
     initial_turn_positions = build_straight_run_control_positions(
         cleaned,
@@ -6033,6 +6306,11 @@ output.print_md(
         path_graphics_refresh.get('failed')
     )
 )
+output.print_md('- View level ProjectElevation used for analysis band: **{0:.0f} mm**'.format(ft_to_mm(level_elevation)))
+output.print_md('- Door portal cells re-blocked (other walls): **{0}**'.format(obstacle_stats.get('door_portal_cells_reblocked', 0)))
+output.print_md('- Door-centre controls inserted: **{0}**'.format(
+    sum([int(source.get('door_centre_count') or 0) for source in cabinet_sources])
+))
 output.print_md('- Cabinet marker Detail Lines created: **{0}**'.format(len(created_marker_ids)))
 output.print_md('- 35 m checkpoint points created: **{0}**'.format(len(distance_35m_marker_records)))
 output.print_md('- 35 m checkpoint Detail Lines created: **{0}**'.format(len(created_35m_marker_ids)))

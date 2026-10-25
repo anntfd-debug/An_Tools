@@ -1,0 +1,283 @@
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Drainage Schematic Generator"
+        Width="1260" Height="880" MinWidth="1000" MinHeight="660"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="Segoe UI" FontSize="12"
+        Background="#F5F6F8">
+
+    <Window.Resources>
+        <Style x:Key="RowLabel" TargetType="TextBlock">
+            <Setter Property="Width" Value="200"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+            <Setter Property="Foreground" Value="#333"/>
+        </Style>
+        <Style x:Key="Section" TargetType="TextBlock">
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="#1F4E79"/>
+            <Setter Property="Margin" Value="0,10,0,4"/>
+        </Style>
+        <Style TargetType="DockPanel">
+            <Setter Property="Margin" Value="0,2"/>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Height" Value="24"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Padding" Value="3,0"/>
+        </Style>
+        <Style TargetType="ComboBox">
+            <Setter Property="Height" Value="24"/>
+        </Style>
+        <Style TargetType="CheckBox">
+            <Setter Property="Margin" Value="0,3"/>
+        </Style>
+        <Style TargetType="RadioButton">
+            <Setter Property="Margin" Value="0,3,16,3"/>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Height" Value="28"/>
+            <Setter Property="Padding" Value="12,0"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="10">
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="430"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <!-- ================= SETTINGS ================= -->
+        <GroupBox Grid.Column="0" Grid.Row="0" Header="Settings" Margin="0,0,10,0" Background="White">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <StackPanel Margin="8,0,8,8">
+
+                    <TextBlock Style="{StaticResource Section}" Text="Output view"/>
+                    <StackPanel Orientation="Horizontal">
+                        <RadioButton x:Name="rb_new" GroupName="vmode" Content="Create new view"/>
+                        <RadioButton x:Name="rb_over" GroupName="vmode" Content="Overwrite existing view"/>
+                    </StackPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="New view name"/>
+                        <TextBox x:Name="tb_vname"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Existing drafting view"/>
+                        <ComboBox x:Name="cb_view"/>
+                    </DockPanel>
+                    <CheckBox x:Name="ck_clear_all"
+                              Content="Overwrite: clear ALL content in view (else tool items only)"/>
+                    <CheckBox x:Name="ck_group" Content="Group generated items (detail group)"/>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="View scale  1 :"/>
+                        <TextBox x:Name="tb_scale"/>
+                    </DockPanel>
+
+                    <TextBlock Style="{StaticResource Section}" Text="Network &amp; order"/>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Symbol order"/>
+                        <ComboBox x:Name="cb_order"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Network grouping"/>
+                        <ComboBox x:Name="cb_netmode"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Main pipe"/>
+                        <ComboBox x:Name="cb_mainmode"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Horizontal main below level (mm)"/>
+                        <TextBox x:Name="tb_hdrop"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Outlet (start of network)"/>
+                        <ComboBox x:Name="cb_root"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Stack min. vertical span (mm)"/>
+                        <TextBox x:Name="tb_stackmin"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Stack label"/>
+                        <ComboBox x:Name="cb_group"/>
+                    </DockPanel>
+                    <CheckBox x:Name="ck_btag" Content="Show branch tag  B(order) (fixture count)"/>
+                    <CheckBox x:Name="ck_xconn" Content="Mark system change / connection points (vent = riser)"/>
+
+                    <TextBlock Style="{StaticResource Section}" Text="Levels"/>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Level assignment"/>
+                        <ComboBox x:Name="cb_lmethod"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Level tolerance below (mm)"/>
+                        <TextBox x:Name="tb_tol"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Extra levels above top level"/>
+                        <TextBox x:Name="tb_extra"/>
+                    </DockPanel>
+                    <CheckBox x:Name="ck_story" Content="Building Story levels only"/>
+                    <CheckBox x:Name="ck_lowest" Content="Draw levels from lowest project level"/>
+
+                    <TextBlock Style="{StaticResource Section}" Text="Layout (paper mm)"/>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Level spacing"/>
+                        <TextBox x:Name="tb_lsp"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Symbol spacing"/>
+                        <TextBox x:Name="tb_ssp"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Gap between branches"/>
+                        <TextBox x:Name="tb_bgap"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Branch vertical step"/>
+                        <TextBox x:Name="tb_bstep"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Sub-branch tier step"/>
+                        <TextBox x:Name="tb_tstep"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Upstream fixture rise (TD→FWG)"/>
+                        <TextBox x:Name="tb_rise"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="45° chamfer at drops (0 = off)"/>
+                        <TextBox x:Name="tb_chamfer"/>
+                    </DockPanel>
+                    <CheckBox x:Name="ck_chstack" Content="45° join: branch → riser and riser → horizontal main"/>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="45° join size"/>
+                        <TextBox x:Name="tb_jch"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Gap between stacks"/>
+                        <TextBox x:Name="tb_gap"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Symbol offset above level"/>
+                        <TextBox x:Name="tb_soff"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Branch offset below level"/>
+                        <TextBox x:Name="tb_boff"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Label offset above symbol"/>
+                        <TextBox x:Name="tb_loff"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Level text width"/>
+                        <TextBox x:Name="tb_ltw"/>
+                    </DockPanel>
+
+                    <TextBlock Style="{StaticResource Section}" Text="Graphics"/>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Level line style"/>
+                        <ComboBox x:Name="cb_lstyle"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Text type"/>
+                        <ComboBox x:Name="cb_ttype"/>
+                    </DockPanel>
+
+                    <TextBlock Style="{StaticResource Section}" Text="Options"/>
+                    <CheckBox x:Name="ck_combine" Content="Combine consecutive identical items in branch (xN)"/>
+                    <CheckBox x:Name="ck_label" Content="Add label (Type Mark / Type Name)"/>
+                    <CheckBox x:Name="ck_ph" Content="Text placeholder for unmapped families"/>
+                    <CheckBox x:Name="ck_vent" Content="Extend Vent stacks to atmosphere"/>
+                </StackPanel>
+            </ScrollViewer>
+        </GroupBox>
+
+        <!-- ================= SYSTEMS + MAPPING ================= -->
+        <Grid Grid.Column="1" Grid.Row="0">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="150"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+            </Grid.RowDefinitions>
+
+            <DockPanel Grid.Row="0" Margin="0,0,0,4">
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button x:Name="btn_all" Content="All" Margin="4,0,0,0" Width="60"/>
+                    <Button x:Name="btn_none" Content="None" Margin="4,0,0,0" Width="60"/>
+                </StackPanel>
+                <TextBlock VerticalAlignment="Center" TextWrapping="Wrap">
+                    <Run FontWeight="SemiBold" Foreground="#1F4E79" Text="Systems in scope"/>
+                    <Run Foreground="#666" Text="  (physically connected pipework of ticked systems is merged)"/>
+                </TextBlock>
+            </DockPanel>
+
+            <ListBox x:Name="lst_systems" Grid.Row="1" Background="White">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <CheckBox IsChecked="{Binding Checked, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                  Content="{Binding Label}"/>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+
+            <DockPanel Grid.Row="2" Margin="0,10,0,4">
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <TextBlock Text="Filter:" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                    <TextBox x:Name="tb_filter" Width="160"/>
+                    <Button x:Name="btn_auto" Content="Auto-match empty" Margin="6,0,0,0"/>
+                    <Button x:Name="btn_clear" Content="Clear symbol" Margin="4,0,0,0"/>
+                </StackPanel>
+                <TextBlock VerticalAlignment="Center" TextWrapping="Wrap">
+                    <Run FontWeight="SemiBold" Foreground="#1F4E79" Text="Model family  →  Schematic symbol"/>
+                    <Run Foreground="#666" Text="  (saved after each run)"/>
+                </TextBlock>
+            </DockPanel>
+
+            <Border Grid.Row="3" Background="#EAF1F8" BorderBrush="#C9D9EA" BorderThickness="1"
+                    Padding="6,3" Margin="0,0,0,4">
+                <DockPanel>
+                    <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                        <Button x:Name="btn_add" Content="+" Width="34" FontWeight="Bold" FontSize="15"
+                                ToolTip="Add pipe accessories / pipe fittings to draw"/>
+                        <Button x:Name="btn_rem" Content="−" Width="34" FontWeight="Bold" FontSize="15"
+                                Margin="4,0,0,0" ToolTip="Remove selected accessory / fitting rows"/>
+                    </StackPanel>
+                    <CheckBox x:Name="ck_extra" VerticalAlignment="Center"
+                              Content="Pipe accessories / pipe fittings  (draw only the families added with +)"/>
+                </DockPanel>
+            </Border>
+
+            <DataGrid x:Name="grid_map" Grid.Row="4"
+                      AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False"
+                      HeadersVisibility="Column" SelectionMode="Extended" SelectionUnit="FullRow"
+                      GridLinesVisibility="Horizontal" HorizontalGridLinesBrush="#E3E3E3"
+                      AlternatingRowBackground="#FAFBFC" Background="White" RowHeight="24">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Category" Binding="{Binding Category}" IsReadOnly="True" Width="130"/>
+                    <DataGridTextColumn Header="Model Family : Type" Binding="{Binding ModelKey}" IsReadOnly="True" Width="2*"/>
+                    <DataGridTextColumn Header="Qty" Binding="{Binding Qty}" IsReadOnly="True" Width="50"/>
+                    <DataGridComboBoxColumn Header="Schematic Symbol" Width="2*"
+                                            SelectedItemBinding="{Binding Symbol, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                </DataGrid.Columns>
+            </DataGrid>
+        </Grid>
+
+        <!-- ================= FOOTER ================= -->
+        <DockPanel Grid.Row="1" Grid.ColumnSpan="2" Margin="0,10,0,0">
+            <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                <Button x:Name="btn_run" Content="Run" Width="100" IsDefault="True"
+                        Background="#1F4E79" Foreground="White"/>
+                <Button x:Name="btn_cancel" Content="Cancel" Width="100" Margin="8,0,0,0" IsCancel="True"/>
+            </StackPanel>
+            <TextBlock x:Name="txt_status" VerticalAlignment="Center" Foreground="#555"/>
+        </DockPanel>
+    </Grid>
+</Window>

@@ -1,27 +1,42 @@
 # -*- coding: utf-8 -*-
 """
-PIPE ACCESSORIES - EXPORT ALL VALUES OF ONE PARAMETER
-=====================================================
+MEP ELEMENTS - EXPORT ALL VALUES OF ONE PARAMETER
+=================================================
+
+SUPPORTED CATEGORIES
+--------------------
+- Pipes
+- Pipe Accessories
+- Plumbing Fixtures
 
 WORKFLOW
 --------
-1. Có thể preselect một hoặc nhiều Pipe Accessories.
+1. Preselect one or more supported elements:
+       - Pipes
+       - Pipe Accessories
+       - Plumbing Fixtures
+   Mixed selection is supported.
 2. Run tool.
-3. Chọn 1 Parameter.
-4. Tool tự đọc TẤT CẢ các value của Parameter đó.
-5. Xuất:
+3. Select one Instance or Type parameter.
+4. Tool reads ALL values of that parameter in the selected scope.
+5. Output:
        - Parameter Value
        - Element ID
+       - Category
        - Family
        - Type
 
 SCOPE
 -----
-Nếu có Pipe Accessories được preselect:
-    -> chỉ xét các Pipe Accessories đã chọn.
+If there are supported preselected elements:
+    -> only those supported selected elements are processed.
 
-Nếu không preselect:
-    -> xét toàn bộ Pipe Accessories trong Active View.
+If there is no preselection:
+    -> preserve the old behavior:
+       collect all Pipe Accessories in Active View.
+
+If there is a preselection but none of the selected elements is supported:
+    -> show a small warning and exit.
 
 SUPPORT
 -------
@@ -49,39 +64,93 @@ output = script.get_output()
 
 
 # ============================================================
+# CATEGORY DEFINITIONS
+# ============================================================
+
+SUPPORTED_CATEGORIES = (
+    DB.BuiltInCategory.OST_PipeCurves,
+    DB.BuiltInCategory.OST_PipeAccessory,
+    DB.BuiltInCategory.OST_PlumbingFixtures,
+)
+
+CATEGORY_NAMES = {
+    int(DB.BuiltInCategory.OST_PipeCurves): "Pipes",
+    int(DB.BuiltInCategory.OST_PipeAccessory): "Pipe Accessories",
+    int(DB.BuiltInCategory.OST_PlumbingFixtures): "Plumbing Fixtures",
+}
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
 def eid_int(element_id):
-    """ElementId -> integer, compatible with newer Revit versions."""
+    """ElementId -> integer, compatible with Revit 2025 / 2026."""
+    if element_id is None:
+        return -1
+
     try:
-        return element_id.Value
+        return int(element_id.Value)
     except Exception:
         try:
-            return element_id.IntegerValue
+            return int(element_id.IntegerValue)
         except Exception:
             return -1
 
 
-def is_pipe_accessory(element):
-    """Check Pipe Accessory category."""
+def bic_int(bic):
+    """BuiltInCategory -> integer."""
+    try:
+        return int(bic)
+    except Exception:
+        return -1
+
+
+def get_category_bic_int(element):
+    """Return the integer BuiltInCategory id for an element category."""
     if element is None:
-        return False
-
-    cat = element.Category
-
-    if cat is None:
-        return False
+        return None
 
     try:
-        return (
-            cat.Id
-            == DB.ElementId(
-                int(DB.BuiltInCategory.OST_PipeAccessory)
-            )
-        )
+        cat = element.Category
     except Exception:
+        cat = None
+
+    if cat is None:
+        return None
+
+    return eid_int(cat.Id)
+
+
+def is_supported_element(element):
+    """True for Pipes, Pipe Accessories, and Plumbing Fixtures."""
+    cat_id = get_category_bic_int(element)
+
+    if cat_id is None:
         return False
+
+    supported_ids = set(
+        bic_int(bic)
+        for bic in SUPPORTED_CATEGORIES
+    )
+
+    return cat_id in supported_ids
+
+
+def get_category_name(element):
+    """Readable category name."""
+    cat_id = get_category_bic_int(element)
+
+    if cat_id in CATEGORY_NAMES:
+        return CATEGORY_NAMES[cat_id]
+
+    try:
+        if element.Category and element.Category.Name:
+            return element.Category.Name
+    except Exception:
+        pass
+
+    return "<Unknown Category>"
 
 
 def get_type_element(element):
@@ -105,20 +174,40 @@ def get_type_element(element):
 
 
 def get_family_name(element):
-    """Return Family Name."""
+    """
+    Return Family Name.
 
+    For loadable families such as Plumbing Fixtures / Pipe Accessories,
+    this normally returns the actual family name.
+
+    For system family elements such as Pipes, Revit may return a system
+    family/type family label. This is expected.
+    """
     type_elem = get_type_element(element)
 
     if type_elem is None:
         return "<Unknown Family>"
 
     try:
-        return type_elem.FamilyName
+        family_name = type_elem.FamilyName
+
+        if family_name:
+            return family_name
     except Exception:
         pass
 
     try:
-        return type_elem.Family.Name
+        family = type_elem.Family
+
+        if family and family.Name:
+            return family.Name
+    except Exception:
+        pass
+
+    # Useful fallback for system-family types.
+    try:
+        if type_elem.Category and type_elem.Category.Name:
+            return type_elem.Category.Name
     except Exception:
         pass
 
@@ -127,7 +216,6 @@ def get_family_name(element):
 
 def get_type_name(element):
     """Return Type Name."""
-
     type_elem = get_type_element(element)
 
     if type_elem is None:
@@ -138,7 +226,6 @@ def get_type_name(element):
 
         if name:
             return name
-
     except Exception:
         pass
 
@@ -152,7 +239,6 @@ def get_type_name(element):
 
             if name:
                 return name
-
     except Exception:
         pass
 
@@ -160,10 +246,7 @@ def get_type_name(element):
 
 
 def parameter_value_to_text(param):
-    """
-    Convert Revit Parameter to readable text.
-    """
-
+    """Convert Revit Parameter to readable text."""
     if param is None:
         return None
 
@@ -173,13 +256,7 @@ def parameter_value_to_text(param):
     except Exception:
         pass
 
-    # --------------------------------------------------------
-    # Prefer Revit formatted value
-    # e.g.:
-    #   100 mm
-    #   2.00 %
-    # --------------------------------------------------------
-
+    # Prefer Revit-formatted display text first.
     try:
         value_string = param.AsValueString()
 
@@ -188,42 +265,29 @@ def parameter_value_to_text(param):
 
             if value_string:
                 return value_string
-
     except Exception:
         pass
 
-    # --------------------------------------------------------
-    # Storage type fallback
-    # --------------------------------------------------------
-
+    # Storage-type fallback.
     try:
         storage_type = param.StorageType
 
-        # STRING
         if storage_type == DB.StorageType.String:
-
             value = param.AsString()
 
             if value is None:
                 return None
 
             value = str(value).strip()
-
             return value if value else None
 
-        # INTEGER
         elif storage_type == DB.StorageType.Integer:
-
             return str(param.AsInteger())
 
-        # DOUBLE
         elif storage_type == DB.StorageType.Double:
-
             return str(param.AsDouble())
 
-        # ELEMENT ID
         elif storage_type == DB.StorageType.ElementId:
-
             value_id = param.AsElementId()
 
             if value_id is None:
@@ -232,13 +296,11 @@ def parameter_value_to_text(param):
             referenced_element = doc.GetElement(value_id)
 
             if referenced_element is not None:
-
                 try:
                     name = referenced_element.Name
 
                     if name:
                         return name
-
                 except Exception:
                     pass
 
@@ -251,20 +313,10 @@ def parameter_value_to_text(param):
 
 
 def get_parameter(element, parameter_name, source):
-    """
-    Get Instance or Type parameter.
-
-    source:
-        INSTANCE
-        TYPE
-    """
-
+    """Get Instance or Type parameter."""
     if source == "INSTANCE":
-
         target = element
-
     else:
-
         target = get_type_element(element)
 
     if target is None:
@@ -276,63 +328,106 @@ def get_parameter(element, parameter_name, source):
         return None
 
 
+def collect_active_view_pipe_accessories():
+    """
+    Preserve the original no-preselection behavior:
+    collect Pipe Accessories in Active View only.
+    """
+    try:
+        return list(
+            DB.FilteredElementCollector(
+                doc,
+                doc.ActiveView.Id
+            )
+            .OfCategory(
+                DB.BuiltInCategory.OST_PipeAccessory
+            )
+            .WhereElementIsNotElementType()
+            .ToElements()
+        )
+    except Exception:
+        return []
+
+
+def category_count_text(elements):
+    """Return compact category counts for summary."""
+    counts = {}
+
+    for element in elements:
+        name = get_category_name(element)
+        counts[name] = counts.get(name, 0) + 1
+
+    parts = []
+
+    for name in sorted(counts.keys(), key=lambda x: x.lower()):
+        parts.append("{}: {}".format(name, counts[name]))
+
+    return " | ".join(parts)
+
+
 # ============================================================
-# GET PIPE ACCESSORIES
+# GET ELEMENT SCOPE
 # ============================================================
 
 selected_ids = list(
     uidoc.Selection.GetElementIds()
 )
 
-selected_accessories = []
+selected_elements = []
 
 for element_id in selected_ids:
-
     element = doc.GetElement(element_id)
 
-    if is_pipe_accessory(element):
-        selected_accessories.append(element)
+    if element is not None:
+        selected_elements.append(element)
 
 
 # ------------------------------------------------------------
 # PRESELECT MODE
 # ------------------------------------------------------------
 
-if selected_accessories:
+if selected_ids:
+    elements = [
+        element
+        for element in selected_elements
+        if is_supported_element(element)
+    ]
 
-    accessories = selected_accessories
+    if not elements:
+        forms.alert(
+            "Selection hiện tại không có đối tượng được hỗ trợ.\n\n"
+            "Hãy chọn một hoặc nhiều:\n"
+            "- Pipes\n"
+            "- Pipe Accessories\n"
+            "- Plumbing Fixtures",
+            title="Export MEP Parameter"
+        )
+        script.exit()
 
-    scope_name = "Preselected Pipe Accessories"
+    ignored_count = len(selected_elements) - len(elements)
+
+    scope_name = "Preselected supported elements"
+
+    if ignored_count > 0:
+        scope_name += " (ignored {} unsupported)".format(
+            ignored_count
+        )
 
 
 # ------------------------------------------------------------
-# ACTIVE VIEW MODE
+# NO PRESELECTION -> PRESERVE OLD ACTIVE VIEW BEHAVIOR
 # ------------------------------------------------------------
 
 else:
-
-    accessories = list(
-        DB.FilteredElementCollector(
-            doc,
-            doc.ActiveView.Id
-        )
-        .OfCategory(
-            DB.BuiltInCategory.OST_PipeAccessory
-        )
-        .WhereElementIsNotElementType()
-        .ToElements()
-    )
-
-    scope_name = "Active View"
+    elements = collect_active_view_pipe_accessories()
+    scope_name = "Active View - Pipe Accessories"
 
 
-if not accessories:
-
+if not elements:
     forms.alert(
-        "Không tìm thấy Pipe Accessories trong phạm vi hiện tại.",
-        title="Pipe Accessories Parameter"
+        "Không tìm thấy đối tượng trong phạm vi hiện tại.",
+        title="Export MEP Parameter"
     )
-
     script.exit()
 
 
@@ -343,16 +438,13 @@ if not accessories:
 parameter_options = {}
 
 
-for element in accessories:
+for element in elements:
 
-    # ========================================================
+    # --------------------------------------------------------
     # INSTANCE PARAMETERS
-    # ========================================================
-
+    # --------------------------------------------------------
     try:
-
         for param in element.Parameters:
-
             try:
                 parameter_name = param.Definition.Name
             except Exception:
@@ -373,20 +465,16 @@ for element in accessories:
     except Exception:
         pass
 
-
-    # ========================================================
+    # --------------------------------------------------------
     # TYPE PARAMETERS
-    # ========================================================
-
+    # --------------------------------------------------------
     type_element = get_type_element(element)
 
     if type_element is None:
         continue
 
     try:
-
         for param in type_element.Parameters:
-
             try:
                 parameter_name = param.Definition.Name
             except Exception:
@@ -413,12 +501,10 @@ for element in accessories:
 # ============================================================
 
 if not parameter_options:
-
     forms.alert(
-        "Không tìm thấy Parameter trên Pipe Accessories.",
-        title="Pipe Accessories Parameter"
+        "Không tìm thấy Parameter trên các đối tượng đã chọn.",
+        title="Export MEP Parameter"
     )
-
     script.exit()
 
 
@@ -434,10 +520,10 @@ parameter_labels = sorted(
 
 selected_parameter_label = forms.SelectFromList.show(
     parameter_labels,
-    title="Chọn Parameter của Pipe Accessories",
+    title="Chọn Parameter để Export",
     button_name="Xuất tất cả Value",
     multiselect=False,
-    width=500,
+    width=520,
     height=650
 )
 
@@ -450,9 +536,7 @@ parameter_info = parameter_options[
     selected_parameter_label
 ]
 
-
 parameter_source = parameter_info["source"]
-
 parameter_name = parameter_info["name"]
 
 
@@ -461,12 +545,10 @@ parameter_name = parameter_info["name"]
 # ============================================================
 
 value_groups = {}
-
 no_value_elements = []
 
 
-for element in accessories:
-
+for element in elements:
     param = get_parameter(
         element,
         parameter_name,
@@ -475,36 +557,18 @@ for element in accessories:
 
     value_text = parameter_value_to_text(param)
 
-
-    # --------------------------------------------------------
-    # NO VALUE
-    # --------------------------------------------------------
-
     if value_text is None:
-
         no_value_elements.append(element)
-
         continue
-
 
     value_text = value_text.strip()
 
-
     if not value_text:
-
         no_value_elements.append(element)
-
         continue
 
-
-    # --------------------------------------------------------
-    # GROUP BY VALUE
-    # --------------------------------------------------------
-
     if value_text not in value_groups:
-
         value_groups[value_text] = []
-
 
     value_groups[value_text].append(
         element
@@ -516,7 +580,7 @@ for element in accessories:
 # ============================================================
 
 output.set_title(
-    "Pipe Accessories - {}".format(
+    "MEP Parameter - {}".format(
         parameter_name
     )
 )
@@ -527,23 +591,23 @@ output.set_title(
 # ============================================================
 
 output.print_md(
-    "# PIPE ACCESSORIES PARAMETER VALUES"
+    "# MEP PARAMETER VALUES"
 )
-
 
 output.print_md(
     "**Scope:** {}  \n"
     "**Parameter:** {}  \n"
-    "**Pipe Accessories:** **{}**  \n"
+    "**Elements:** **{}**  \n"
+    "**Categories:** {}  \n"
     "**Unique Values:** **{}**"
     .format(
         scope_name,
         selected_parameter_label,
-        len(accessories),
+        len(elements),
+        category_count_text(elements),
         len(value_groups)
     )
 )
-
 
 output.print_md("---")
 
@@ -563,21 +627,21 @@ sorted_values = sorted(
 # ============================================================
 
 table_data = []
-
 row_number = 1
 
 
 for value in sorted_values:
+    grouped_elements = value_groups[value]
 
-    elements = value_groups[value]
-
-    # Stable sorting by ID
-    elements = sorted(
-        elements,
+    grouped_elements = sorted(
+        grouped_elements,
         key=lambda x: eid_int(x.Id)
     )
 
-    for element in elements:
+    for element in grouped_elements:
+        category_name = get_category_name(
+            element
+        )
 
         family_name = get_family_name(
             element
@@ -596,17 +660,16 @@ for value in sorted_values:
                 eid_int(element.Id)
             )
 
-
         table_data.append(
             [
                 row_number,
                 value,
                 id_display,
+                category_name,
                 family_name,
                 type_name
             ]
         )
-
 
         row_number += 1
 
@@ -616,24 +679,22 @@ for value in sorted_values:
 # ============================================================
 
 if table_data:
-
     output.print_table(
         table_data=table_data,
         columns=[
             "#",
             parameter_name,
             "Element ID",
+            "Category",
             "Family",
             "Type"
         ],
         title="All Parameter Values"
     )
 
-
 else:
-
     output.print_md(
-        "Không có Pipe Accessories nào có giá trị cho Parameter này."
+        "Không có đối tượng nào có giá trị cho Parameter này."
     )
 
 
@@ -647,41 +708,58 @@ output.print_md(
     "## Summary by Value"
 )
 
-
 summary_table = []
 
 
 for value in sorted_values:
-
-    elements = value_groups[value]
+    grouped_elements = value_groups[value]
 
     ids = []
+    category_counts = {}
 
-    for element in elements:
-
+    for element in grouped_elements:
         ids.append(
             str(
                 eid_int(element.Id)
             )
         )
 
+        category_name = get_category_name(
+            element
+        )
+
+        category_counts[category_name] = (
+            category_counts.get(category_name, 0) + 1
+        )
+
+    category_summary = " | ".join(
+        "{}: {}".format(
+            name,
+            category_counts[name]
+        )
+        for name in sorted(
+            category_counts.keys(),
+            key=lambda x: x.lower()
+        )
+    )
 
     summary_table.append(
         [
             value,
-            len(elements),
+            len(grouped_elements),
+            category_summary,
             ", ".join(ids)
         ]
     )
 
 
 if summary_table:
-
     output.print_table(
         table_data=summary_table,
         columns=[
             parameter_name,
             "Quantity",
+            "Categories",
             "Element IDs"
         ],
         title="Value Summary"
@@ -693,27 +771,24 @@ if summary_table:
 # ============================================================
 
 if no_value_elements:
-
     output.print_md("---")
 
     output.print_md(
         "## Không có giá trị"
     )
 
-
     no_value_ids = []
 
     for element in no_value_elements:
-
         no_value_ids.append(
-            str(
-                eid_int(element.Id)
+            "{} [{}]".format(
+                eid_int(element.Id),
+                get_category_name(element)
             )
         )
 
-
     output.print_md(
-        "**{} Pipe Accessories** không có giá trị `{}`:"
+        "**{} elements** không có giá trị `{}`:"
         .format(
             len(no_value_elements),
             parameter_name

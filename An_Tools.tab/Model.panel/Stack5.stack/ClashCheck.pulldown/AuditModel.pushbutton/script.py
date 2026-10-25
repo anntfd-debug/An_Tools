@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Pipe / Pipe Accessory / Pipe Fitting vs Linked Model Clash Checker
-Version 2.9 - Active View stability / saved-link safety + region + pipe direction + grouped clash
+Version 3.0 - Fire Rated Door target + Active View stability / saved-link safety + region + pipe direction + grouped clash
 
 HOST OBJECTS (independent checkboxes)
     - Pipes
@@ -15,11 +15,12 @@ LINKED TARGETS (independent checkboxes)
     - Structural Framing (beams / braces)
     - Structural Columns
     - Fire Rated Walls
+    - Fire Rated Doors (Type Name keywords: Fire Rated / 2HR / HR ...)
 
 WORKFLOW
     1. Run tool.
     2. Reuse saved links OR pick Architecture link group
-       (Rooms + Fire Rated Walls).
+       (Rooms + Fire Rated Walls + Fire Rated Doors).
     3. Pick Structure link group
        (Structural Framing + Structural Columns).
     4. UI opens: choose Entire Model / Active View / Pick Region in Active View.
@@ -63,6 +64,18 @@ BBOX_EPS_FT = 1.0 / MM_PER_FOOT      # ~1 mm
 AUTO_FLOOR_MATCH_TOL_FT = 10.0 / MM_PER_FOOT  # ~10 mm
 MAX_WARNINGS = 80
 
+# V3.0 Fire Rated Door: Door Type Name keywords (editable in UI).
+DEFAULT_DOOR_KEYWORDS = u"Fire Rated, 2HR, HR"
+# Type names containing these phrases are NOT treated as fire rated even if a
+# keyword such as "Fire Rated" appears inside them.
+DOOR_NON_RATED_PHRASES = [
+    u"non fire rated",
+    u"not fire rated",
+    u"non rated",
+    u"not rated",
+    u"unrated",
+    u"nfr"
+]
 # Pipe direction classification. A pipe is treated as vertical when its
 # normalized axis is almost parallel to global Z. All other valid pipe axes
 # (level or sloped) are classified as horizontal/sloped.
@@ -408,11 +421,11 @@ def ask_reuse_link_groups(saved_arch, saved_struct):
 
     lines = []
     if saved_arch:
-        lines.append(u"ARCH / ROOM + FIRE WALL:")
+        lines.append(u"ARCH / ROOM + FIRE WALL + FIRE DOOR:")
         for link in saved_arch:
             lines.append(u"  • {0}".format(get_link_label(link)))
     else:
-        lines.append(u"ARCH / ROOM + FIRE WALL: không tìm thấy link đã lưu")
+        lines.append(u"ARCH / ROOM + FIRE WALL + FIRE DOOR: không tìm thấy link đã lưu")
 
     lines.append(u"")
 
@@ -454,7 +467,7 @@ def get_link_groups():
         return saved_arch, saved_struct
 
     arch_links = pick_link_group(
-        u"BƯỚC 1/2 - Chọn Link chứa ROOM + FIRE RATED WALL. "
+        u"BƯỚC 1/2 - Chọn Link chứa ROOM + FIRE RATED WALL + FIRE RATED DOOR. "
         u"Có thể chọn nhiều Link, sau đó bấm Finish."
     )
 
@@ -483,7 +496,7 @@ def get_link_groups():
 
 # UI is stored separately in ui.xaml inside this pushbutton bundle.
 UI_XAML_PATH = script.get_bundle_file("ui.xaml")
-EXPECTED_UI_VERSION = u"2.8"
+EXPECTED_UI_VERSION = u"3.0"
 
 
 def validate_ui_bundle(window):
@@ -498,6 +511,8 @@ def validate_ui_bundle(window):
         "cb_zoom_linked_after_clash",
         "cb_pipe_vertical",
         "cb_pipe_horizontal",
+        "cb_firedoor",
+        "tb_door_keywords",
         "btn_run",
     ]
     missing = []
@@ -523,7 +538,7 @@ def validate_ui_bundle(window):
         script.exit()
 
     try:
-        window.tb_ui_version.Text = u"UI V{0} - Inspection Mode ready".format(EXPECTED_UI_VERSION)
+        window.tb_ui_version.Text = u"UI V{0} - Fire Rated Door ready".format(EXPECTED_UI_VERSION)
     except Exception:
         pass
 
@@ -561,7 +576,8 @@ class OptionsWindow(forms.WPFWindow):
         self.cb_beam.IsChecked = as_bool(getattr(config, "target_beam", True), True)
         self.cb_column.IsChecked = as_bool(getattr(config, "target_column", True), True)
         self.cb_firewall.IsChecked = as_bool(getattr(config, "target_firewall", True), True)
-
+        self.cb_firedoor.IsChecked = as_bool(getattr(config, "target_firedoor", True), True)
+        self.tb_door_keywords.Text = to_text(getattr(config, "door_keywords", DEFAULT_DOOR_KEYWORDS))
         self.tb_keywords.Text = to_text(getattr(config, "room_keywords", u"Toilet, WC"))
 
         self.cb_extend_room.IsChecked = as_bool(getattr(config, "extend_room", False), False)
@@ -639,7 +655,8 @@ class OptionsWindow(forms.WPFWindow):
             self.cb_room.IsChecked and
             self.cb_beam.IsChecked and
             self.cb_column.IsChecked and
-            self.cb_firewall.IsChecked
+            self.cb_firewall.IsChecked and
+            self.cb_firedoor.IsChecked
         )
 
     def host_all_changed(self, sender, args):
@@ -656,7 +673,7 @@ class OptionsWindow(forms.WPFWindow):
         self.cb_beam.IsChecked = state
         self.cb_column.IsChecked = state
         self.cb_firewall.IsChecked = state
-
+        self.cb_firedoor.IsChecked = state
     def inspection_mode_changed(self, sender, args):
         self._sync_inspect_ui()
 
@@ -684,9 +701,9 @@ class OptionsWindow(forms.WPFWindow):
         target_beam = bool(self.cb_beam.IsChecked)
         target_column = bool(self.cb_column.IsChecked)
         target_firewall = bool(self.cb_firewall.IsChecked)
-
+        target_firedoor = bool(self.cb_firedoor.IsChecked)
         raw_keywords = to_text(self.tb_keywords.Text).strip()
-
+        raw_door_keywords = to_text(self.tb_door_keywords.Text).strip()
         pipe_direction_required = (
             ((not inspection_mode) and host_pipe) or
             (inspection_mode and inspection_category == u"pipe")
@@ -702,19 +719,24 @@ class OptionsWindow(forms.WPFWindow):
             if inspection_category == u"room" and not raw_keywords:
                 forms.alert(u"Inspect Room cần Room Name keyword.", title="Linked Clash Checker")
                 return
+            if inspection_category == u"firedoor" and not raw_door_keywords:
+                forms.alert(u"Inspect Fire Rated Door cần Door Type Name keyword.", title="Linked Clash Checker")
+                return
         else:
             if not (host_pipe or host_accessory or host_fitting):
                 forms.alert(u"Hãy chọn ít nhất 1 nhóm đối tượng MEP trong Host.", title="Linked Clash Checker")
                 return
 
-            if not (target_room or target_beam or target_column or target_firewall):
+            if not (target_room or target_beam or target_column or target_firewall or target_firedoor):
                 forms.alert(u"Hãy chọn ít nhất 1 nhóm đối tượng trong Link.", title="Linked Clash Checker")
                 return
 
             if target_room and not raw_keywords:
                 forms.alert(u"Đang bật Room Name nhưng chưa nhập keyword Room.", title="Linked Clash Checker")
                 return
-
+            if target_firedoor and not raw_door_keywords:
+                forms.alert(u"Đang bật Fire Rated Door nhưng chưa nhập Door Type Name keyword.", title="Linked Clash Checker")
+                return
         offset_mm = safe_float(self.tb_offset_mm.Text, -1.0)
         if (not inspection_mode) and bool(self.cb_extend_room.IsChecked) and offset_mm < 0:
             forms.alert(u"Offset Room phải >= 0 mm.", title="Linked Clash Checker")
@@ -735,6 +757,8 @@ class OptionsWindow(forms.WPFWindow):
             "target_beam": target_beam,
             "target_column": target_column,
             "target_firewall": target_firewall,
+            "target_firedoor": target_firedoor,
+            "door_keywords": raw_door_keywords,
             "room_keywords": raw_keywords,
             "extend_room": bool(self.cb_extend_room.IsChecked),
             "room_ext_mode": u"auto" if bool(self.rb_auto.IsChecked) else u"manual",
@@ -756,6 +780,8 @@ class OptionsWindow(forms.WPFWindow):
         config.target_beam = target_beam
         config.target_column = target_column
         config.target_firewall = target_firewall
+        config.target_firedoor = target_firedoor
+        config.door_keywords = raw_door_keywords
         config.room_keywords = raw_keywords
         config.extend_room = bool(self.cb_extend_room.IsChecked)
         config.room_ext_mode = self.result["room_ext_mode"]
@@ -938,6 +964,76 @@ def get_fire_rating_text(wall, link_doc):
         return txt
 
     return u""
+
+
+# ============================================================
+# FIRE RATED DOOR - V3.0 (match on Door TYPE NAME)
+# ============================================================
+
+def door_keyword_pattern(keyword_norm):
+    """Whole-token style regex so 'HR' matches '2HR' / 'HR' / '2 HR'
+    but NOT words like 'THREE' or 'CHROME'. Optional plural 's' allowed."""
+    if not keyword_norm:
+        return None
+    if keyword_norm[0].isdigit():
+        left = u"(?<![0-9a-z])"
+    else:
+        left = u"(?<![a-z])"
+    try:
+        return re.compile(left + re.escape(keyword_norm) + u"s?(?![a-z])")
+    except Exception:
+        return None
+
+
+def build_door_matchers(raw_text):
+    result = []
+    for item in parse_keywords(raw_text):
+        pattern = door_keyword_pattern(item["normalized"])
+        if pattern is not None:
+            result.append((item["raw"], pattern))
+    return result
+
+
+def door_type_fire_match(type_name, door_matchers):
+    """Return matched keyword (raw) or None."""
+    norm = normalize_text(type_name)
+    if not norm:
+        return None
+    for phrase in DOOR_NON_RATED_PHRASES:
+        if re.search(u"(?<![a-z])" + re.escape(phrase) + u"(?![a-z])", norm):
+            return None
+    for raw, pattern in door_matchers:
+        if pattern.search(norm):
+            return raw
+    return None
+
+
+def get_family_name(element, element_doc):
+    try:
+        type_elem = element_doc.GetElement(element.GetTypeId())
+        if type_elem is not None:
+            try:
+                return to_text(type_elem.FamilyName)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return u""
+
+
+def get_fire_door_info(door, link_doc, door_matchers):
+    """Return (is_fire_door, label, extra)."""
+    type_name = get_element_type_name(door, link_doc)
+    keyword = door_type_fire_match(type_name, door_matchers)
+    if keyword is None:
+        return False, u"", u""
+    family_name = get_family_name(door, link_doc)
+    if family_name:
+        label = u"Door {0} : {1}".format(family_name, type_name)
+    else:
+        label = u"Door {0}".format(type_name or element_id_text(door))
+    extra = u"Fire Door keyword: {0}".format(keyword)
+    return True, label, extra
 
 
 # ============================================================
@@ -1656,7 +1752,9 @@ def build_target_records(arch_links, struct_links, settings, warnings):
     records = []
     keywords = parse_keywords(settings["room_keywords"]) if settings["target_room"] else []
 
-    # ARCHITECTURE LINKS: Rooms + Fire Rated Walls
+    door_matchers = build_door_matchers(settings.get("door_keywords", u"")) if settings.get("target_firedoor") else []
+
+    # ARCHITECTURE LINKS: Rooms + Fire Rated Walls + Fire Rated Doors
     for link in arch_links:
         link_doc = link.GetLinkDocument()
         if link_doc is None:
@@ -1737,6 +1835,30 @@ def build_target_records(arch_links, struct_links, settings, warnings):
                     "extra": u"Fire Rating: {0}".format(rating)
                 })
 
+        if settings.get("target_firedoor") and door_matchers:
+            doors = collect_link_category(
+                link,
+                DB.BuiltInCategory.OST_Doors,
+                settings,
+                warnings,
+                u"Door"
+            )
+
+            for door in doors:
+                is_fire, label, extra = get_fire_door_info(door, link_doc, door_matchers)
+                if not is_fire:
+                    continue
+
+                records.append({
+                    "kind": u"Fire Rated Door",
+                    "link": link,
+                    "link_doc": link_doc,
+                    "transform": transform,
+                    "element": door,
+                    "key": make_target_key(link, door),
+                    "label": label,
+                    "extra": extra
+                })
     # STRUCTURE LINKS: Framing + Columns
     for link in struct_links:
         link_doc = link.GetLinkDocument()
@@ -1956,7 +2078,8 @@ INSPECT_LABELS = {
     u"room": u"Room",
     u"beam": u"Structural Framing",
     u"column": u"Structural Column",
-    u"firewall": u"Fire Rated Wall"
+    u"firewall": u"Fire Rated Wall",
+    u"firedoor": u"Fire Rated Door"
 }
 
 
@@ -2005,7 +2128,9 @@ def inspect_host_category(category_key, settings, warnings):
 def inspect_linked_category(category_key, arch_links, struct_links, settings, warnings):
     records = []
 
-    if category_key in (u"room", u"firewall"):
+    door_matchers = []
+
+    if category_key in (u"room", u"firewall", u"firedoor"):
         links = arch_links
     else:
         links = struct_links
@@ -2018,6 +2143,11 @@ def inspect_linked_category(category_key, arch_links, struct_links, settings, wa
         bic = DB.BuiltInCategory.OST_Walls
         keywords = []
         kind = u"Fire Rated Wall"
+    elif category_key == u"firedoor":
+        bic = DB.BuiltInCategory.OST_Doors
+        keywords = []
+        door_matchers = build_door_matchers(settings.get("door_keywords", u""))
+        kind = u"Fire Rated Door"
     elif category_key == u"beam":
         bic = DB.BuiltInCategory.OST_StructuralFraming
         keywords = []
@@ -2059,7 +2189,10 @@ def inspect_linked_category(category_key, arch_links, struct_links, settings, wa
                 type_name = get_element_type_name(elem, link_doc)
                 label = u"Wall {0}".format(type_name or element_id_text(elem))
                 extra = u"Fire Rating: {0}".format(rating)
-
+            elif category_key == u"firedoor":
+                is_fire, label, extra = get_fire_door_info(elem, link_doc, door_matchers)
+                if not is_fire:
+                    continue
             else:
                 type_name = get_element_type_name(elem, link_doc)
                 label = u"{0} {1}".format(kind, type_name or element_id_text(elem))
@@ -2294,7 +2427,7 @@ def select_linked_records(records, warnings):
 
 def print_inspect_results(settings, category_key, records, warnings):
     label = INSPECT_LABELS.get(category_key, category_key)
-    output.print_md(u"# INSPECTION MODE - LINKED CLASH CHECKER V2.9")
+    output.print_md(u"# INSPECTION MODE - LINKED CLASH CHECKER V3.0")
     print(u"Scope: {0}".format(scope_label(settings)))
     if is_region_scope(settings) and category_key in (u"pipe", u"accessory", u"fitting"):
         print(u"Host MEP trong vùng đã chọn: {0}".format(settings.get("_region_host_count", 0)))
@@ -2398,7 +2531,8 @@ CLASH_HEADER_ORDER = [
     u"Room",
     u"Structural Framing",
     u"Structural Column",
-    u"Fire Rated Wall"
+    u"Fire Rated Wall",
+    u"Fire Rated Door"
 ]
 
 
@@ -2412,6 +2546,8 @@ def enabled_clash_headers(settings):
         values.append(u"Structural Column")
     if settings.get("target_firewall"):
         values.append(u"Fire Rated Wall")
+    if settings.get("target_firedoor"):
+        values.append(u"Fire Rated Door")
     return values
 
 
@@ -2465,11 +2601,13 @@ def selected_target_labels(settings):
         values.append(u"Structural Column")
     if settings["target_firewall"]:
         values.append(u"Fire Rated Wall")
+    if settings.get("target_firedoor"):
+        values.append(u"Fire Rated Door")
     return values
 
 
 def print_results(arch_links, struct_links, settings, clash_results, target_stats, room_ext_stats, warnings):
-    output.print_md(u"# LINKED CLASH CHECKER V2.9")
+    output.print_md(u"# LINKED CLASH CHECKER V3.0")
 
     output.print_md(u"## Thiết lập")
     print(u"Scope: {0}".format(scope_label(settings)))
@@ -2487,6 +2625,9 @@ def print_results(arch_links, struct_links, settings, clash_results, target_stat
     ))
     if settings.get("_linked_zoom_count") is not None:
         print(u"Linked target đã Select / Zoom: {0}".format(settings.get("_linked_zoom_count", 0)))
+
+    if settings.get("target_firedoor"):
+        print(u"Fire Door Type Name keywords: {0}".format(settings.get("door_keywords", u"")))
 
     if settings["target_room"]:
         print(u"Room keywords: {0}".format(settings["room_keywords"]))
@@ -2625,7 +2766,7 @@ def main():
             for warning in link_safety_warnings:
                 print(u"[SAFE MODE] {0}".format(warning))
 
-        if category_key in (u"room", u"firewall") and not arch_links:
+        if category_key in (u"room", u"firewall", u"firedoor") and not arch_links:
             forms.alert(
                 u"Inspect {0} không có Architecture Link hợp lệ trong scope hiện tại.\n\n"
                 u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "
@@ -2660,7 +2801,7 @@ def main():
         for warning in link_safety_warnings:
             print(u"[SAFE MODE] {0}".format(warning))
 
-    if (settings["target_room"] or settings["target_firewall"]) and not arch_links:
+    if (settings["target_room"] or settings["target_firewall"] or settings.get("target_firedoor")) and not arch_links:
         forms.alert(
             u"Không có Architecture Link hợp lệ trong scope hiện tại.\n\n"
             u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "

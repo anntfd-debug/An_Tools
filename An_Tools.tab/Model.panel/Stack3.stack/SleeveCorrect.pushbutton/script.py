@@ -290,6 +290,52 @@ def bbox_xyz(element, point, tolerance):
         return True
 
 
+def sleeve_axis(family_instance, sleeve_data):
+    try:
+        axis = norm(family_instance.GetTransform().BasisZ)
+        if axis:
+            return axis
+    except Exception:
+        pass
+    dimensions = [
+        (sleeve_data['xmax'] - sleeve_data['xmin'], XYZ.BasisX),
+        (sleeve_data['ymax'] - sleeve_data['ymin'], XYZ.BasisY),
+        (sleeve_data['zmax'] - sleeve_data['zmin'], XYZ.BasisZ)
+    ]
+    dimensions.sort(key=lambda item: item[0], reverse=True)
+    return dimensions[0][1]
+
+
+def is_vertical_axis(axis):
+    try:
+        return abs(axis.DotProduct(XYZ.BasisZ)) >= 0.8660254
+    except Exception:
+        return True
+
+
+def host_priority(host, vertical_sleeve):
+    """Vertical: Beam > Floor > Wall. Horizontal: Beam > Wall > Floor."""
+    category_id = catid(host)
+    floor_id = int(BuiltInCategory.OST_Floors)
+    wall_id = int(BuiltInCategory.OST_Walls)
+    beam_id = int(BuiltInCategory.OST_StructuralFraming)
+    if vertical_sleeve:
+        if category_id == beam_id:
+            return 0
+        if category_id == floor_id:
+            return 1
+        if category_id == wall_id:
+            return 2
+    else:
+        if category_id == beam_id:
+            return 0
+        if category_id == wall_id:
+            return 1
+        if category_id == floor_id:
+            return 2
+    return 9
+
+
 def axes(element):
     category_id = catid(element)
     result = []
@@ -374,15 +420,30 @@ def ray_segments(solid, transform, point, axis, half_length):
 
 
 def floor_type_thickness(floor):
+    """Return authoritative total floor type thickness."""
+    values = []
     try:
         floor_type = floor.Document.GetElement(floor.GetTypeId())
-        parameter = floor_type.get_Parameter(BuiltInParameter.FLOOR_ATTR_THICKNESS_PARAM)
-        value = parameter.AsDouble()
-        if MIN_T <= value <= MAX_T:
-            return value
     except Exception:
-        pass
-    return None
+        floor_type = None
+    if floor_type:
+        try:
+            parameter = floor_type.get_Parameter(BuiltInParameter.FLOOR_ATTR_THICKNESS_PARAM)
+            if parameter and parameter.HasValue:
+                value = parameter.AsDouble()
+                if MIN_T <= value <= MAX_T:
+                    values.append(value)
+        except Exception:
+            pass
+        try:
+            compound = floor_type.GetCompoundStructure()
+            if compound:
+                value = compound.GetWidth()
+                if MIN_T <= value <= MAX_T:
+                    values.append(value)
+        except Exception:
+            pass
+    return max(values) if values else None
 
 
 def level_of_host(host):
@@ -504,12 +565,13 @@ def source_footprint(sleeve_data, inverse):
     )
 
 
-def best_hit(cache_item, sleeve_data):
+def best_hit(cache_item, sleeve_data, current_sleeve_axis):
     host = cache_item['host']
     source_transform = cache_item['transform']
     try:
         inverse = source_transform.Inverse
         point = inverse.OfPoint(sleeve_data['center'])
+        source_sleeve_axis = norm(inverse.OfVector(current_sleeve_axis))
         sxmin, sxmax, symin, symax = source_footprint(sleeve_data, inverse)
     except Exception:
         return None
@@ -522,8 +584,9 @@ def best_hit(cache_item, sleeve_data):
         return None
 
     best = None
+    test_axes = axes(host) if is_floor else [source_sleeve_axis]
     for solid, solid_transform in cache_item['solids']:
-        for axis in axes(host):
+        for axis in test_axes:
             probes = (floor_probe_points(point, sxmin, sxmax, symin, symax)
                       if is_floor else general_probe_points(point, axis))
             for probe, probe_distance in probes:
@@ -590,6 +653,11 @@ def best_hit(cache_item, sleeve_data):
     if not best:
         return None
 
+    if is_floor:
+        total_floor_thickness = floor_type_thickness(host)
+        if total_floor_thickness is not None:
+            best['thickness'] = total_floor_thickness
+
     offset, method = host_offset_at_location(
         host, best['source_center'], best['thickness']
     )
@@ -623,16 +691,16 @@ def find_host(family_instance, host_cache):
     sleeve_data = sleeve_solid_data(family_instance)
     if not sleeve_data:
         return None, 'Sleeve has no valid physical Solid'
-
+    axis = sleeve_axis(family_instance, sleeve_data)
+    vertical = is_vertical_axis(axis)
     best = None
     for cache_item in host_cache:
-        hit = best_hit(cache_item, sleeve_data)
+        hit = best_hit(cache_item, sleeve_data, axis)
         if not hit:
             continue
-        rank = hit['rank']
+        rank = (host_priority(cache_item['host'], vertical),) + hit['rank']
         if best is None or rank < best[0]:
             best = (rank, cache_item, hit)
-
     if not best:
         return None, 'No intersecting host'
     return freeze_match(best[1], best[2]), 'OK'
