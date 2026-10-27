@@ -6289,6 +6289,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self.setup_data()
         self.load_last_choices()
         self._prefer_unique_preselected_system()
+        # Selection filter: Min/Max chỉ chứa size của selection thuộc System đang chọn.
+        self._refresh_pipe_size_combos(log_change=True)
         self._update_preselection_status()
 
     def _apply_default_window_size(self):
@@ -7026,33 +7028,139 @@ class ReplaceElementsWindow(forms.WPFWindow):
 
 
     def _prefer_unique_preselected_system(self):
-        """If the preselection has exactly one System Type, select it automatically."""
-        system_values = set()
-        for value in self.preselected_element_ids:
-            try:
-                elem = doc.GetElement(make_element_id(value))
-                if is_pipe_fitting(elem):
-                    for sid_value in fitting_connected_system_values(elem):
-                        if sid_value is not None:
-                            system_values.add(sid_value)
-                else:
-                    sid = get_system_type_id(elem)
-                    sid_value = self.id_value(sid)
-                    if sid_value is not None and sid != DB.ElementId.InvalidElementId:
-                        system_values.add(sid_value)
-            except Exception:
-                pass
-        if len(system_values) == 1:
-            wanted = list(system_values)[0]
-            if self._select_combo_by_id(self.cmb_Systems, wanted):
+        """Selection filter: dùng index System/Size đã dựng từ preselection (không quét lại model)."""
+        values = [v for v in (getattr(self, '_selection_index', {}) or {}).keys() if v is not None]
+        if len(values) == 1:
+            if self._select_combo_by_id(self.cmb_Systems, values[0]):
                 try:
                     self.log(u"Tự chọn System Type theo preselection: {}".format(
                         self.cmb_Systems.SelectedItem.Name))
                 except Exception:
                     pass
-        elif len(system_values) > 1:
-            self.log(u"Preselection có {} System Type; hãy kiểm tra combo System Type trước khi chạy.".format(
-                len(system_values)))
+        elif len(values) > 1:
+            self.log(u"Preselection có {} System Type; combo chỉ liệt kê các System này.".format(len(values)))
+
+    # ============================================================
+    # Selection filter - System Type + Pipe Size chỉ lấy từ preselection
+    # ============================================================
+    def _new_size_bucket(self):
+        return {'pipes': 0, 'fittings': 0, 'sizes': {}}
+
+    def _bucket_add_size(self, bucket, size_ft, is_pipe_elem):
+        try:
+            value = float(size_ft)
+        except Exception:
+            return
+        if value <= 0.0:
+            return
+        key = round(value * 304.8, 3)  # mm, loại nhiễu float
+        rec = bucket['sizes'].get(key)
+        if rec is None:
+            rec = [value, 0, 0]
+            bucket['sizes'][key] = rec
+        if is_pipe_elem:
+            rec[1] += 1
+        else:
+            rec[2] += 1
+
+    def _build_selection_index(self, pipes, fittings):
+        """Dựng index 1 lần: System Type -> số Pipe/Fitting + các size có trong selection.
+
+        Fitting thuộc mọi System Type của Pipe nối trực tiếp với nó (giống
+        fitting_touches_system_type() lúc Run), nên fitting ranh giới hiện ở cả hai System.
+        """
+        index = {}
+        all_bucket = self._new_size_bucket()
+        for p in list(pipes or []):
+            try:
+                sid = get_system_type_id(p)
+                sval = element_id_value(sid) if is_valid_element_id(sid) else None
+                size = get_pipe_diameter_ft(p)
+                bucket = index.setdefault(sval, self._new_size_bucket())
+                bucket['pipes'] += 1
+                all_bucket['pipes'] += 1
+                if size is not None:
+                    self._bucket_add_size(bucket, size, True)
+                    self._bucket_add_size(all_bucket, size, True)
+            except Exception:
+                pass
+        for f in list(fittings or []):
+            try:
+                svals = set([v for v in fitting_connected_system_values(f) if v is not None])
+                try:
+                    sid = get_system_type_id(f)
+                    if is_valid_element_id(sid):
+                        svals.add(element_id_value(sid))
+                except Exception:
+                    pass
+                if not svals:
+                    svals = set([None])
+                port_sizes = []
+                for d in fitting_port_diameters_ft(f):
+                    if not any(abs(float(d) - float(x)) <= 1.0e-6 for x in port_sizes):
+                        port_sizes.append(float(d))
+                for sval in svals:
+                    bucket = index.setdefault(sval, self._new_size_bucket())
+                    bucket['fittings'] += 1
+                    for d in port_sizes:
+                        self._bucket_add_size(bucket, d, False)
+                all_bucket['fittings'] += 1
+                for d in port_sizes:
+                    self._bucket_add_size(all_bucket, d, False)
+            except Exception:
+                pass
+        self._selection_index = index
+        self._selection_all_bucket = all_bucket
+        return index
+
+    def _current_size_bucket(self):
+        index = getattr(self, '_selection_index', {}) or {}
+        try:
+            item = self.cmb_Systems.SelectedItem
+            sval = element_id_value(item.Value) if item is not None else None
+        except Exception:
+            sval = None
+        if sval is not None and sval in index:
+            return index[sval]
+        return getattr(self, '_selection_all_bucket', None) or self._new_size_bucket()
+
+    def _refresh_pipe_size_combos(self, log_change=False):
+        """Nạp lại Min/Max chỉ với size của Pipe/Fitting đã chọn thuộc System đang chọn.
+
+        Mặc định Min = size nhỏ nhất, Max = size lớn nhất => full range của selection.
+        """
+        bucket = self._current_size_bucket()
+        rows = sorted(bucket['sizes'].values(), key=lambda r: float(r[0]))
+        self._updating_size_range = True
+        try:
+            self.cmb_MinPipeSize.Items.Clear()
+            self.cmb_MaxPipeSize.Items.Clear()
+            self.pipe_size_items = []
+            for size_ft, pipe_count, fitting_count in rows:
+                label = u"{}   ({} Pipe, {} Fitting)".format(
+                    format_pipe_size(size_ft), int(pipe_count), int(fitting_count))
+                item = CmbItem(label, float(size_ft))
+                self.pipe_size_items.append(item)
+                self.cmb_MinPipeSize.Items.Add(item)
+                self.cmb_MaxPipeSize.Items.Add(item)
+            self.cmb_MinPipeSize.DisplayMemberPath = "Name"
+            self.cmb_MaxPipeSize.DisplayMemberPath = "Name"
+            if self.cmb_MinPipeSize.Items.Count > 0:
+                self.cmb_MinPipeSize.SelectedIndex = 0
+                self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MaxPipeSize.Items.Count - 1
+        except Exception as ex:
+            self.log(u"Không thể nạp Pipe Size theo selection: {}".format(safe_text(ex)))
+        finally:
+            self._updating_size_range = False
+        self._update_pipe_size_range_status()
+        if log_change:
+            try:
+                sys_name = self.cmb_Systems.SelectedItem.Name if self.cmb_Systems.SelectedItem else u"?"
+            except Exception:
+                sys_name = u"?"
+            self.log(u"Selection filter: System '{}' có {} size ({}).".format(
+                sys_name, len(rows),
+                u", ".join([format_pipe_size(r[0]) for r in rows]) if rows else u"không có"))
 
     def _update_preselection_status(self):
         try:
@@ -7131,7 +7239,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         try:
             min_size, max_size = self._current_pipe_size_range()
             if min_size is None or max_size is None:
-                self.txt_PipeSizeRangeStatus.Text = u"Model chưa có Pipe size hợp lệ để tạo range."
+                self.txt_PipeSizeRangeStatus.Text = u"Selection không có Pipe/Fitting size hợp lệ thuộc System Type đang chọn."
                 self.txt_PipeSizeRangeStatus.Foreground = System.Windows.Media.Brushes.DarkRed
                 return
             if min_size > max_size:
@@ -7141,7 +7249,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
             self.txt_PipeSizeRangeStatus.Text = (
                 u"Sẽ xử lý Pipe từ {} đến {} (bao gồm hai đầu range). "
                 u"Fitting chỉ được xử lý khi TẤT CẢ port size của fitting đều nằm trong range. "
-                u"Danh sách size được lấy từ Pipe đang tồn tại trong model."
+                u"Danh sách size chỉ lấy từ Pipe/Fitting ĐÃ CHỌN thuộc System Type đang chọn."
                 .format(format_pipe_size(min_size), format_pipe_size(max_size)))
             self.txt_PipeSizeRangeStatus.Foreground = System.Windows.Media.Brushes.DarkGreen
         except Exception:
@@ -7277,6 +7385,7 @@ class ReplaceElementsWindow(forms.WPFWindow):
         if getattr(self, '_loading_choices', True):
             return
         try:
+            self._refresh_pipe_size_combos(log_change=True)
             self._refresh_manual_size_mapping_controls()
             self._update_size_compat_summary()
         except Exception as ex:
@@ -7324,16 +7433,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
             except Exception:
                 pass
 
-            # Restore Min/Max only when those exact sizes still exist in model.
-            try:
-                saved_min = self._config_get(config, 'min_pipe_size_ft', None)
-                saved_max = self._config_get(config, 'max_pipe_size_ft', None)
-                if saved_min is not None:
-                    self._select_combo_by_float_value(self.cmb_MinPipeSize, saved_min)
-                if saved_max is not None:
-                    self._select_combo_by_float_value(self.cmb_MaxPipeSize, saved_max)
-            except Exception:
-                pass
+            # Selection filter: KHÔNG khôi phục Min/Max cũ. Danh sách size giờ theo
+            # selection hiện tại; mặc định luôn là full range của selection.
 
             saved_mode = safe_text(self._config_get(config, 'fitting_selection_mode', u'auto')).lower()
             saved_size_mode = safe_text(self._config_get(config, 'size_compatibility_mode', u'strict')).lower()
@@ -7426,7 +7527,8 @@ class ReplaceElementsWindow(forms.WPFWindow):
                 pass
 
         try:
-            _pipes, fittings = collect_pipes_and_fittings()
+            _pipes, fittings = collect_pipes_and_fittings(
+                True, getattr(self, 'preselected_element_ids', []) or [])
         except Exception:
             fittings = []
 
@@ -7545,78 +7647,57 @@ class ReplaceElementsWindow(forms.WPFWindow):
         self.log(u"V5.8.8 SYSTEM TYPE LOCK: luôn bật; Pipe System Type được snapshot/verify ở cấp phần tử và trước commit toàn batch.")
         if REVIT_VERSION and REVIT_VERSION not in SUPPORTED_REVIT_VERSIONS:
             self.log(u"CẢNH BÁO: Revit {} chưa nằm trong phạm vi kiểm thử V5.8.8 (2025/2026); tool sẽ chạy ở compatibility mode.".format(REVIT_VERSION))
-        pipes, fittings = collect_pipes_and_fittings()
-
-        # V5.8: build Min/Max dropdowns from actual Pipe diameters present
-        # anywhere in the current model. No arbitrary standard-size list is used.
-        model_pipe_sizes = collect_model_pipe_sizes(pipes)
-        for size_ft in model_pipe_sizes:
-            item = CmbItem(format_pipe_size(size_ft), float(size_ft))
-            self.pipe_size_items.append(item)
-            self.cmb_MinPipeSize.Items.Add(item)
-            self.cmb_MaxPipeSize.Items.Add(item)
-        self.cmb_MinPipeSize.DisplayMemberPath = "Name"
-        self.cmb_MaxPipeSize.DisplayMemberPath = "Name"
-        if self.cmb_MinPipeSize.Items.Count > 0:
-            self.cmb_MinPipeSize.SelectedIndex = 0
-            self.cmb_MaxPipeSize.SelectedIndex = self.cmb_MaxPipeSize.Items.Count - 1
-        self._update_pipe_size_range_status()
-        self.log(u"V5.8.8 Size Range: đọc được {} kích thước Pipe đang có trong model ({} -> {}).".format(
-            len(model_pipe_sizes),
-            format_pipe_size(model_pipe_sizes[0]) if model_pipe_sizes else u"?",
-            format_pipe_size(model_pipe_sizes[-1]) if model_pipe_sizes else u"?"))
-
-        # Revit 2025/2026: ElementId is 64-bit. Never depend on IntegerValue here.
-        # First detect PipingSystemType from actual Pipe/Fitting instances.
-        system_type_ids = set()
-        for e in pipes + fittings:
-            sid = get_system_type_id(e)
-            sid_value = element_id_value(sid)
-            if sid_value is not None and is_valid_element_id(sid):
-                system_type_ids.add(sid_value)
-
-        # Build from the real PipingSystemType elements. If instance-based
-        # detection returns nothing (for example disconnected/partially built
-        # MEP content), fall back to all PipingSystemType definitions in model.
-        all_system_types = []
-        try:
-            all_system_types = list(DB.FilteredElementCollector(doc)\
-                                    .OfClass(DB.Plumbing.PipingSystemType)\
-                                    .WhereElementIsElementType()\
-                                    .ToElements())
-        except Exception:
-            all_system_types = []
-
-        all_by_value = {}
-        for st in all_system_types:
-            value = element_id_value(st.Id)
-            if value is not None:
-                all_by_value[value] = st
-
-        if not system_type_ids and all_by_value:
-            system_type_ids.update(all_by_value.keys())
-            self.log(u"Revit {}: không đọc được System Type từ instance; đã fallback sang {} Piping System Type trong model.".format(REVIT_VERSION if REVIT_VERSION else u"?", len(all_by_value)))
+        # Selection filter: chỉ đọc Pipe/Fitting đã chọn trước khi mở tool.
+        pipes, fittings = collect_pipes_and_fittings(True, self.preselected_element_ids)
+        index = self._build_selection_index(pipes, fittings)
 
         system_type_items = []
-        for raw_id in sorted(system_type_ids):
-            st = all_by_value.get(raw_id)
-            eid = st.Id if st is not None else make_element_id(raw_id)
-            # Only show real PipingSystemType elements; ignore classification ids.
-            if _is_piping_system_type_id(eid):
-                system_type_items.append(CmbItem(get_system_type_name_by_id(eid), eid))
+        for sval, bucket in index.items():
+            if sval is None:
+                continue
+            eid = make_element_id(sval)
+            if not _is_piping_system_type_id(eid):
+                continue
+            label = u"{}   ({} Pipe, {} Fitting)".format(
+                get_system_type_name_by_id(eid), bucket['pipes'], bucket['fittings'])
+            item = CmbItem(label, eid)
+            item.ElementCount = bucket['pipes'] + bucket['fittings']
+            system_type_items.append(item)
 
-        # Absolute fallback: if the instance ids were stale/incomplete, show all
-        # real PipingSystemType definitions so the System combo is never empty.
-        if not system_type_items and all_by_value:
-            for raw_id, st in sorted(all_by_value.items(), key=lambda kv: get_real_name(kv[1]).lower()):
-                system_type_items.append(CmbItem(get_real_name(st), st.Id))
+        if not system_type_items:
+            # Selection không đọc được System Type -> fallback toàn bộ PipingSystemType.
+            try:
+                all_system_types = list(DB.FilteredElementCollector(doc)\
+                                        .OfClass(DB.Plumbing.PipingSystemType)\
+                                        .WhereElementIsElementType()\
+                                        .ToElements())
+            except Exception:
+                all_system_types = []
+            for st in sorted(all_system_types, key=lambda x: get_real_name(x).lower()):
+                item = CmbItem(get_real_name(st), st.Id)
+                item.ElementCount = 0
+                system_type_items.append(item)
+            self.log(u"Selection không đọc được System Type; fallback {} Piping System Type trong model.".format(
+                len(system_type_items)))
 
-        for item in sorted(system_type_items, key=lambda x: x.Name.lower()):
+        system_type_items.sort(key=lambda x: x.Name.lower())
+        for item in system_type_items:
             self.system_items.append(item)
             self.cmb_Systems.Items.Add(item)
         self.cmb_Systems.DisplayMemberPath = "Name"
         if self.cmb_Systems.Items.Count > 0:
-            self.cmb_Systems.SelectedIndex = 0
+            # Mặc định chọn System có nhiều phần tử nhất trong selection.
+            best = 0
+            for i in range(self.cmb_Systems.Items.Count):
+                if getattr(self.cmb_Systems.Items[i], 'ElementCount', 0) > \
+                        getattr(self.cmb_Systems.Items[best], 'ElementCount', 0):
+                    best = i
+            self.cmb_Systems.SelectedIndex = best
+
+        self._refresh_pipe_size_combos(log_change=False)
+        self.log(u"Selection filter: {} Pipe + {} Fitting -> {} System Type, {} size (tổng).".format(
+            len(pipes), len(fittings), len([v for v in index.keys() if v is not None]),
+            len((self._selection_all_bucket or {}).get('sizes', {}))))
 
         # Pipe types.
         pipe_types = list(DB.FilteredElementCollector(doc)\

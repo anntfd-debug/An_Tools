@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import unicode_literals
-__title__ = u'Tag Pipes Pro V2.0'
-__doc__ = u'Tạo mới, align hoặc chuẩn hóa Pipe Tag; lọc chiều dài, kích thước, hướng ống, View Range và tự lưu cấu hình.'
+__title__ = u'Tag MEP Pro V3.1'
+__doc__ = u'Tạo mới, align hoặc chuẩn hóa Tag cho Pipe, Conduit, Fire Alarm Device, Plumbing Fixture và Pipe Accessory; lọc chiều dài, kích thước, hướng, View Range và tự lưu cấu hình.'
 
 from Autodesk.Revit.DB import *
-from Autodesk.Revit.DB.Plumbing import Pipe
 from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
 from Autodesk.Revit.UI import TaskDialog
 from Autodesk.Revit.Exceptions import OperationCanceledException
@@ -16,19 +15,14 @@ import traceback
 # -----------------------------------------------------------------------------
 # UNICODE / TIẾNG VIỆT HELPERS
 # -----------------------------------------------------------------------------
-# Lưu ý quan trọng:
-# - Một số bản pyRevit bị lỗi mã hóa khi dùng forms.toast/forms.alert với tiếng Việt.
-# - Dấu tiếng Việt bị biến thành dạng mojibake như: "ÄÃ£...".
-# - Đây không phải lỗi font của Windows, mà là lỗi đường truyền encoding của pyRevit UI.
-# - Cách ổn định nhất là KHÔNG dùng forms.toast/forms.alert cho tiếng Việt;
-#   chuyển toàn bộ thông báo sang Revit native TaskDialog.
+# Không dùng forms.toast/forms.alert cho tiếng Việt (lỗi mojibake trên một số bản
+# pyRevit) -> dùng Revit native TaskDialog.
 try:
     unicode
 except NameError:
     unicode = str
 
-
-TASK_DIALOG_TITLE = u'Tag Pipes Pro'
+TASK_DIALOG_TITLE = u'Tag MEP Pro'
 
 
 def ensure_unicode(value):
@@ -46,17 +40,12 @@ def ensure_unicode(value):
 
 
 def revit_message(message, title=TASK_DIALOG_TITLE):
-    """Hiển thị thông báo Unicode bằng TaskDialog của Revit.
-
-    Không dùng pyrevit.forms.toast/forms.alert vì một số máy sẽ lỗi dấu tiếng Việt.
-    """
     msg = ensure_unicode(message)
     ttl = ensure_unicode(title)
     try:
         TaskDialog.Show(ttl, msg)
     except:
         try:
-            # Fallback cuối cùng: in ra pyRevit output.
             print(msg.encode('utf-8') if hasattr(msg, 'encode') else msg)
         except:
             pass
@@ -67,33 +56,90 @@ def alert_msg(message):
 
 
 def toast_msg(message):
-    # Giữ tên hàm để không phải đổi logic bên dưới, nhưng thực tế dùng TaskDialog.
     revit_message(message)
 
 
+def log(message):
+    try:
+        print(ensure_unicode(message))
+    except:
+        pass
+
+
 # -----------------------------------------------------------------------------
-# FILE PATHS
+# ĐỊNH NGHĨA CÁC LOẠI ĐỐI TƯỢNG ĐƯỢC TAG
+# -----------------------------------------------------------------------------
+# kind: 'pipe' | 'conduit' | 'fa' | 'pf' | 'pa'
+#   - linear = True  -> đối tượng dạng đường (LocationCurve), xếp bậc theo cụm song song
+#   - linear = False -> đối tượng dạng điểm (FamilyInstance), tag lệch trái/phải
+KIND_ORDER = ['pipe', 'conduit', 'fa', 'pf', 'pa']
+
+KIND_INFO = {
+    'pipe': {
+        'label': u'Pipe',
+        'cat': BuiltInCategory.OST_PipeCurves,
+        'tag_cat': BuiltInCategory.OST_PipeTags,
+        'size_bip': BuiltInParameter.RBS_PIPE_DIAMETER_PARAM,
+        'linear': True,
+    },
+    'conduit': {
+        'label': u'Conduit',
+        'cat': BuiltInCategory.OST_Conduit,
+        'tag_cat': BuiltInCategory.OST_ConduitTags,
+        'size_bip': BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM,
+        'linear': True,
+    },
+    'fa': {
+        'label': u'Fire Alarm Device',
+        'cat': BuiltInCategory.OST_FireAlarmDevices,
+        'tag_cat': BuiltInCategory.OST_FireAlarmDeviceTags,
+        'size_bip': None,
+        'linear': False,
+    },
+    'pf': {
+        'label': u'Plumbing Fixture',
+        'cat': BuiltInCategory.OST_PlumbingFixtures,
+        'tag_cat': BuiltInCategory.OST_PlumbingFixtureTags,
+        'size_bip': None,
+        'linear': False,
+    },
+    'pa': {
+        'label': u'Pipe Accessory',
+        'cat': BuiltInCategory.OST_PipeAccessory,
+        'tag_cat': BuiltInCategory.OST_PipeAccessoryTags,
+        'size_bip': None,
+        'linear': False,
+    },
+}
+
+CAT_TO_KIND = {}
+TAG_CAT_TO_KIND = {}
+for _k in KIND_ORDER:
+    CAT_TO_KIND[int(KIND_INFO[_k]['cat'])] = _k
+    TAG_CAT_TO_KIND[int(KIND_INFO[_k]['tag_cat'])] = _k
+
+
+# -----------------------------------------------------------------------------
+# FILE PATHS / SETTINGS
 # -----------------------------------------------------------------------------
 SCRIPT_DIR = os.path.dirname(__file__)
 xaml_file = os.path.join(SCRIPT_DIR, 'ui_definition.xaml')
+# Giữ nguyên tên file cấu hình để nạp lại được setting của bản V2.0.
 CONFIG_FILENAME = 'tag_parallel_pipes_settings.json'
 CONFIG_FILE = os.path.join(SCRIPT_DIR, CONFIG_FILENAME)
 
 
 def get_fallback_config_file():
-    """Fallback lưu setting vào AppData nếu thư mục bundle không cho ghi file."""
     appdata = os.getenv('APPDATA')
     if appdata:
         folder = os.path.join(appdata, 'pyRevit_TagPipesPro')
     else:
         folder = os.path.join(os.path.expanduser('~'), '.pyRevit_TagPipesPro')
-
     try:
         if not os.path.exists(folder):
             os.makedirs(folder)
     except:
         pass
-
     return os.path.join(folder, CONFIG_FILENAME)
 
 
@@ -103,32 +149,42 @@ DEFAULT_SETTINGS = {
     'spacing_mm': '5.0',
     'min_length_mm': '500',
     'max_length_mm': '10000',
-    'use_max_length': False,     # False = không giới hạn chiều dài tối đa
+    'use_max_length': False,
     'min_size_mm': '15',
     'max_size_mm': '1000',
-    'use_max_size': True,        # False = không giới hạn đường kính lớn nhất
-    'scope': 'selection',        # selection | view
-    'orientation': 'all',        # all | horizontal | vertical
-    'tag_condition': 'all',      # all | untagged (chỉ áp dụng mode create)
-    'operation_mode': 'create',   # create | align | normalize
-    'tag_side': 'left',           # left | right
-    'view_range_mode': 'none',    # none | manual | active
+    'use_max_size': True,
+    'scope': 'selection',          # selection | view
+    'orientation': 'all',          # all | horizontal | vertical
+    'tag_condition': 'all',        # all | untagged
+    'operation_mode': 'create',    # create | align | normalize
+    'tag_side': 'left',            # left | right
+    'view_range_mode': 'none',     # none | manual | active
     'view_range_bottom_mm': '-1000',
     'view_range_top_mm': '3000',
-    'tag_type': ''
+    # Đối tượng cần tag (mới)
+    'use_pipe': True,
+    'use_conduit': False,
+    'use_fa': False,
+    'tag_type': '',                # Pipe tag (giữ key cũ để tương thích V2.0)
+    'conduit_tag_type': '',
+    'fa_tag_type': '',
+    'use_pf': False,
+    'use_pa': False,
+    'pf_tag_type': '',
+    'pa_tag_type': '',
+    # Fire Alarm Device (mới)
+    'device_offset_mm': '6.0',
+    'device_leader': False,
 }
 
 
 def to_text(value):
-    """Chuyển giá trị sang Unicode text, tương thích IronPython/Python."""
     return ensure_unicode(value)
 
 
 def setting_to_bool(value, default=False):
-    """Đọc giá trị bool từ JSON cũ/mới một cách an toàn."""
     if isinstance(value, bool):
         return value
-
     text = to_text(value).strip().lower()
     if text in ('true', '1', 'yes', 'on'):
         return True
@@ -139,7 +195,6 @@ def setting_to_bool(value, default=False):
 
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
-
     for path in [CONFIG_FILE, FALLBACK_CONFIG_FILE]:
         if not path or not os.path.exists(path):
             continue
@@ -151,7 +206,6 @@ def load_settings():
             break
         except:
             pass
-
     return settings
 
 
@@ -159,13 +213,11 @@ def write_settings_file(path, settings):
     folder = os.path.dirname(path)
     if folder and not os.path.exists(folder):
         os.makedirs(folder)
-
     with open(path, 'w') as fp:
         json.dump(settings, fp, indent=2, sort_keys=True)
 
 
 def save_settings(settings):
-    """Ưu tiên lưu cùng thư mục script. Nếu không được thì lưu vào AppData."""
     try:
         write_settings_file(CONFIG_FILE, settings)
         return CONFIG_FILE
@@ -178,44 +230,107 @@ def save_settings(settings):
 
 
 # -----------------------------------------------------------------------------
-# HELPERS
+# HELPERS CHUNG
 # -----------------------------------------------------------------------------
 def mm_to_feet(mm, scale):
     return (mm * scale) / 304.8
 
 
 def reverse_xyz(vec):
-    """Đảo chiều vector, tương thích nhiều phiên bản Revit/IronPython."""
     try:
         return vec.Negate()
     except:
         return vec * -1.0
 
 
-def are_pipes_parallel(p1, p2):
-    d1 = (p1.Location.Curve.GetEndPoint(1) - p1.Location.Curve.GetEndPoint(0)).Normalize()
-    d2 = (p2.Location.Curve.GetEndPoint(1) - p2.Location.Curve.GetEndPoint(0)).Normalize()
-    return abs(d1.DotProduct(d2)) > 0.95
-
-
-def get_perpendicular_distance(p1, p2):
-    pt1 = p1.Location.Curve.Evaluate(0.5, True)
-    pt2 = p2.Location.Curve.Evaluate(0.5, True)
-    d1 = (p1.Location.Curve.GetEndPoint(1) - p1.Location.Curve.GetEndPoint(0)).Normalize()
-    v = pt2 - pt1
-    return (v - d1 * v.DotProduct(d1)).GetLength()
+def get_id_value(element_id):
+    """Lấy ID dạng số, tương thích Revit 2024+ (Value) và bản cũ (IntegerValue)."""
+    try:
+        return int(element_id.Value)
+    except:
+        try:
+            return int(element_id.IntegerValue)
+        except:
+            return None
 
 
 def parse_mm_value(text_value, field_name):
-    """Đọc số mm từ TextBox, cho phép nhập dấu phẩy hoặc dấu chấm."""
     try:
         return float(to_text(text_value).replace(',', '.'))
     except:
         raise ValueError(u'{} phải là số hợp lệ.'.format(field_name))
 
 
+def get_element_kind(elem):
+    """Trả về 'pipe' | 'conduit' | 'fa' hoặc None."""
+    try:
+        if not elem or not elem.Category:
+            return None
+        return CAT_TO_KIND.get(get_id_value(elem.Category.Id))
+    except:
+        return None
+
+
+def get_tag_kind(tag):
+    try:
+        if not tag or not tag.Category:
+            return None
+        return TAG_CAT_TO_KIND.get(get_id_value(tag.Category.Id))
+    except:
+        return None
+
+
+def has_valid_curve(elem):
+    try:
+        return bool(elem.Location and hasattr(elem.Location, 'Curve') and elem.Location.Curve)
+    except:
+        return False
+
+
+def is_valid_target(elem, allowed_kinds):
+    kind = get_element_kind(elem)
+    if kind is None or kind not in allowed_kinds:
+        return False
+    if KIND_INFO[kind]['linear']:
+        return has_valid_curve(elem)
+    return get_element_point(elem) is not None
+
+
+def get_element_point(elem):
+    """Điểm đặt của thiết bị: LocationPoint, nếu không có thì tâm BoundingBox."""
+    try:
+        loc = elem.Location
+        if loc and hasattr(loc, 'Point') and loc.Point:
+            return loc.Point
+    except:
+        pass
+    try:
+        bb = elem.get_BoundingBox(None)
+        if bb:
+            return (bb.Min + bb.Max) * 0.5
+    except:
+        pass
+    return None
+
+
+def are_curves_parallel(e1, e2):
+    d1 = (e1.Location.Curve.GetEndPoint(1) - e1.Location.Curve.GetEndPoint(0)).Normalize()
+    d2 = (e2.Location.Curve.GetEndPoint(1) - e2.Location.Curve.GetEndPoint(0)).Normalize()
+    return abs(d1.DotProduct(d2)) > 0.95
+
+
+def get_perpendicular_distance(e1, e2):
+    pt1 = e1.Location.Curve.Evaluate(0.5, True)
+    pt2 = e2.Location.Curve.Evaluate(0.5, True)
+    d1 = (e1.Location.Curve.GetEndPoint(1) - e1.Location.Curve.GetEndPoint(0)).Normalize()
+    v = pt2 - pt1
+    return (v - d1 * v.DotProduct(d1)).GetLength()
+
+
+# -----------------------------------------------------------------------------
+# VIEW RANGE
+# -----------------------------------------------------------------------------
 def get_view_base_elevation(view):
-    """Cao độ Level gắn với active view. Nếu không lấy được thì dùng 0."""
     try:
         level = view.GenLevel
         if level:
@@ -227,136 +342,136 @@ def get_view_base_elevation(view):
 
 def is_valid_level_id(level_id):
     try:
-        return level_id and level_id.IntegerValue != -1
+        return level_id and get_id_value(level_id) != -1
     except:
         return False
 
 
 def get_plan_view_plane_z(doc, view, plan_view_range, plane):
-    """Trả về cao độ tuyệt đối của một mặt phẳng View Range."""
     try:
         level_id = plan_view_range.GetLevelId(plane)
         offset = plan_view_range.GetOffset(plane)
-
         level_elevation = get_view_base_elevation(view)
         if is_valid_level_id(level_id):
             level = doc.GetElement(level_id)
             if level and hasattr(level, 'Elevation'):
                 level_elevation = level.Elevation
-
         return level_elevation + offset
     except:
         return None
 
 
 def get_active_view_range_bounds(doc, view):
-    """Lấy khoảng Z của View Range hiện hành trong active view.
-
-    Dùng Top Clip làm giới hạn trên. Giới hạn dưới lấy thấp nhất giữa
-    Bottom Clip và View Depth để không bỏ sót các phần tử đang được view hiển thị.
-    """
     try:
         pvr = view.GetViewRange()
     except:
         return None
-
     top_z = get_plan_view_plane_z(doc, view, pvr, PlanViewPlane.TopClipPlane)
     bottom_z = get_plan_view_plane_z(doc, view, pvr, PlanViewPlane.BottomClipPlane)
     view_depth_z = get_plan_view_plane_z(doc, view, pvr, PlanViewPlane.ViewDepthPlane)
-
-    values = []
-    if top_z is not None:
-        values.append(top_z)
-    if bottom_z is not None:
-        values.append(bottom_z)
-    if view_depth_z is not None:
-        values.append(view_depth_z)
-
+    values = [v for v in (top_z, bottom_z, view_depth_z) if v is not None]
     if len(values) < 2:
         return None
-
     upper = top_z if top_z is not None else max(values)
-    lower_candidates = []
-    if bottom_z is not None:
-        lower_candidates.append(bottom_z)
-    if view_depth_z is not None:
-        lower_candidates.append(view_depth_z)
+    lower_candidates = [v for v in (bottom_z, view_depth_z) if v is not None]
     lower = min(lower_candidates) if lower_candidates else min(values)
-
     if upper < lower:
-        tmp = upper
-        upper = lower
-        lower = tmp
-
+        upper, lower = lower, upper
     return (lower, upper)
 
 
 def get_element_z_span(elem):
-    """Lấy khoảng cao độ Z của element để so với View Range."""
     try:
         bb = elem.get_BoundingBox(None)
         if bb:
             return (bb.Min.Z, bb.Max.Z)
     except:
         pass
-
     try:
         curve = elem.Location.Curve
         z0 = curve.GetEndPoint(0).Z
         z1 = curve.GetEndPoint(1).Z
         return (min(z0, z1), max(z0, z1))
     except:
-        return None
+        pass
+    pt = get_element_point(elem)
+    if pt is not None:
+        return (pt.Z, pt.Z)
+    return None
 
 
 def element_overlaps_z_range(elem, bottom_z, top_z):
-    """True nếu element có phần giao với dải View Range."""
     span = get_element_z_span(elem)
     if not span:
         return False
-
-    elem_min_z, elem_max_z = span
-    return elem_max_z >= bottom_z and elem_min_z <= top_z
+    return span[1] >= bottom_z and span[0] <= top_z
 
 
-# BỘ LỌC CHỈ CHO PHÉP CHỌN ỐNG KHI THAO TÁC TRÊN MÀN HÌNH
-class PipeSelectionFilter(ISelectionFilter):
-    def __init__(self, view_range_bounds=None):
-        # view_range_bounds = (bottom_z, top_z) theo đơn vị internal feet của Revit.
-        # Khi có giá trị này, user chỉ quét/chọn được pipe có giao với dải View Range.
+# -----------------------------------------------------------------------------
+# SELECTION FILTER - Pipe / Conduit / Fire Alarm Device
+# -----------------------------------------------------------------------------
+class TagTargetSelectionFilter(ISelectionFilter):
+    def __init__(self, allowed_kinds, view_range_bounds=None):
+        self.allowed_kinds = list(allowed_kinds)
         self.view_range_bounds = view_range_bounds
 
     def AllowElement(self, elem):
-        if not (elem and elem.Category and elem.Category.Id.IntegerValue == int(BuiltInCategory.OST_PipeCurves)):
-            return False
-
-        if self.view_range_bounds:
-            try:
-                return element_overlaps_z_range(elem, self.view_range_bounds[0], self.view_range_bounds[1])
-            except:
+        try:
+            if not is_valid_target(elem, self.allowed_kinds):
                 return False
-
-        return True
+            if self.view_range_bounds:
+                return element_overlaps_z_range(
+                    elem, self.view_range_bounds[0], self.view_range_bounds[1])
+            return True
+        except:
+            return False
 
     def AllowReference(self, reference, position):
         return False
 
 
-class TagParallelPipesWPF(forms.WPFWindow):
+# -----------------------------------------------------------------------------
+# WPF WINDOW
+# -----------------------------------------------------------------------------
+class TagMEPWPF(forms.WPFWindow):
     def __init__(self, xaml_file_path):
         forms.WPFWindow.__init__(self, xaml_file_path)
-
         self.result = None
         self.settings = load_settings()
-        self.setup_tag_combobox()
+
+        # kind -> (checkbox, combobox, settings key của checkbox, settings key của tag type)
+        self.kind_controls = {
+            'pipe': (self.chkPipe, self.cbPipeTagTypes, 'use_pipe', 'tag_type'),
+            'conduit': (self.chkConduit, self.cbConduitTagTypes, 'use_conduit', 'conduit_tag_type'),
+            'fa': (self.chkFireAlarm, self.cbFireAlarmTagTypes, 'use_fa', 'fa_tag_type'),
+            'pf': (self.chkPlumbingFixture, self.cbPlumbingFixtureTagTypes, 'use_pf', 'pf_tag_type'),
+            'pa': (self.chkPipeAccessory, self.cbPipeAccessoryTagTypes, 'use_pa', 'pa_tag_type'),
+        }
+        self.tag_maps = {}
+
+        self.setup_tag_comboboxes()
         self.apply_saved_settings()
+
+        # Card thông số thiết bị chỉ bật khi có ít nhất 1 loại thiết bị dạng điểm được tick
+        for kind in KIND_ORDER:
+            if not KIND_INFO[kind]['linear']:
+                chk = self.kind_controls[kind][0]
+                chk.Checked += self.on_kind_toggled
+                chk.Unchecked += self.on_kind_toggled
+        self.on_kind_toggled(None, None)
 
         self.btnExecute.Click += self.on_execute_click
         self.btnCancel.Click += self.on_close_click
 
-    # -------------------------------------------------------------------------
-    # UI SETTINGS
-    # -------------------------------------------------------------------------
+    def on_kind_toggled(self, sender, args):
+        try:
+            self.cardDevice.IsEnabled = any(
+                bool(self.kind_controls[k][0].IsChecked)
+                for k in KIND_ORDER if not KIND_INFO[k]['linear'])
+        except:
+            pass
+
+    # ------------------------------------------------------------------
     def set_status(self, message):
         try:
             self.txtSettingsStatus.Text = message
@@ -366,109 +481,122 @@ class TagParallelPipesWPF(forms.WPFWindow):
     def set_radio_value(self, radio_map, saved_value, default_value):
         if saved_value not in radio_map:
             saved_value = default_value
-
         for key in radio_map:
             radio_map[key].IsChecked = (key == saved_value)
 
+    # ------------------------------------------------------------------
+    def build_tag_map(self, doc, tag_bic):
+        symbols = FilteredElementCollector(doc)\
+            .OfClass(FamilySymbol)\
+            .OfCategory(tag_bic)\
+            .ToElements()
+        tag_map = {}
+        for t in symbols:
+            type_param = t.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+            type_name = type_param.AsString() if type_param else None
+            fam_param = t.get_Parameter(BuiltInParameter.SYMBOL_FAMILY_NAME_PARAM)
+            fam_name = fam_param.AsString() if fam_param else u'Unknown Family'
+            if type_name:
+                tag_map[u'{} - {}'.format(fam_name, type_name)] = t
+        return tag_map
+
+    def setup_tag_comboboxes(self):
+        doc = revit.doc
+        for kind in KIND_ORDER:
+            chk, cb, _, _ = self.kind_controls[kind]
+            tag_map = self.build_tag_map(doc, KIND_INFO[kind]['tag_cat'])
+            self.tag_maps[kind] = tag_map
+            cb.ItemsSource = sorted(tag_map.keys())
+            if tag_map:
+                cb.SelectedIndex = 0
+            else:
+                try:
+                    chk.ToolTip = u'Model chưa load family {} Tag. Align vẫn dùng được; Tạo mới / Đổi Type cần load tag trước.'.format(
+                        KIND_INFO[kind]['label'])
+                except:
+                    pass
+
+    # ------------------------------------------------------------------
     def apply_saved_settings(self):
-        self.txtSpacing.Text = to_text(self.settings.get('spacing_mm', DEFAULT_SETTINGS['spacing_mm']))
-        self.txtMinLength.Text = to_text(self.settings.get('min_length_mm', DEFAULT_SETTINGS['min_length_mm']))
-        self.txtMaxLength.Text = to_text(self.settings.get('max_length_mm', DEFAULT_SETTINGS['max_length_mm']))
+        s = self.settings
+        self.txtSpacing.Text = to_text(s.get('spacing_mm', DEFAULT_SETTINGS['spacing_mm']))
+        self.txtMinLength.Text = to_text(s.get('min_length_mm', DEFAULT_SETTINGS['min_length_mm']))
+        self.txtMaxLength.Text = to_text(s.get('max_length_mm', DEFAULT_SETTINGS['max_length_mm']))
         self.chkLimitMaxLength.IsChecked = setting_to_bool(
-            self.settings.get('use_max_length', DEFAULT_SETTINGS['use_max_length']),
-            DEFAULT_SETTINGS['use_max_length']
-        )
-        self.txtMinSize.Text = to_text(self.settings.get('min_size_mm', DEFAULT_SETTINGS['min_size_mm']))
-        self.txtMaxSize.Text = to_text(self.settings.get('max_size_mm', DEFAULT_SETTINGS['max_size_mm']))
+            s.get('use_max_length', DEFAULT_SETTINGS['use_max_length']), DEFAULT_SETTINGS['use_max_length'])
+        self.txtMinSize.Text = to_text(s.get('min_size_mm', DEFAULT_SETTINGS['min_size_mm']))
+        self.txtMaxSize.Text = to_text(s.get('max_size_mm', DEFAULT_SETTINGS['max_size_mm']))
         self.chkLimitMaxSize.IsChecked = setting_to_bool(
-            self.settings.get('use_max_size', DEFAULT_SETTINGS['use_max_size']),
-            DEFAULT_SETTINGS['use_max_size']
-        )
-        self.txtRangeBottom.Text = to_text(self.settings.get('view_range_bottom_mm', DEFAULT_SETTINGS['view_range_bottom_mm']))
-        self.txtRangeTop.Text = to_text(self.settings.get('view_range_top_mm', DEFAULT_SETTINGS['view_range_top_mm']))
+            s.get('use_max_size', DEFAULT_SETTINGS['use_max_size']), DEFAULT_SETTINGS['use_max_size'])
+        self.txtRangeBottom.Text = to_text(s.get('view_range_bottom_mm', DEFAULT_SETTINGS['view_range_bottom_mm']))
+        self.txtRangeTop.Text = to_text(s.get('view_range_top_mm', DEFAULT_SETTINGS['view_range_top_mm']))
+        self.txtDeviceOffset.Text = to_text(s.get('device_offset_mm', DEFAULT_SETTINGS['device_offset_mm']))
+        self.chkDeviceLeader.IsChecked = setting_to_bool(
+            s.get('device_leader', DEFAULT_SETTINGS['device_leader']), DEFAULT_SETTINGS['device_leader'])
 
-        self.set_radio_value({
-            'view': self.rbView,
-            'selection': self.rbSelection
-        }, self.settings.get('scope', 'selection'), 'selection')
+        self.set_radio_value({'view': self.rbView, 'selection': self.rbSelection},
+                             s.get('scope', 'selection'), 'selection')
+        self.set_radio_value({'all': self.rbOrientationAll,
+                              'horizontal': self.rbOrientationHorizontal,
+                              'vertical': self.rbOrientationVertical},
+                             s.get('orientation', 'all'), 'all')
+        self.set_radio_value({'all': self.rbAllPipes, 'untagged': self.rbUntaggedOnly},
+                             s.get('tag_condition', 'all'), 'all')
+        self.set_radio_value({'create': self.rbOperationCreate,
+                              'align': self.rbOperationAlign,
+                              'normalize': self.rbOperationNormalize},
+                             s.get('operation_mode', 'create'), 'create')
+        self.set_radio_value({'left': self.rbTagSideLeft, 'right': self.rbTagSideRight},
+                             s.get('tag_side', 'left'), 'left')
+        self.set_radio_value({'none': self.rbViewRangeNone,
+                              'manual': self.rbViewRangeManual,
+                              'active': self.rbViewRangeActive},
+                             s.get('view_range_mode', 'none'), 'none')
 
-        self.set_radio_value({
-            'all': self.rbOrientationAll,
-            'horizontal': self.rbOrientationHorizontal,
-            'vertical': self.rbOrientationVertical
-        }, self.settings.get('orientation', 'all'), 'all')
-
-        self.set_radio_value({
-            'all': self.rbAllPipes,
-            'untagged': self.rbUntaggedOnly
-        }, self.settings.get('tag_condition', 'all'), 'all')
-
-        self.set_radio_value({
-            'create': self.rbOperationCreate,
-            'align': self.rbOperationAlign,
-            'normalize': self.rbOperationNormalize
-        }, self.settings.get('operation_mode', 'create'), 'create')
-
-        self.set_radio_value({
-            'left': self.rbTagSideLeft,
-            'right': self.rbTagSideRight
-        }, self.settings.get('tag_side', 'left'), 'left')
-
-        self.set_radio_value({
-            'none': self.rbViewRangeNone,
-            'manual': self.rbViewRangeManual,
-            'active': self.rbViewRangeActive
-        }, self.settings.get('view_range_mode', 'none'), 'none')
-
-        saved_tag = self.settings.get('tag_type', '')
-        if saved_tag and saved_tag in self.tag_map:
-            self.cbTagTypes.SelectedItem = saved_tag
-        elif self.tag_map and self.cbTagTypes.SelectedIndex < 0:
-            self.cbTagTypes.SelectedIndex = 0
+        for kind in KIND_ORDER:
+            chk, cb, use_key, type_key = self.kind_controls[kind]
+            chk.IsChecked = setting_to_bool(s.get(use_key, DEFAULT_SETTINGS[use_key]), DEFAULT_SETTINGS[use_key])
+            saved_tag = s.get(type_key, '')
+            tag_map = self.tag_maps.get(kind, {})
+            if saved_tag and saved_tag in tag_map:
+                cb.SelectedItem = saved_tag
+            elif tag_map and cb.SelectedIndex < 0:
+                cb.SelectedIndex = 0
 
         if os.path.exists(CONFIG_FILE) or os.path.exists(FALLBACK_CONFIG_FILE):
             self.set_status(u'Đã nạp cấu hình lần chạy trước.')
         else:
-            self.set_status(u'Chưa có cấu hình đã lưu. Tool sẽ tự lưu sau khi bấm Đặt Tag.')
+            self.set_status(u'Chưa có cấu hình đã lưu. Tool sẽ tự lưu sau khi bấm Thực hiện.')
 
-    def get_current_settings(self):
-        if bool(self.rbSelection.IsChecked):
-            scope = 'selection'
-        else:
-            scope = 'view'
-
+    # ------------------------------------------------------------------
+    def read_radio_options(self):
+        scope = 'selection' if bool(self.rbSelection.IsChecked) else 'view'
         if bool(self.rbOrientationHorizontal.IsChecked):
             orientation = 'horizontal'
         elif bool(self.rbOrientationVertical.IsChecked):
             orientation = 'vertical'
         else:
             orientation = 'all'
-
-        if bool(self.rbUntaggedOnly.IsChecked):
-            tag_condition = 'untagged'
-        else:
-            tag_condition = 'all'
-
+        tag_condition = 'untagged' if bool(self.rbUntaggedOnly.IsChecked) else 'all'
         if bool(self.rbOperationAlign.IsChecked):
             operation_mode = 'align'
         elif bool(self.rbOperationNormalize.IsChecked):
             operation_mode = 'normalize'
         else:
             operation_mode = 'create'
-
-        if bool(self.rbTagSideRight.IsChecked):
-            tag_side = 'right'
-        else:
-            tag_side = 'left'
-
+        tag_side = 'right' if bool(self.rbTagSideRight.IsChecked) else 'left'
         if bool(self.rbViewRangeManual.IsChecked):
             view_range_mode = 'manual'
         elif bool(self.rbViewRangeActive.IsChecked):
             view_range_mode = 'active'
         else:
             view_range_mode = 'none'
+        return scope, orientation, tag_condition, operation_mode, tag_side, view_range_mode
 
-        return {
+    def get_current_settings(self):
+        scope, orientation, tag_condition, operation_mode, tag_side, view_range_mode = \
+            self.read_radio_options()
+        data = {
             'spacing_mm': to_text(self.txtSpacing.Text),
             'min_length_mm': to_text(self.txtMinLength.Text),
             'max_length_mm': to_text(self.txtMaxLength.Text),
@@ -484,110 +612,79 @@ class TagParallelPipesWPF(forms.WPFWindow):
             'view_range_mode': view_range_mode,
             'view_range_bottom_mm': to_text(self.txtRangeBottom.Text),
             'view_range_top_mm': to_text(self.txtRangeTop.Text),
-            'tag_type': to_text(self.cbTagTypes.SelectedItem)
+            'device_offset_mm': to_text(self.txtDeviceOffset.Text),
+            'device_leader': bool(self.chkDeviceLeader.IsChecked),
         }
+        for kind in KIND_ORDER:
+            chk, cb, use_key, type_key = self.kind_controls[kind]
+            data[use_key] = bool(chk.IsChecked)
+            data[type_key] = to_text(cb.SelectedItem) if cb.SelectedItem else u''
+        return data
 
-    # -------------------------------------------------------------------------
-    # TAG COMBOBOX
-    # -------------------------------------------------------------------------
-    def setup_tag_combobox(self):
-        doc = revit.doc
-        pipe_tag_symbols = FilteredElementCollector(doc)\
-                            .OfClass(FamilySymbol)\
-                            .OfCategory(BuiltInCategory.OST_PipeTags)\
-                            .ToElements()
-
-        self.tag_map = {}
-        for t in pipe_tag_symbols:
-            type_param = t.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
-            type_name = type_param.AsString() if type_param else 'Unknown Type'
-
-            fam_param = t.get_Parameter(BuiltInParameter.SYMBOL_FAMILY_NAME_PARAM)
-            fam_name = fam_param.AsString() if fam_param else 'Unknown Family'
-
-            if type_name != 'Unknown Type':
-                display_name = '{} - {}'.format(fam_name, type_name)
-                self.tag_map[display_name] = t
-
-        self.cbTagTypes.ItemsSource = sorted(self.tag_map.keys())
-        if self.tag_map:
-            self.cbTagTypes.SelectedIndex = 0
-
-    # -------------------------------------------------------------------------
-    # MAIN COMMAND - CHỈ ĐỌC UI VÀ ĐÓNG CỬA SỔ
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def on_execute_click(self, sender, args):
-        """Đọc và kiểm tra dữ liệu UI rồi đóng WPF.
-
-        Không gọi PickObjects, không thao tác Selection và không mở Transaction
-        trong event của WPF. Việc tách này tránh xung đột trạng thái modal của
-        Revit khi user đã preselect ống trước lúc chạy lệnh.
-        """
+        """Chỉ đọc/kiểm tra UI rồi đóng WPF. Không Pick/Transaction trong event WPF."""
         try:
+            scope, orientation, tag_condition, operation_mode, tag_side, view_range_mode = \
+                self.read_radio_options()
+
+            # --- Đối tượng cần tag ---
+            selected_kinds = [k for k in KIND_ORDER if bool(self.kind_controls[k][0].IsChecked)]
+            if not selected_kinds:
+                alert_msg(u'Vui lòng tick ít nhất một loại đối tượng cần tag.')
+                return
+
+            tag_type_ids = {}
+            for kind in selected_kinds:
+                cb = self.kind_controls[kind][1]
+                name = cb.SelectedItem
+                tag_map = self.tag_maps.get(kind, {})
+                if name and name in tag_map:
+                    tag_type_ids[kind] = tag_map[name].Id
+                elif operation_mode in ('create', 'normalize'):
+                    alert_msg(u'Chưa có/chưa chọn Tag Type cho {}. Hãy load family tag hoặc bỏ tick đối tượng này.'.format(
+                        KIND_INFO[kind]['label']))
+                    return
+
+            has_linear = any(KIND_INFO[k]['linear'] for k in selected_kinds)
+            has_device = any(not KIND_INFO[k]['linear'] for k in selected_kinds)
+
+            # --- Thông số Pipe/Conduit ---
             spacing_mm = parse_mm_value(self.txtSpacing.Text, u'Khoảng cách xếp bậc')
-            min_length_mm = parse_mm_value(self.txtMinLength.Text, u'Chiều dài ống tối thiểu')
+            min_length_mm = parse_mm_value(self.txtMinLength.Text, u'Chiều dài tối thiểu')
             use_max_length = bool(self.chkLimitMaxLength.IsChecked)
-            max_length_mm = 0.0
-            if use_max_length:
-                max_length_mm = parse_mm_value(self.txtMaxLength.Text, u'Chiều dài ống tối đa')
-
-            min_size_mm = parse_mm_value(self.txtMinSize.Text, u'Đường kính ống nhỏ nhất')
+            max_length_mm = parse_mm_value(self.txtMaxLength.Text, u'Chiều dài tối đa') if use_max_length else 0.0
+            min_size_mm = parse_mm_value(self.txtMinSize.Text, u'Đường kính nhỏ nhất')
             use_max_size = bool(self.chkLimitMaxSize.IsChecked)
-            max_size_mm = 0.0
-            if use_max_size:
-                max_size_mm = parse_mm_value(self.txtMaxSize.Text, u'Đường kính ống lớn nhất')
+            max_size_mm = parse_mm_value(self.txtMaxSize.Text, u'Đường kính lớn nhất') if use_max_size else 0.0
 
-            if spacing_mm <= 0:
-                alert_msg(u'Khoảng cách xếp bậc phải lớn hơn 0.')
-                return
-            if min_length_mm < 0:
-                alert_msg(u'Chiều dài ống tối thiểu không được nhỏ hơn 0.')
-                return
-            if use_max_length:
-                if max_length_mm < 0:
-                    alert_msg(u'Chiều dài ống tối đa không được nhỏ hơn 0.')
+            if has_linear:
+                if spacing_mm <= 0:
+                    alert_msg(u'Khoảng cách xếp bậc phải lớn hơn 0.')
                     return
-                if min_length_mm > max_length_mm:
-                    alert_msg(u'Chiều dài ống tối thiểu không được lớn hơn chiều dài tối đa.')
+                if min_length_mm < 0:
+                    alert_msg(u'Chiều dài tối thiểu không được nhỏ hơn 0.')
                     return
-            if min_size_mm < 0:
-                alert_msg(u'Đường kính ống nhỏ nhất không được nhỏ hơn 0.')
-                return
-            if use_max_size:
-                if max_size_mm < 0:
-                    alert_msg(u'Đường kính ống lớn nhất không được nhỏ hơn 0.')
+                if use_max_length and (max_length_mm < 0 or min_length_mm > max_length_mm):
+                    alert_msg(u'Chiều dài tối đa phải ≥ 0 và không nhỏ hơn chiều dài tối thiểu.')
                     return
-                if min_size_mm > max_size_mm:
-                    alert_msg(u'Đường kính ống nhỏ nhất không được lớn hơn đường kính lớn nhất.')
+                if min_size_mm < 0:
+                    alert_msg(u'Đường kính nhỏ nhất không được nhỏ hơn 0.')
+                    return
+                if use_max_size and (max_size_mm < 0 or min_size_mm > max_size_mm):
+                    alert_msg(u'Đường kính lớn nhất phải ≥ 0 và không nhỏ hơn đường kính nhỏ nhất.')
                     return
 
-            scope = 'selection' if bool(self.rbSelection.IsChecked) else 'view'
+            # --- Thông số Fire Alarm Device ---
+            device_offset_mm = 0.0
+            device_leader = bool(self.chkDeviceLeader.IsChecked)
+            if has_device:
+                device_offset_mm = parse_mm_value(self.txtDeviceOffset.Text, u'Khoảng cách tag thiết bị')
+                if device_offset_mm < 0:
+                    alert_msg(u'Khoảng cách tag thiết bị không được nhỏ hơn 0.')
+                    return
 
-            if bool(self.rbOrientationHorizontal.IsChecked):
-                orientation = 'horizontal'
-            elif bool(self.rbOrientationVertical.IsChecked):
-                orientation = 'vertical'
-            else:
-                orientation = 'all'
-
-            tag_condition = 'untagged' if bool(self.rbUntaggedOnly.IsChecked) else 'all'
-            if bool(self.rbOperationAlign.IsChecked):
-                operation_mode = 'align'
-            elif bool(self.rbOperationNormalize.IsChecked):
-                operation_mode = 'normalize'
-            else:
-                operation_mode = 'create'
-            tag_side = 'right' if bool(self.rbTagSideRight.IsChecked) else 'left'
-
-            if bool(self.rbViewRangeManual.IsChecked):
-                view_range_mode = 'manual'
-            elif bool(self.rbViewRangeActive.IsChecked):
-                view_range_mode = 'active'
-            else:
-                view_range_mode = 'none'
-
-            # Chỉ ép kiểu các ô View Range khi chế độ manual thực sự được dùng.
-            # Nhờ vậy nội dung tạm thời trong hai ô này không chặn các mode khác.
+            # --- View Range ---
             if view_range_mode == 'manual':
                 range_bottom_mm = parse_mm_value(self.txtRangeBottom.Text, u'Cao độ dưới View Range')
                 range_top_mm = parse_mm_value(self.txtRangeTop.Text, u'Cao độ trên View Range')
@@ -598,16 +695,12 @@ class TagParallelPipesWPF(forms.WPFWindow):
                 range_bottom_mm = 0.0
                 range_top_mm = 0.0
 
-            selected_tag_name = self.cbTagTypes.SelectedItem
-            if not selected_tag_name or selected_tag_name not in self.tag_map:
-                alert_msg(u'Vui lòng chọn loại Tag trước khi thực hiện.')
-                return
-
-            saved_path = save_settings(self.get_current_settings())
-            if saved_path:
+            if save_settings(self.get_current_settings()):
                 self.set_status(u'Đã lưu cấu hình hiện tại.')
 
             self.result = {
+                'kinds': selected_kinds,
+                'tag_type_ids': tag_type_ids,
                 'spacing_mm': spacing_mm,
                 'min_length_mm': min_length_mm,
                 'max_length_mm': max_length_mm,
@@ -615,6 +708,8 @@ class TagParallelPipesWPF(forms.WPFWindow):
                 'min_size_mm': min_size_mm,
                 'max_size_mm': max_size_mm,
                 'use_max_size': use_max_size,
+                'device_offset_mm': device_offset_mm,
+                'device_leader': device_leader,
                 'scope': scope,
                 'orientation': orientation,
                 'tag_condition': tag_condition,
@@ -623,7 +718,6 @@ class TagParallelPipesWPF(forms.WPFWindow):
                 'view_range_mode': view_range_mode,
                 'view_range_bottom_mm': range_bottom_mm,
                 'view_range_top_mm': range_top_mm,
-                'tag_type_id': self.tag_map[selected_tag_name].Id
             }
             self.Close()
 
@@ -632,10 +726,7 @@ class TagParallelPipesWPF(forms.WPFWindow):
         except Exception as ex:
             self.result = None
             alert_msg(u'Lỗi giao diện: {}'.format(ensure_unicode(ex)))
-            try:
-                print(traceback.format_exc())
-            except:
-                pass
+            log(traceback.format_exc())
 
     def on_close_click(self, sender, args):
         self.result = None
@@ -643,41 +734,21 @@ class TagParallelPipesWPF(forms.WPFWindow):
 
 
 # -----------------------------------------------------------------------------
-# COMMAND LOGIC - CHỈ CHẠY SAU KHI WPF ĐÃ ĐÓNG HOÀN TOÀN
+# COMMAND LOGIC - CHỈ CHẠY SAU KHI WPF ĐÃ ĐÓNG
 # -----------------------------------------------------------------------------
-def get_id_value(element_id):
-    """Lấy ID dạng số, tương thích Revit mới và cũ."""
+def get_revit_year(doc):
     try:
-        return element_id.Value
+        return int(doc.Application.VersionNumber)
     except:
-        try:
-            return element_id.IntegerValue
-        except:
-            return None
+        return 2022
 
 
-def is_pipe_element(elem):
-    try:
-        return (elem and elem.Category and
-                get_id_value(elem.Category.Id) == int(BuiltInCategory.OST_PipeCurves))
-    except:
-        return False
-
-
-def has_valid_curve(elem):
-    try:
-        return bool(elem.Location and hasattr(elem.Location, 'Curve') and elem.Location.Curve)
-    except:
-        return False
-
-
-def deduplicate_pipes(elements):
+def deduplicate_targets(elements, allowed_kinds):
     result = []
     seen_ids = set()
-
     for elem in elements or []:
         try:
-            if not is_pipe_element(elem) or not has_valid_curve(elem):
+            if not is_valid_target(elem, allowed_kinds):
                 continue
             eid = get_id_value(elem.Id)
             if eid is None or eid in seen_ids:
@@ -686,275 +757,265 @@ def deduplicate_pipes(elements):
             result.append(elem)
         except:
             continue
-
     return result
 
 
-def get_tagged_pipe_elements_from_tag(doc, tag):
-    """Resolve Pipe host từ một Pipe Tag local, tương thích Revit cũ/mới."""
-    result = []
-    if not tag or not isinstance(tag, IndependentTag):
-        return result
-
-    try:
-        if not tag.Category or get_id_value(tag.Category.Id) != int(BuiltInCategory.OST_PipeTags):
-            return result
-    except:
-        return result
-
-    try:
-        rvt_year = int(doc.Application.VersionNumber)
-    except:
-        rvt_year = 2022
-
-    if rvt_year >= 2022:
+def get_tag_host_ids(doc, tag):
+    """Trả về list ElementId host local của tag (Revit cũ/mới)."""
+    ids = []
+    if get_revit_year(doc) >= 2022:
         try:
             for tagged_ref in tag.GetTaggedReferences():
-                elem = doc.GetElement(tagged_ref.ElementId)
-                if is_pipe_element(elem):
-                    result.append(elem)
+                ids.append(tagged_ref.ElementId)
         except:
             pass
     else:
         try:
-            elem = doc.GetElement(tag.TaggedLocalElementId)
-            if is_pipe_element(elem):
+            ids.append(tag.TaggedLocalElementId)
+        except:
+            pass
+    return ids
+
+
+def get_hosts_from_tag(doc, tag, allowed_kinds):
+    """Resolve host từ Pipe/Conduit/Fire Alarm Device Tag. Host phải cùng loại với tag."""
+    result = []
+    if not tag or not isinstance(tag, IndependentTag):
+        return result
+    tag_kind = get_tag_kind(tag)
+    if tag_kind is None or tag_kind not in allowed_kinds:
+        return result
+    for host_id in get_tag_host_ids(doc, tag):
+        try:
+            elem = doc.GetElement(host_id)
+            if get_element_kind(elem) == tag_kind:
                 result.append(elem)
         except:
             pass
+    return result
 
-    return deduplicate_pipes(result)
 
-
-def get_preselected_pipes(doc, uidoc, active_view=None):
-    """Đọc Pipe đã preselect; nếu user chọn Pipe Tag thì resolve ngược về host Pipe."""
+def get_preselected_targets(doc, uidoc, active_view, allowed_kinds):
     elements = []
     try:
         selected_ids = list(uidoc.Selection.GetElementIds())
     except:
         selected_ids = []
-
+    active_view_id = get_id_value(active_view.Id) if active_view else None
     for elem_id in selected_ids:
         try:
             elem = doc.GetElement(elem_id)
         except:
             elem = None
-
         if not elem:
             continue
-
-        if is_pipe_element(elem):
+        if get_element_kind(elem) in allowed_kinds:
             elements.append(elem)
             continue
-
         if isinstance(elem, IndependentTag):
             try:
-                if active_view and get_id_value(elem.OwnerViewId) != get_id_value(active_view.Id):
+                if active_view_id is not None and get_id_value(elem.OwnerViewId) != active_view_id:
                     continue
             except:
                 pass
-            elements.extend(get_tagged_pipe_elements_from_tag(doc, elem))
+            elements.extend(get_hosts_from_tag(doc, elem, allowed_kinds))
+    return deduplicate_targets(elements, allowed_kinds)
 
-    return deduplicate_pipes(elements)
 
 def resolve_view_range_bounds(doc, active_view, options):
-    """Tính View Range sau khi cửa sổ WPF đã đóng."""
     mode = options['view_range_mode']
-
     if mode == 'none':
         return None
-
     if mode == 'active':
         bounds = get_active_view_range_bounds(doc, active_view)
         if not bounds:
             alert_msg(u'Active view hiện tại không hỗ trợ View Range. Hãy chọn Plan View hoặc dùng chế độ nhập View Range thủ công.')
             return False
         return bounds
-
     base_z = get_view_base_elevation(active_view)
     bottom_z = base_z + options['view_range_bottom_mm'] / 304.8
     top_z = base_z + options['view_range_top_mm'] / 304.8
     return (min(bottom_z, top_z), max(bottom_z, top_z))
 
 
-def collect_input_pipes(doc, uidoc, active_view, options, view_range_bounds):
-    """Thu thập Pipe theo thứ tự an toàn.
+def kinds_label(kinds):
+    return u' / '.join([KIND_INFO[k]['label'] for k in kinds])
 
-    - Chế độ toàn view: collector theo active view.
-    - Chế độ selection: ưu tiên Pipe đã chọn trước khi mở tool.
-    - Chỉ khi không có preselection mới gọi PickObjects.
-    """
+
+def collect_input_targets(doc, uidoc, active_view, options, view_range_bounds):
+    kinds = options['kinds']
     if options['scope'] == 'view':
-        elements = FilteredElementCollector(doc, active_view.Id)\
-                     .OfCategory(BuiltInCategory.OST_PipeCurves)\
-                     .WhereElementIsNotElementType()\
-                     .ToElements()
-        return deduplicate_pipes(elements), False
+        elements = []
+        for kind in kinds:
+            try:
+                elements.extend(
+                    FilteredElementCollector(doc, active_view.Id)
+                    .OfCategory(KIND_INFO[kind]['cat'])
+                    .WhereElementIsNotElementType()
+                    .ToElements())
+            except:
+                pass
+        return deduplicate_targets(elements, kinds), False
 
-    preselected = get_preselected_pipes(doc, uidoc, active_view)
+    preselected = get_preselected_targets(doc, uidoc, active_view, kinds)
     if preselected:
         return preselected, True
 
-    pipe_filter = PipeSelectionFilter(view_range_bounds)
+    label = kinds_label(kinds)
     mode = options['view_range_mode']
     if mode == 'manual':
-        pick_message = u'Chưa có Pipe được chọn trước. Chỉ chọn được Pipe nằm trong View Range thủ công -> Nhấn FINISH.'
+        pick_message = u'Chưa chọn trước. Chỉ chọn được {} nằm trong View Range thủ công -> Nhấn FINISH.'.format(label)
     elif mode == 'active':
-        pick_message = u'Chưa có Pipe được chọn trước. Chỉ chọn được Pipe nằm trong View Range hiện hành -> Nhấn FINISH.'
+        pick_message = u'Chưa chọn trước. Chỉ chọn được {} nằm trong View Range hiện hành -> Nhấn FINISH.'.format(label)
     else:
-        pick_message = u'Chưa có Pipe được chọn trước. Quét/click chọn các Pipe cần đặt Tag -> Nhấn FINISH.'
+        pick_message = u'Chưa chọn trước. Quét/click chọn {} cần đặt Tag -> Nhấn FINISH.'.format(label)
 
     selected_refs = uidoc.Selection.PickObjects(
         ObjectType.Element,
-        pipe_filter,
-        pick_message
-    )
-
+        TagTargetSelectionFilter(kinds, view_range_bounds),
+        pick_message)
     elements = []
     for ref in selected_refs:
         try:
             elements.append(doc.GetElement(ref.ElementId))
         except:
             pass
+    return deduplicate_targets(elements, kinds), False
 
-    return deduplicate_pipes(elements), False
 
-
-def get_tagged_pipe_dict(doc, active_view):
-    rvt_year = int(doc.Application.VersionNumber)
+def get_tagged_dict(doc, active_view, kinds):
+    """{host_id_value: [tag ElementId,...]} - chỉ tính tag đúng category của host."""
     existing_tags = FilteredElementCollector(doc, active_view.Id)\
-                        .OfClass(IndependentTag)\
-                        .ToElements()
-
+        .OfClass(IndependentTag)\
+        .ToElements()
     tagged_dict = {}
-    pipe_tag_cat_id = int(BuiltInCategory.OST_PipeTags)
-
     for tag in existing_tags:
         try:
-            if not tag.Category or get_id_value(tag.Category.Id) != pipe_tag_cat_id:
+            tag_kind = get_tag_kind(tag)
+            if tag_kind is None or tag_kind not in kinds:
                 continue
-
-            if rvt_year >= 2022:
-                refs = tag.GetTaggedReferences()
-                for tagged_ref in refs:
-                    pid = get_id_value(tagged_ref.ElementId)
-                    if pid is None:
-                        continue
-                    tagged_dict.setdefault(pid, []).append(tag.Id)
-            else:
-                pid = get_id_value(tag.TaggedLocalElementId)
-                if pid is not None:
-                    tagged_dict.setdefault(pid, []).append(tag.Id)
+            for host_id in get_tag_host_ids(doc, tag):
+                hid = get_id_value(host_id)
+                if hid is None:
+                    continue
+                host = doc.GetElement(host_id)
+                if get_element_kind(host) != tag_kind:
+                    continue
+                tagged_dict.setdefault(hid, []).append(tag.Id)
         except:
             pass
-
     return tagged_dict
 
 
-def filter_pipes(raw_elements, options, view_range_bounds, tagged_dict):
+def get_size_ft(elem, kind):
+    bip = KIND_INFO[kind]['size_bip']
+    if bip is None:
+        return None
+    try:
+        p = elem.get_Parameter(bip)
+        if p and p.HasValue:
+            return p.AsDouble()
+    except:
+        pass
+    try:
+        return elem.Diameter
+    except:
+        return None
+
+
+def filter_targets(raw_elements, options, view_range_bounds, tagged_dict):
+    """Trả về (linear_elements, device_elements, view_range_skipped)."""
     min_length_ft = options['min_length_mm'] / 304.8
     use_max_length = options.get('use_max_length', False)
     max_length_ft = options['max_length_mm'] / 304.8 if use_max_length else None
-
     min_size_ft = options['min_size_mm'] / 304.8
     use_max_size = options.get('use_max_size', True)
     max_size_ft = options['max_size_mm'] / 304.8 if use_max_size else None
+    operation_mode = options.get('operation_mode', 'create')
 
-    pipes_to_process = []
+    linear_elements = []
+    device_elements = []
     view_range_skipped = 0
 
-    for elem in deduplicate_pipes(raw_elements):
+    for elem in deduplicate_targets(raw_elements, options['kinds']):
         try:
+            kind = get_element_kind(elem)
+
             if view_range_bounds and not element_overlaps_z_range(
                     elem, view_range_bounds[0], view_range_bounds[1]):
                 view_range_skipped += 1
                 continue
 
-            curve = elem.Location.Curve
-            ep0 = curve.GetEndPoint(0)
-            ep1 = curve.GetEndPoint(1)
-            vector = ep1 - ep0
-            if vector.GetLength() <= 0.000001:
+            eid = get_id_value(elem.Id)
+            if operation_mode == 'create':
+                if options['tag_condition'] == 'untagged' and eid in tagged_dict:
+                    continue
+            else:
+                if eid not in tagged_dict:
+                    continue
+
+            # Thiết bị dạng điểm (FA / Plumbing Fixture / Pipe Accessory): không lọc hướng/chiều dài/kích thước
+            if not KIND_INFO[kind]['linear']:
+                device_elements.append(elem)
                 continue
 
-            dir_vec = vector.Normalize()
-            is_vertical = abs(dir_vec.Z) > 0.99
-            is_horizontal = not is_vertical
-
-            if options['orientation'] == 'horizontal' and not is_horizontal:
+            curve = elem.Location.Curve
+            vector = curve.GetEndPoint(1) - curve.GetEndPoint(0)
+            if vector.GetLength() <= 0.000001:
+                continue
+            is_vertical = abs(vector.Normalize().Z) > 0.99
+            if options['orientation'] == 'horizontal' and is_vertical:
                 continue
             if options['orientation'] == 'vertical' and not is_vertical:
                 continue
 
-            pipe_id_value = get_id_value(elem.Id)
-            operation_mode = options.get('operation_mode', 'create')
-            if operation_mode == 'create':
-                if options['tag_condition'] == 'untagged' and pipe_id_value in tagged_dict:
-                    continue
-            else:
-                # Align/Normalize chỉ làm việc với Pipe đã có Pipe Tag trong active view.
-                if pipe_id_value not in tagged_dict:
-                    continue
-
             length_param = elem.get_Parameter(BuiltInParameter.CURVE_ELEM_LENGTH)
             if length_param:
-                pipe_length_ft = length_param.AsDouble()
-                if pipe_length_ft < min_length_ft:
+                length_ft = length_param.AsDouble()
+                if length_ft < min_length_ft:
                     continue
-                if use_max_length and pipe_length_ft > max_length_ft:
-                    continue
-
-            size_param = elem.get_Parameter(BuiltInParameter.RBS_PIPE_DIAMETER_PARAM)
-            if size_param:
-                pipe_size_ft = size_param.AsDouble()
-                if pipe_size_ft < min_size_ft:
-                    continue
-                if use_max_size and pipe_size_ft > max_size_ft:
+                if use_max_length and length_ft > max_length_ft:
                     continue
 
-            pipes_to_process.append(elem)
+            size_ft = get_size_ft(elem, kind)
+            if size_ft is not None:
+                if size_ft < min_size_ft:
+                    continue
+                if use_max_size and size_ft > max_size_ft:
+                    continue
+
+            linear_elements.append(elem)
         except Exception as ex:
-            try:
-                print(ensure_unicode(u'Bỏ qua Pipe ID {} khi lọc: {}'.format(elem.Id, ensure_unicode(ex))))
-            except:
-                pass
+            log(u'Bỏ qua ID {} khi lọc: {}'.format(elem.Id, ensure_unicode(ex)))
 
-    return pipes_to_process, view_range_skipped
+    return linear_elements, device_elements, view_range_skipped
 
 
-def build_parallel_clusters(pipes_to_process):
+def build_parallel_clusters(linear_elements):
+    """Gom cụm Pipe + Conduit song song gần nhau để xếp bậc tag không chồng nhau."""
     clusters = []
-    unclustered = list(pipes_to_process)
-
+    unclustered = list(linear_elements)
     while unclustered:
         current = unclustered.pop(0)
         cluster = [current]
         remaining = []
-
-        for pipe in unclustered:
+        for elem in unclustered:
             try:
-                if are_pipes_parallel(current, pipe) and get_perpendicular_distance(current, pipe) < 5.0:
-                    cluster.append(pipe)
+                if are_curves_parallel(current, elem) and get_perpendicular_distance(current, elem) < 5.0:
+                    cluster.append(elem)
                 else:
-                    remaining.append(pipe)
+                    remaining.append(elem)
             except:
-                remaining.append(pipe)
-
+                remaining.append(elem)
         unclustered = remaining
         clusters.append(cluster)
-
     return clusters
 
 
 def get_cluster_layout(active_view, options, cluster):
-    """Tính thứ tự Pipe và vị trí TagHead theo cùng một quy tắc cho cả 3 mode."""
-    if not cluster:
-        return [], None, None, 0.0, 0.0
-
     view_scale = active_view.Scale
     if view_scale <= 0:
         raise Exception(u'Active view không có tỷ lệ hợp lệ để tính khoảng cách tag.')
-
     view_right = active_view.RightDirection
     view_up = active_view.UpDirection
     tag_side_left = options['tag_side'] == 'left'
@@ -962,288 +1023,267 @@ def get_cluster_layout(active_view, options, cluster):
     first_curve = cluster[0].Location.Curve
     direction_vector = first_curve.GetEndPoint(1) - first_curve.GetEndPoint(0)
     if direction_vector.GetLength() <= 0.000001:
-        raise Exception(u'Pipe trong cụm không có hướng hợp lệ.')
-    pipe_direction = direction_vector.Normalize()
+        raise Exception(u'Đối tượng trong cụm không có hướng hợp lệ.')
+    direction = direction_vector.Normalize()
 
-    if abs(pipe_direction.DotProduct(view_right)) > 0.707:
+    if abs(direction.DotProduct(view_right)) > 0.707:
         dir_perp = view_up
         dir_para = reverse_xyz(view_right) if tag_side_left else view_right
-        sorted_cluster = sorted(
-            cluster,
-            key=lambda p: p.Location.Curve.Evaluate(0.5, True).DotProduct(view_up)
-        )
+        sorted_cluster = sorted(cluster, key=lambda e: e.Location.Curve.Evaluate(0.5, True).DotProduct(view_up))
     else:
         dir_perp = reverse_xyz(view_right) if tag_side_left else view_right
         dir_para = view_up
-        sorted_cluster = sorted(
-            cluster,
-            key=lambda p: p.Location.Curve.Evaluate(0.5, True).DotProduct(view_right)
-        )
+        sorted_cluster = sorted(cluster, key=lambda e: e.Location.Curve.Evaluate(0.5, True).DotProduct(view_right))
 
-    first_offset_mm = 4.0
-    model_first_offset = mm_to_feet(first_offset_mm, view_scale)
+    model_first_offset = mm_to_feet(4.0, view_scale)
     model_spacing = mm_to_feet(options['spacing_mm'], view_scale)
     return sorted_cluster, dir_perp, dir_para, model_first_offset, model_spacing
 
 
-def get_target_tag_head(pipe, index, dir_perp, dir_para,
-                        model_first_offset, model_spacing):
-    mid_point = pipe.Location.Curve.Evaluate(0.5, True)
-    vec_perp = dir_perp * model_first_offset
-    vec_para = dir_para * (index * model_spacing)
-    return mid_point + vec_perp + vec_para
+def get_linear_tag_head(elem, index, dir_perp, dir_para, model_first_offset, model_spacing):
+    mid_point = elem.Location.Curve.Evaluate(0.5, True)
+    return mid_point + dir_perp * model_first_offset + dir_para * (index * model_spacing)
 
 
-def create_pipe_tags(doc, active_view, options, clusters, tagged_dict):
-    tag_symbol = doc.GetElement(options['tag_type_id'])
-    if not tag_symbol:
-        raise Exception(u'Không tìm thấy loại Pipe Tag đã chọn trong model.')
+def get_device_tag_head(elem, active_view, options):
+    view_scale = active_view.Scale
+    if view_scale <= 0:
+        raise Exception(u'Active view không có tỷ lệ hợp lệ để tính khoảng cách tag.')
+    pt = get_element_point(elem)
+    if pt is None:
+        raise Exception(u'Không xác định được vị trí thiết bị.')
+    view_right = active_view.RightDirection
+    side = reverse_xyz(view_right) if options['tag_side'] == 'left' else view_right
+    return pt + side * mm_to_feet(options['device_offset_mm'], view_scale)
 
-    tag_all_pipes = options['tag_condition'] == 'all'
-    success_count = 0
+
+def build_tag_jobs(active_view, options, clusters, devices):
+    """Danh sách (element, kind, head_pos) dùng chung cho Create / Align / Normalize."""
+    jobs = []
+    skipped = 0
+    for cluster in clusters:
+        if not cluster:
+            continue
+        try:
+            sorted_cluster, dir_perp, dir_para, first_off, spacing = \
+                get_cluster_layout(active_view, options, cluster)
+        except Exception as ex:
+            skipped += len(cluster)
+            log(u'Lỗi xử lý cụm: {}'.format(ensure_unicode(ex)))
+            continue
+        for index, elem in enumerate(sorted_cluster):
+            try:
+                head = get_linear_tag_head(elem, index, dir_perp, dir_para, first_off, spacing)
+                jobs.append((elem, get_element_kind(elem), head))
+            except Exception as ex:
+                skipped += 1
+                log(u'Lỗi tính vị trí tag ID {}: {}'.format(elem.Id, ensure_unicode(ex)))
+    for elem in devices:
+        try:
+            jobs.append((elem, get_element_kind(elem), get_device_tag_head(elem, active_view, options)))
+        except Exception as ex:
+            skipped += 1
+            log(u'Lỗi tính vị trí tag thiết bị ID {}: {}'.format(elem.Id, ensure_unicode(ex)))
+    return jobs, skipped
+
+
+def kind_wants_leader(kind, options):
+    if KIND_INFO[kind]['linear']:
+        return True
+    return bool(options.get('device_leader', False))
+
+
+def apply_leader(tag, want_leader):
+    try:
+        tag.HasLeader = want_leader
+    except:
+        pass
+    if want_leader:
+        try:
+            tag.LeaderEndCondition = LeaderEndCondition.Attached
+        except:
+            pass
+
+
+def get_tag_symbols(doc, options, kinds_needed):
+    symbols = {}
+    for kind in kinds_needed:
+        type_id = options['tag_type_ids'].get(kind)
+        sym = doc.GetElement(type_id) if type_id else None
+        if not sym:
+            raise Exception(u'Không tìm thấy Tag Type đã chọn cho {}.'.format(KIND_INFO[kind]['label']))
+        symbols[kind] = sym
+    return symbols
+
+
+def activate_symbols(doc, symbols):
+    changed = False
+    for sym in symbols.values():
+        if not sym.IsActive:
+            sym.Activate()
+            changed = True
+    if changed:
+        doc.Regenerate()
+
+
+def new_counter():
+    return dict((k, 0) for k in KIND_ORDER)
+
+
+def create_tags(doc, active_view, options, jobs, tagged_dict):
+    kinds_needed = sorted(set([j[1] for j in jobs]))
+    symbols = get_tag_symbols(doc, options, kinds_needed)
+    tag_all = options['tag_condition'] == 'all'
+
+    created = new_counter()
     deleted_count = 0
     skipped_count = 0
-    deleted_tag_keys = set()
+    deleted_keys = set()
 
-    with revit.Transaction('Tag Pipes Pro - Create'):
-        if not tag_symbol.IsActive:
-            tag_symbol.Activate()
-            doc.Regenerate()
-
-        for cluster in clusters:
-            if not cluster:
-                continue
-
+    with revit.Transaction('Tag MEP Pro - Create'):
+        activate_symbols(doc, symbols)
+        for elem, kind, head_pos in jobs:
             try:
-                sorted_cluster, dir_perp, dir_para, model_first_offset, model_spacing = \
-                    get_cluster_layout(active_view, options, cluster)
-            except Exception as ex:
-                skipped_count += len(cluster)
+                eid = get_id_value(elem.Id)
+                if tag_all and eid in tagged_dict:
+                    for old_tag_id in tagged_dict[eid]:
+                        key = get_id_value(old_tag_id)
+                        if key in deleted_keys:
+                            continue
+                        try:
+                            doc.Delete(old_tag_id)
+                            deleted_keys.add(key)
+                            deleted_count += 1
+                        except:
+                            pass
+
+                want_leader = kind_wants_leader(kind, options)
+                new_tag = IndependentTag.Create(
+                    doc,
+                    symbols[kind].Id,
+                    active_view.Id,
+                    Reference(elem),
+                    want_leader,
+                    TagOrientation.Horizontal,
+                    head_pos)
+                apply_leader(new_tag, want_leader)
+                # Đảm bảo TagHead đúng vị trí tính toán (thiết bị không leader).
                 try:
-                    print(ensure_unicode(u'Lỗi xử lý cụm Pipe: {}'.format(ensure_unicode(ex))))
+                    new_tag.TagHeadPosition = head_pos
                 except:
                     pass
-                continue
+                created[kind] += 1
+            except Exception as ex:
+                skipped_count += 1
+                log(u'Lỗi tại {} ID {}: {}'.format(KIND_INFO[kind]['label'], elem.Id, ensure_unicode(ex)))
 
-            for index, pipe in enumerate(sorted_cluster):
-                try:
-                    pipe_id_value = get_id_value(pipe.Id)
-
-                    if tag_all_pipes and pipe_id_value in tagged_dict:
-                        for old_tag_id in tagged_dict[pipe_id_value]:
-                            old_tag_key = get_id_value(old_tag_id)
-                            if old_tag_key in deleted_tag_keys:
-                                continue
-                            try:
-                                doc.Delete(old_tag_id)
-                                deleted_tag_keys.add(old_tag_key)
-                                deleted_count += 1
-                            except:
-                                pass
-
-                    head_pos = get_target_tag_head(
-                        pipe, index, dir_perp, dir_para,
-                        model_first_offset, model_spacing
-                    )
-
-                    new_tag = IndependentTag.Create(
-                        doc,
-                        tag_symbol.Id,
-                        active_view.Id,
-                        Reference(pipe),
-                        False,
-                        TagOrientation.Horizontal,
-                        head_pos
-                    )
-
-                    # Giữ nguyên logic leader của bản gốc cho tag mới.
-                    try:
-                        new_tag.HasLeader = True
-                    except:
-                        pass
-                    try:
-                        new_tag.LeaderEndCondition = LeaderEndCondition.Attached
-                    except:
-                        pass
-
-                    success_count += 1
-
-                except Exception as ex:
-                    skipped_count += 1
-                    try:
-                        print(ensure_unicode(u'Lỗi tại Pipe ID {}: {}'.format(pipe.Id, ensure_unicode(ex))))
-                    except:
-                        pass
-
-    return {
-        'created': success_count,
-        'deleted': deleted_count,
-        'aligned': 0,
-        'type_changed': 0,
-        'skipped': skipped_count,
-        'duplicate_tags': 0
-    }
+    return {'created': created, 'deleted': deleted_count, 'aligned': new_counter(),
+            'type_changed': 0, 'skipped': skipped_count, 'duplicate_tags': 0}
 
 
-def process_existing_pipe_tags(doc, active_view, options, clusters, tagged_dict,
-                               change_type=False):
-    """Align tag hiện có, hoặc đổi type + đưa về đúng cấu hình.
+def process_existing_tags(doc, active_view, options, jobs, tagged_dict, change_type=False):
+    """Align hoặc Đổi Type + Align tag hiện có. Không xóa/tạo lại tag."""
+    symbols = {}
+    if change_type:
+        kinds_needed = sorted(set([j[1] for j in jobs]))
+        symbols = get_tag_symbols(doc, options, kinds_needed)
 
-    Không xóa/recreate tag. Vì vậy ElementId và host reference của tag được giữ nguyên.
-    Nếu một Pipe có nhiều Pipe Tag trong active view, tất cả tag đó đều được xử lý;
-    chúng sẽ cùng nhận vị trí chuẩn của Pipe và được báo trong summary là duplicate.
-    """
-    tag_symbol = doc.GetElement(options['tag_type_id']) if change_type else None
-    if change_type and not tag_symbol:
-        raise Exception(u'Không tìm thấy loại Pipe Tag đã chọn trong model.')
-
-    aligned_count = 0
+    aligned = new_counter()
     type_changed_count = 0
     skipped_count = 0
     duplicate_tags = 0
 
-    transaction_name = 'Tag Pipes Pro - Normalize' if change_type else 'Tag Pipes Pro - Align'
-    with revit.Transaction(transaction_name):
-        if change_type and not tag_symbol.IsActive:
-            tag_symbol.Activate()
-            doc.Regenerate()
-
-        for cluster in clusters:
-            if not cluster:
+    name = 'Tag MEP Pro - Normalize' if change_type else 'Tag MEP Pro - Align'
+    with revit.Transaction(name):
+        if change_type:
+            activate_symbols(doc, symbols)
+        for elem, kind, head_pos in jobs:
+            tag_ids = list(tagged_dict.get(get_id_value(elem.Id), []))
+            if not tag_ids:
                 continue
-
-            try:
-                sorted_cluster, dir_perp, dir_para, model_first_offset, model_spacing = \
-                    get_cluster_layout(active_view, options, cluster)
-            except Exception as ex:
-                skipped_count += len(cluster)
+            if len(tag_ids) > 1:
+                duplicate_tags += len(tag_ids) - 1
+            for tag_id in tag_ids:
+                subtrans = None
+                type_changed_this = False
                 try:
-                    print(ensure_unicode(u'Lỗi xử lý cụm Pipe: {}'.format(ensure_unicode(ex))))
-                except:
-                    pass
-                continue
-
-            for index, pipe in enumerate(sorted_cluster):
-                pipe_id_value = get_id_value(pipe.Id)
-                tag_ids = list(tagged_dict.get(pipe_id_value, []))
-                if not tag_ids:
-                    continue
-                if len(tag_ids) > 1:
-                    duplicate_tags += len(tag_ids) - 1
-
-                head_pos = get_target_tag_head(
-                    pipe, index, dir_perp, dir_para,
-                    model_first_offset, model_spacing
-                )
-
-                for tag_id in tag_ids:
-                    subtrans = None
-                    type_changed_this_tag = False
-                    try:
-                        tag = doc.GetElement(tag_id)
-                        if not tag or not isinstance(tag, IndependentTag):
-                            skipped_count += 1
-                            continue
-
-                        # Normalize dùng SubTransaction riêng cho từng tag để tránh
-                        # trạng thái nửa chừng: đổi Type thành công nhưng align thất bại.
-                        if change_type:
-                            subtrans = SubTransaction(doc)
-                            subtrans.Start()
-
-                            try:
-                                if get_id_value(tag.GetTypeId()) != get_id_value(tag_symbol.Id):
-                                    tag.ChangeTypeId(tag_symbol.Id)
-                                    type_changed_this_tag = True
-                            except Exception as type_ex:
-                                raise Exception(u'Không đổi được Tag Type: {}'.format(ensure_unicode(type_ex)))
-
-                            # Normalize = type + orientation + leader + vị trí.
-                            # Các thuộc tính presentation được áp dụng best-effort vì
-                            # một số family/tag state có thể không cho set trực tiếp.
-                            try:
-                                tag.TagOrientation = TagOrientation.Horizontal
-                            except:
-                                pass
-                            try:
-                                tag.HasLeader = True
-                            except:
-                                pass
-                            try:
-                                tag.LeaderEndCondition = LeaderEndCondition.Attached
-                            except:
-                                pass
-
-                        # Align mode chỉ đổi vị trí; không tự ý đổi type/leader/orientation.
-                        tag.TagHeadPosition = head_pos
-
-                        if subtrans:
-                            subtrans.Commit()
-                        aligned_count += 1
-                        if type_changed_this_tag:
-                            type_changed_count += 1
-
-                    except Exception as ex:
-                        if subtrans:
-                            try:
-                                subtrans.RollBack()
-                            except:
-                                pass
+                    tag = doc.GetElement(tag_id)
+                    if not tag or not isinstance(tag, IndependentTag):
                         skipped_count += 1
+                        continue
+                    if change_type:
+                        subtrans = SubTransaction(doc)
+                        subtrans.Start()
+                        sym = symbols[kind]
+                        if get_id_value(tag.GetTypeId()) != get_id_value(sym.Id):
+                            tag.ChangeTypeId(sym.Id)
+                            type_changed_this = True
                         try:
-                            print(ensure_unicode(
-                                u'Lỗi xử lý Tag ID {} của Pipe ID {}: {}'.format(
-                                    tag_id, pipe.Id, ensure_unicode(ex)
-                                )
-                            ))
+                            tag.TagOrientation = TagOrientation.Horizontal
                         except:
                             pass
+                        apply_leader(tag, kind_wants_leader(kind, options))
+                    tag.TagHeadPosition = head_pos
+                    if subtrans:
+                        subtrans.Commit()
+                    aligned[kind] += 1
+                    if type_changed_this:
+                        type_changed_count += 1
+                except Exception as ex:
+                    if subtrans:
+                        try:
+                            subtrans.RollBack()
+                        except:
+                            pass
+                    skipped_count += 1
+                    log(u'Lỗi xử lý Tag ID {} của {} ID {}: {}'.format(
+                        tag_id, KIND_INFO[kind]['label'], elem.Id, ensure_unicode(ex)))
 
-    return {
-        'created': 0,
-        'deleted': 0,
-        'aligned': aligned_count,
-        'type_changed': type_changed_count,
-        'skipped': skipped_count,
-        'duplicate_tags': duplicate_tags
-    }
+    return {'created': new_counter(), 'deleted': 0, 'aligned': aligned,
+            'type_changed': type_changed_count, 'skipped': skipped_count,
+            'duplicate_tags': duplicate_tags}
+
+
+def format_breakdown(counter):
+    parts = [u'{}: {}'.format(KIND_INFO[k]['label'], counter[k]) for k in KIND_ORDER if counter.get(k)]
+    return u' ({})'.format(u', '.join(parts)) if parts else u''
 
 
 def show_result(options, result, view_range_skipped, used_preselection):
     lines = []
-    operation_mode = options.get('operation_mode', 'create')
-
-    if operation_mode == 'create':
+    mode = options.get('operation_mode', 'create')
+    if mode == 'create':
         if options['tag_condition'] == 'all' and result['deleted'] > 0:
             lines.append(u'Đã xóa {} tag cũ.'.format(result['deleted']))
-        lines.append(u'Đã tạo mới {} tag xếp bậc.'.format(result['created']))
-    elif operation_mode == 'align':
-        lines.append(u'Đã align {} tag hiện có.'.format(result['aligned']))
+        total = sum(result['created'].values())
+        lines.append(u'Đã tạo mới {} tag{}.'.format(total, format_breakdown(result['created'])))
+    elif mode == 'align':
+        total = sum(result['aligned'].values())
+        lines.append(u'Đã align {} tag hiện có{}.'.format(total, format_breakdown(result['aligned'])))
         lines.append(u'Không đổi Tag Type, leader hoặc orientation.')
     else:
-        lines.append(u'Đã đưa {} tag hiện có về vị trí cấu hình.'.format(result['aligned']))
+        total = sum(result['aligned'].values())
+        lines.append(u'Đã đưa {} tag về vị trí cấu hình{}.'.format(total, format_breakdown(result['aligned'])))
         lines.append(u'Đã đổi type cho {} tag.'.format(result['type_changed']))
-        lines.append(u'Đã áp dụng Horizontal + Leader Attached cho tag được xử lý.')
-
+        lines.append(u'Đã áp dụng Horizontal + Leader theo cấu hình.')
     if result['duplicate_tags'] > 0:
-        lines.append(u'Phát hiện {} tag bổ sung trên các Pipe có nhiều tag; các tag này cũng được xử lý.'.format(result['duplicate_tags']))
+        lines.append(u'Phát hiện {} tag bổ sung trên các đối tượng có nhiều tag; các tag này cũng được xử lý.'.format(result['duplicate_tags']))
     if result['skipped'] > 0:
-        lines.append(u'Bỏ qua {} tag/Pipe do lỗi khi xử lý.'.format(result['skipped']))
+        lines.append(u'Bỏ qua {} tag/đối tượng do lỗi (xem cửa sổ pyRevit).'.format(result['skipped']))
     if view_range_skipped > 0:
-        lines.append(u'Bỏ qua {} Pipe nằm ngoài View Range.'.format(view_range_skipped))
+        lines.append(u'Bỏ qua {} đối tượng nằm ngoài View Range.'.format(view_range_skipped))
     if used_preselection:
-        lines.append(u'Đã dùng trực tiếp các Pipe được chọn trước khi mở lệnh.')
-
+        lines.append(u'Đã dùng trực tiếp các đối tượng được chọn trước khi mở lệnh.')
     toast_msg(u'\n'.join(lines))
+
 
 def run_tool():
     doc = revit.doc
     uidoc = revit.uidoc
     active_view = doc.ActiveView
 
-    win = TagParallelPipesWPF(xaml_file)
+    win = TagMEPWPF(xaml_file)
     win.show_dialog()
-
     options = win.result
     if not options:
         return
@@ -1253,68 +1293,48 @@ def run_tool():
         return
 
     try:
-        raw_elements, used_preselection = collect_input_pipes(
-            doc,
-            uidoc,
-            active_view,
-            options,
-            view_range_bounds
-        )
+        raw_elements, used_preselection = collect_input_targets(
+            doc, uidoc, active_view, options, view_range_bounds)
     except OperationCanceledException:
         return
 
+    label = kinds_label(options['kinds'])
     if not raw_elements:
-        alert_msg(u'Không có Pipe nào trong phạm vi xử lý.')
+        alert_msg(u'Không có {} nào trong phạm vi xử lý.'.format(label))
         return
 
     try:
-        tagged_dict = get_tagged_pipe_dict(doc, active_view)
-        pipes_to_process, view_range_skipped = filter_pipes(
-            raw_elements,
-            options,
-            view_range_bounds,
-            tagged_dict
-        )
+        tagged_dict = get_tagged_dict(doc, active_view, options['kinds'])
+        linear_elements, devices, view_range_skipped = filter_targets(
+            raw_elements, options, view_range_bounds, tagged_dict)
 
-        if not pipes_to_process:
-            operation_mode = options.get('operation_mode', 'create')
-            if operation_mode in ('align', 'normalize'):
-                alert_msg(u'Không tìm thấy Pipe đã có Pipe Tag trong active view và thỏa mãn các điều kiện lọc.')
+        if not linear_elements and not devices:
+            mode = options.get('operation_mode', 'create')
+            if mode in ('align', 'normalize'):
+                alert_msg(u'Không tìm thấy {} đã có tag trong active view và thỏa mãn các điều kiện lọc.'.format(label))
             elif view_range_bounds and view_range_skipped > 0:
-                alert_msg(u'Không tìm thấy Pipe nào thỏa mãn điều kiện lọc. Có {} Pipe bị bỏ qua vì nằm ngoài View Range.'.format(view_range_skipped))
+                alert_msg(u'Không có đối tượng thỏa mãn điều kiện lọc. {} đối tượng bị bỏ qua vì nằm ngoài View Range.'.format(view_range_skipped))
             else:
-                alert_msg(u'Không tìm thấy Pipe nào thỏa mãn các điều kiện lọc.')
+                alert_msg(u'Không tìm thấy {} nào thỏa mãn các điều kiện lọc.'.format(label))
             return
 
-        clusters = build_parallel_clusters(pipes_to_process)
-        operation_mode = options.get('operation_mode', 'create')
+        clusters = build_parallel_clusters(linear_elements)
+        jobs, layout_skipped = build_tag_jobs(active_view, options, clusters, devices)
 
-        if operation_mode == 'align':
-            result = process_existing_pipe_tags(
-                doc, active_view, options, clusters, tagged_dict, False
-            )
-        elif operation_mode == 'normalize':
-            result = process_existing_pipe_tags(
-                doc, active_view, options, clusters, tagged_dict, True
-            )
+        mode = options.get('operation_mode', 'create')
+        if mode == 'align':
+            result = process_existing_tags(doc, active_view, options, jobs, tagged_dict, False)
+        elif mode == 'normalize':
+            result = process_existing_tags(doc, active_view, options, jobs, tagged_dict, True)
         else:
-            result = create_pipe_tags(
-                doc, active_view, options, clusters, tagged_dict
-            )
+            result = create_tags(doc, active_view, options, jobs, tagged_dict)
 
-        show_result(
-            options,
-            result,
-            view_range_skipped,
-            used_preselection
-        )
+        result['skipped'] += layout_skipped
+        show_result(options, result, view_range_skipped, used_preselection)
 
     except Exception as ex:
         alert_msg(u'Lỗi hệ thống: {}'.format(ensure_unicode(ex)))
-        try:
-            print(traceback.format_exc())
-        except:
-            pass
+        log(traceback.format_exc())
 
 
 if __name__ == '__main__':

@@ -34,7 +34,7 @@ DEFAULT_AUTO_SCAN = False
 DEFAULT_CABINET_KEYWORDS = 'FHR; Fire Hose Reel; Hose Reel; Fire Cabinet; Tu Chua Chay'
 
 # Walking obstacle height band, relative to the active view level.
-ANALYSIS_BOTTOM_MM = 0.0
+ANALYSIS_BOTTOM_MM = 600.0
 ANALYSIS_TOP_MM = 2000.0
 
 # Cabinet source-point settings. The source point is calculated from the
