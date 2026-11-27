@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Pipe / Pipe Accessory / Pipe Fitting vs Linked Model Clash Checker
-Version 3.0 - Fire Rated Door target + Active View stability / saved-link safety + region + pipe direction + grouped clash
+Version 3.1 - Structural Floor target + Fire Rated Door target + Active View stability / saved-link safety + region + pipe direction + grouped clash
 
 HOST OBJECTS (independent checkboxes)
     - Pipes
@@ -14,6 +14,7 @@ LINKED TARGETS (independent checkboxes)
     - Rooms filtered by Room Name keywords
     - Structural Framing (beams / braces)
     - Structural Columns
+    - Floors (same Structure link as beams / columns)
     - Fire Rated Walls
     - Fire Rated Doors (Type Name keywords: Fire Rated / 2HR / HR ...)
 
@@ -22,7 +23,7 @@ WORKFLOW
     2. Reuse saved links OR pick Architecture link group
        (Rooms + Fire Rated Walls + Fire Rated Doors).
     3. Pick Structure link group
-       (Structural Framing + Structural Columns).
+       (Structural Framing + Structural Columns + Floors).
     4. UI opens: choose Entire Model / Active View / Pick Region in Active View.
     5. Optional Inspection Mode: choose one category, select + zoom it.
     6. If Inspection Mode is OFF, clash test runs normally.
@@ -472,7 +473,7 @@ def get_link_groups():
     )
 
     struct_links = pick_link_group(
-        u"BƯỚC 2/2 - Chọn Link STRUCTURE chứa BEAM + COLUMN. "
+        u"BƯỚC 2/2 - Chọn Link STRUCTURE chứa BEAM + COLUMN + FLOOR. "
         u"Có thể chọn nhiều Link, sau đó bấm Finish."
     )
 
@@ -496,7 +497,7 @@ def get_link_groups():
 
 # UI is stored separately in ui.xaml inside this pushbutton bundle.
 UI_XAML_PATH = script.get_bundle_file("ui.xaml")
-EXPECTED_UI_VERSION = u"3.0"
+EXPECTED_UI_VERSION = u"3.1"
 
 
 def validate_ui_bundle(window):
@@ -512,6 +513,7 @@ def validate_ui_bundle(window):
         "cb_pipe_vertical",
         "cb_pipe_horizontal",
         "cb_firedoor",
+        "cb_floor",
         "tb_door_keywords",
         "btn_run",
     ]
@@ -538,7 +540,7 @@ def validate_ui_bundle(window):
         script.exit()
 
     try:
-        window.tb_ui_version.Text = u"UI V{0} - Fire Rated Door ready".format(EXPECTED_UI_VERSION)
+        window.tb_ui_version.Text = u"UI V{0} - Structural Floor ready".format(EXPECTED_UI_VERSION)
     except Exception:
         pass
 
@@ -575,6 +577,7 @@ class OptionsWindow(forms.WPFWindow):
         self.cb_room.IsChecked = as_bool(getattr(config, "target_room", True), True)
         self.cb_beam.IsChecked = as_bool(getattr(config, "target_beam", True), True)
         self.cb_column.IsChecked = as_bool(getattr(config, "target_column", True), True)
+        self.cb_floor.IsChecked = as_bool(getattr(config, "target_floor", True), True)
         self.cb_firewall.IsChecked = as_bool(getattr(config, "target_firewall", True), True)
         self.cb_firedoor.IsChecked = as_bool(getattr(config, "target_firedoor", True), True)
         self.tb_door_keywords.Text = to_text(getattr(config, "door_keywords", DEFAULT_DOOR_KEYWORDS))
@@ -655,6 +658,7 @@ class OptionsWindow(forms.WPFWindow):
             self.cb_room.IsChecked and
             self.cb_beam.IsChecked and
             self.cb_column.IsChecked and
+            self.cb_floor.IsChecked and
             self.cb_firewall.IsChecked and
             self.cb_firedoor.IsChecked
         )
@@ -672,6 +676,7 @@ class OptionsWindow(forms.WPFWindow):
         self.cb_room.IsChecked = state
         self.cb_beam.IsChecked = state
         self.cb_column.IsChecked = state
+        self.cb_floor.IsChecked = state
         self.cb_firewall.IsChecked = state
         self.cb_firedoor.IsChecked = state
     def inspection_mode_changed(self, sender, args):
@@ -700,6 +705,7 @@ class OptionsWindow(forms.WPFWindow):
         target_room = bool(self.cb_room.IsChecked)
         target_beam = bool(self.cb_beam.IsChecked)
         target_column = bool(self.cb_column.IsChecked)
+        target_floor = bool(self.cb_floor.IsChecked)
         target_firewall = bool(self.cb_firewall.IsChecked)
         target_firedoor = bool(self.cb_firedoor.IsChecked)
         raw_keywords = to_text(self.tb_keywords.Text).strip()
@@ -727,7 +733,7 @@ class OptionsWindow(forms.WPFWindow):
                 forms.alert(u"Hãy chọn ít nhất 1 nhóm đối tượng MEP trong Host.", title="Linked Clash Checker")
                 return
 
-            if not (target_room or target_beam or target_column or target_firewall or target_firedoor):
+            if not (target_room or target_beam or target_column or target_floor or target_firewall or target_firedoor):
                 forms.alert(u"Hãy chọn ít nhất 1 nhóm đối tượng trong Link.", title="Linked Clash Checker")
                 return
 
@@ -756,6 +762,7 @@ class OptionsWindow(forms.WPFWindow):
             "target_room": target_room,
             "target_beam": target_beam,
             "target_column": target_column,
+            "target_floor": target_floor,
             "target_firewall": target_firewall,
             "target_firedoor": target_firedoor,
             "door_keywords": raw_door_keywords,
@@ -779,6 +786,7 @@ class OptionsWindow(forms.WPFWindow):
         config.target_room = target_room
         config.target_beam = target_beam
         config.target_column = target_column
+        config.target_floor = target_floor
         config.target_firewall = target_firewall
         config.target_firedoor = target_firedoor
         config.door_keywords = raw_door_keywords
@@ -1748,6 +1756,30 @@ def get_element_type_name(element, element_doc):
     return u""
 
 
+def get_floor_extra(floor, link_doc):
+    """V3.1: short info for a linked Floor (Level + thickness)."""
+    parts = []
+    try:
+        level = link_doc.GetElement(floor.LevelId)
+        if level is not None:
+            parts.append(u"Level: {0}".format(to_text(level.Name)))
+    except Exception:
+        pass
+    try:
+        p = floor.get_Parameter(DB.BuiltInParameter.FLOOR_ATTR_THICKNESS_PARAM)
+        if p is not None and p.HasValue:
+            parts.append(u"Thickness: {0:.0f} mm".format(p.AsDouble() * MM_PER_FOOT))
+    except Exception:
+        pass
+    try:
+        p = floor.get_Parameter(DB.BuiltInParameter.FLOOR_PARAM_IS_STRUCTURAL)
+        if p is not None and p.HasValue:
+            parts.append(u"Structural: {0}".format(u"Yes" if p.AsInteger() == 1 else u"No"))
+    except Exception:
+        pass
+    return u" | ".join(parts)
+
+
 def build_target_records(arch_links, struct_links, settings, warnings):
     records = []
     keywords = parse_keywords(settings["room_keywords"]) if settings["target_room"] else []
@@ -1859,7 +1891,7 @@ def build_target_records(arch_links, struct_links, settings, warnings):
                     "label": label,
                     "extra": extra
                 })
-    # STRUCTURE LINKS: Framing + Columns
+    # STRUCTURE LINKS: Framing + Columns + Floors (V3.1)
     for link in struct_links:
         link_doc = link.GetLinkDocument()
         if link_doc is None:
@@ -1873,6 +1905,8 @@ def build_target_records(arch_links, struct_links, settings, warnings):
             category_requests.append((u"Structural Framing", DB.BuiltInCategory.OST_StructuralFraming))
         if settings["target_column"]:
             category_requests.append((u"Structural Column", DB.BuiltInCategory.OST_StructuralColumns))
+        if settings.get("target_floor"):
+            category_requests.append((u"Floor", DB.BuiltInCategory.OST_Floors))
 
         for kind, bic in category_requests:
             elems = collect_link_category(
@@ -1885,6 +1919,7 @@ def build_target_records(arch_links, struct_links, settings, warnings):
 
             for elem in elems:
                 type_name = get_element_type_name(elem, link_doc)
+                extra = get_floor_extra(elem, link_doc) if kind == u"Floor" else u""
                 records.append({
                     "kind": kind,
                     "link": link,
@@ -1893,7 +1928,7 @@ def build_target_records(arch_links, struct_links, settings, warnings):
                     "element": elem,
                     "key": make_target_key(link, elem),
                     "label": u"{0} {1}".format(kind, type_name or element_id_text(elem)),
-                    "extra": u""
+                    "extra": extra
                 })
 
     return records
@@ -2078,6 +2113,7 @@ INSPECT_LABELS = {
     u"room": u"Room",
     u"beam": u"Structural Framing",
     u"column": u"Structural Column",
+    u"floor": u"Floor",
     u"firewall": u"Fire Rated Wall",
     u"firedoor": u"Fire Rated Door"
 }
@@ -2156,6 +2192,10 @@ def inspect_linked_category(category_key, arch_links, struct_links, settings, wa
         bic = DB.BuiltInCategory.OST_StructuralColumns
         keywords = []
         kind = u"Structural Column"
+    elif category_key == u"floor":
+        bic = DB.BuiltInCategory.OST_Floors
+        keywords = []
+        kind = u"Floor"
     else:
         return []
 
@@ -2196,7 +2236,7 @@ def inspect_linked_category(category_key, arch_links, struct_links, settings, wa
             else:
                 type_name = get_element_type_name(elem, link_doc)
                 label = u"{0} {1}".format(kind, type_name or element_id_text(elem))
-                extra = u""
+                extra = get_floor_extra(elem, link_doc) if category_key == u"floor" else u""
 
             records.append({
                 "host": False,
@@ -2427,7 +2467,7 @@ def select_linked_records(records, warnings):
 
 def print_inspect_results(settings, category_key, records, warnings):
     label = INSPECT_LABELS.get(category_key, category_key)
-    output.print_md(u"# INSPECTION MODE - LINKED CLASH CHECKER V3.0")
+    output.print_md(u"# INSPECTION MODE - LINKED CLASH CHECKER V3.1")
     print(u"Scope: {0}".format(scope_label(settings)))
     if is_region_scope(settings) and category_key in (u"pipe", u"accessory", u"fitting"):
         print(u"Host MEP trong vùng đã chọn: {0}".format(settings.get("_region_host_count", 0)))
@@ -2531,6 +2571,7 @@ CLASH_HEADER_ORDER = [
     u"Room",
     u"Structural Framing",
     u"Structural Column",
+    u"Floor",
     u"Fire Rated Wall",
     u"Fire Rated Door"
 ]
@@ -2544,6 +2585,8 @@ def enabled_clash_headers(settings):
         values.append(u"Structural Framing")
     if settings.get("target_column"):
         values.append(u"Structural Column")
+    if settings.get("target_floor"):
+        values.append(u"Floor")
     if settings.get("target_firewall"):
         values.append(u"Fire Rated Wall")
     if settings.get("target_firedoor"):
@@ -2599,6 +2642,8 @@ def selected_target_labels(settings):
         values.append(u"Structural Framing")
     if settings["target_column"]:
         values.append(u"Structural Column")
+    if settings.get("target_floor"):
+        values.append(u"Floor (Structure Link)")
     if settings["target_firewall"]:
         values.append(u"Fire Rated Wall")
     if settings.get("target_firedoor"):
@@ -2607,7 +2652,7 @@ def selected_target_labels(settings):
 
 
 def print_results(arch_links, struct_links, settings, clash_results, target_stats, room_ext_stats, warnings):
-    output.print_md(u"# LINKED CLASH CHECKER V3.0")
+    output.print_md(u"# LINKED CLASH CHECKER V3.1")
 
     output.print_md(u"## Thiết lập")
     print(u"Scope: {0}".format(scope_label(settings)))
@@ -2777,7 +2822,7 @@ def main():
             )
             script.exit()
 
-        if category_key in (u"beam", u"column") and not struct_links:
+        if category_key in (u"beam", u"column", u"floor") and not struct_links:
             forms.alert(
                 u"Inspect {0} không có Structure Link hợp lệ trong scope hiện tại.\n\n"
                 u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "
@@ -2810,7 +2855,7 @@ def main():
         )
         script.exit()
 
-    if (settings["target_beam"] or settings["target_column"]) and not struct_links:
+    if (settings["target_beam"] or settings["target_column"] or settings.get("target_floor")) and not struct_links:
         forms.alert(
             u"Không có Structure Link hợp lệ trong scope hiện tại.\n\n"
             u"Nếu đang dùng Active View/Region: Link đã lưu có thể không hiển thị trong view này. "

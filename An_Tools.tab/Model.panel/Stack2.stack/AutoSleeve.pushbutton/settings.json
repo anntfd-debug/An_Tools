@@ -1,43 +1,47 @@
 {
+  "scan_wall": false, 
+  "root_link_ids": [
+    13713064
+  ], 
   "scan_floor": true, 
   "replace_mode": false, 
   "mapping": [
     {
       "size": "110", 
-      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_160mm"
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_130mm"
     }, 
     {
       "size": "160", 
-      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_210mm"
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_180mm"
     }, 
     {
       "size": "125", 
-      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_170mm"
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_140mm"
     }, 
     {
       "size": "150", 
-      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_190mm"
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_170mm"
     }, 
     {
       "size": "50", 
-      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_100mm"
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_70mm"
     }, 
     {
-      "size": "63", 
+      "size": "75", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_90mm"
+    }, 
+    {
+      "size": "90", 
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_110mm"
+    }, 
+    {
+      "size": "100", 
       "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_120mm"
     }, 
     {
       "size": "315", 
-      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_365mm"
-    }, 
-    {
-      "size": "75", 
-      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_120mm"
+      "type": "GEN_PENO_Circular_Castin : Peno_Hyd_Cast_330mm"
     }
   ], 
-  "scan_beam": true, 
-  "root_link_ids": [
-    13713061
-  ], 
-  "scan_wall": true
+  "scan_beam": true
 }

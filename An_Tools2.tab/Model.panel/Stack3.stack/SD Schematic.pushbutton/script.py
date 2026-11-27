@@ -30,6 +30,21 @@ Main pipe:
   - 45 deg joins: every horizontal branch bends 45 deg down into its riser,
     and every riser bends 45 deg into the horizontal main (size = "45° join").
 
+Branch order (same network):
+  - Branches are laid out in flow order: the branch at the END of the run
+    (farthest from the outlet) is pushed to the LEFT, then each next branch
+    closer to the outlet, the outlet / stack on the right.
+Custom label:
+  - Column "Schematic Name" in the mapping table: text typed there is used as
+    the label of that family type in the schematic (empty = Type Mark / Type Name).
+
+Change log:
+  - Every run saves a log of all Element IDs in scope (type, size, system,
+    level, location, physical connections) per model + schematic name:
+    %APPDATA%/pyRevit/DrainageSchematic/logs/<model>/<schematic>/
+  - "Mark changes vs previous run": compares with the previous log and circles
+    (or revision-clouds) the changed positions: NEW / MOD / DEL.
+
 Compatible: Revit 2019 - 2026, pyRevit (IronPython engine).
 UI: ui.xaml (WPF) in the same bundle folder.
 """
@@ -60,6 +75,7 @@ from System.Windows.Controls import DataGridEditingUnit
 from Autodesk.Revit import DB
 from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
 import Autodesk.Revit.Exceptions as RvtExc
+from Autodesk.Revit.DB.ExtensibleStorage import SchemaBuilder, Schema, Entity, AccessLevel
 
 from pyrevit import revit, forms, script
 
@@ -86,6 +102,8 @@ MAIN_H_AUTO = "Horizontal main + risers (auto)"
 MAIN_H_PICK = "Horizontal main + risers (pick reference pipe)"
 MAIN_V = "Vertical stack (all branches to stack)"
 ROOT_AUTO = "Auto (lowest open end)"
+HZ_AVG = "Average"
+HZ_LOW = "Lowest point (outlet end)"
 ROOT_PICK = "Pick outlet element(s)"
 LABEL_NAME = "System Name"
 LABEL_ABBR = "System Abbreviation"
@@ -96,6 +114,11 @@ CLS_PRIORITY = {"Sanitary": 0, "Vent": 1, "OtherPipe": 2}
 DRAIN_CLS = ("Sanitary", "Vent", "OtherPipe")
 CLS_COLOR = {"Sanitary": (153, 76, 0), "Vent": (255, 128, 0), "OtherPipe": (0, 160, 0)}
 DEFAULT_COLOR = (0, 112, 192)
+
+MARK_CIRCLE = "Circle (detail lines, red)"
+MARK_CLOUD = "Revision cloud (latest un-issued revision)"
+MARK_STYLE_NAME = "SCH_CHANGE"
+MARK_COLOR = (255, 0, 0)
 
 DEFAULTS = {
     "view_mode": VIEW_NEW,
@@ -131,7 +154,8 @@ DEFAULTS = {
     "stack_gap_mm": 25.0,
     "symbol_offset_mm": 0.0,
     "branch_offset_mm": 5.0,
-    "label_offset_mm": 6.0,
+    "label_offset_mm": 6.0,      # fallback (symbol extent unknown): label above insertion point
+    "label_gap_mm": 1.5,         # paper mm between TOP of symbol graphics and bottom of label
     "level_text_width_mm": 45.0,
     "level_line_style": "",
     "text_type": "",
@@ -143,12 +167,31 @@ DEFAULTS = {
     "skip_nested": True,
     "riser_abbr": ["VP", "SV", "V", "VENT", "AAV"],
     "checked_systems": [],
+    "mark_changes": False,
+    "mark_style": MARK_CIRCLE,
+    "mark_radius_mm": 6.0,       # paper mm
+    "move_tol_mm": 20.0,         # model mm - smaller movements are ignored
+    "log_keep": 20,              # number of history logs kept per schematic
+    "fwg_names": "FWG, FW",      # Schematic Name of floor wastes: inlet pipe drawn below level
+    "fwg_drop_mm": 3.0,          # paper mm below the level line
+    "fwg_single_side": "Left",   # single inlet into FWG / FW: Left / Right / Center
+    "fwg_45": True,              # 45 deg segment into FWG / FW
+    "fwg_45_mm": 2.5,            # paper mm, size of that 45 deg segment
+    "no_cross": True,            # sub-stacks ordered by junction height -> no crossing
+    "auto_lsp": True,            # expand level spacing so branches stay between 2 levels
+    "hmain_above_mm": 8.0,       # paper mm min. gap between the main and the level line BELOW it
+    "lvl_free_mm": 15.0,         # paper mm kept free above a level (symbols + labels)
+    "hmain_gap_mm": 6.0,         # paper mm between lowest branch of upper level and the main
+    "hmain_real_z": True,        # horizontal main drawn at its REAL elevation (interpolated)
+    "hmain_z_mode": "Average",   # Average of main pipes / Lowest point (outlet end)
+    "hmain_clear_mm": 3.0,       # paper mm min. clearance between main and a level line
 }
 
 SETTINGS_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
                             "pyRevit", "DrainageSchematic")
 SETTINGS_FILE = os.path.join(SETTINGS_DIR, "settings.json")
 XAML_FILE = os.path.join(os.path.dirname(__file__), "ui.xaml")
+LOG_ROOT = os.path.join(SETTINGS_DIR, "logs")
 
 
 def load_settings():
@@ -159,7 +202,7 @@ def load_settings():
                 data = json.load(f)
         except Exception:
             data = {}
-    for k in ("params", "mapping", "generated"):
+    for k in ("params", "mapping", "generated", "labels"):
         if not isinstance(data.get(k), dict):
             data[k] = {}
     if not isinstance(data.get("extras"), list):
@@ -830,23 +873,32 @@ def find_root(net, comp, KIND, picked):
     return (min(cands)[1], None) if cands else (None, None)
 
 
+VENT_COST_MULT = 25.0     # path cost multiplier for vent pipework (tree building)
+VENT_COST_ADD = 3.0       # + fixed cost (ft) per vent element
+
+
 class Tree(object):
     """Shortest-path tree from the outlet."""
 
-    def __init__(self, net, root, root_pt, KIND, STK, TOPZ):
+    def __init__(self, net, root, root_pt, KIND, STK, TOPZ, vent_k=None):
         self.net = net
         self.KIND = KIND
         self.root = root
         self.is_item = lambda k: False
+        # path choice uses a COST where vent pipework is heavily penalised, so a
+        # fixture / branch is always reached through the drainage pipe it really
+        # discharges to, never "backwards" through a vent loop. dist stays geometric.
+        cost = {root: 0.0}
         dist, parent, depth = {root: 0.0}, {root: None}, {root: 0}
         entry, exitp = {root: root_pt}, {root: None}
         ecls = {root: None}
         done, done_set = [], set()
         heap = [(0.0, 0, root)]
         while heap:
-            d, _dp, k = heapq.heappop(heap)
+            ck, _dp, k = heapq.heappop(heap)
             if k in done_set:
                 continue
+            d = dist[k]
             done_set.add(k)
             done.append(k)
             ein = entry[k]
@@ -857,15 +909,22 @@ class Tree(object):
                 if gate and cm is not None and cm != ecls[k]:
                     continue
                 w = mine.DistanceTo(ein) if ein is not None else 0.0
-                nd = d + w
-                if j not in dist or nd < dist[j] - 1e-9:
-                    dist[j] = nd
+                vent_edge = ct == "Vent" or cm == "Vent"
+                if not vent_edge and vent_k is not None:
+                    try:
+                        vent_edge = bool(vent_k(j))
+                    except Exception:
+                        vent_edge = False
+                nc = ck + (w * VENT_COST_MULT + VENT_COST_ADD if vent_edge else w)
+                if j not in cost or nc < cost[j] - 1e-9:
+                    cost[j] = nc
+                    dist[j] = d + w
                     parent[j] = k
                     entry[j] = theirs
                     exitp[j] = mine
                     ecls[j] = ct
                     depth[j] = depth[k] + 1
-                    heapq.heappush(heap, (nd, depth[j], j))
+                    heapq.heappush(heap, (nc, depth[j], j))
         self.nodes = done
         self.dist, self.parent, self.entry, self.exitp = dist, parent, entry, exitp
         self.children = dict((k, []) for k in done)
@@ -910,8 +969,10 @@ class Tree(object):
         return din.DotProduct(dout) <= RUN_DOT
 
     def ordered_children(self, k):
+        # drawn right -> left: shorter side branches near the junction,
+        # longer ones further left, straight run (end of line) left-most
         return sorted(self.children.get(k, []),
-                      key=lambda c: (self.is_run(k, c), self.maxd[c]))
+                      key=lambda c: (self.is_run(k, c), self.maxd[c], c))
 
     def main_path(self, rk):
         """VERTICAL mode: outlet -> stack (follow run, prefer stack)."""
@@ -971,6 +1032,7 @@ class SNode(object):
     def __init__(self, kind, k=None, children=None):
         self.kind = kind
         self.k = k
+        self.ks = [k] if k is not None else []     # element ids drawn by this node
         self.children = children or []
         self.key = ""
         self.label = ""
@@ -1015,6 +1077,7 @@ def combine_nodes(nodes):
         if (out and n.kind == "item" and not n.children and out[-1].kind == "item"
                 and not out[-1].children and out[-1].key == n.key):
             out[-1].count += n.count
+            out[-1].ks.extend(n.ks)
         else:
             out.append(n)
     return out
@@ -1043,7 +1106,10 @@ def edge_sid(ctx, k, sid_in):
 
 
 def trans_marker(ctx, k, sid_from, sid_to, body):
-    if not ctx.show_trans or sid_to is None or sid_from is None or sid_to == sid_from:
+    if sid_to is None or sid_from is None or sid_to == sid_from:
+        return []
+    # option OFF: hide system-change markers, but ALWAYS keep vent risers
+    if not ctx.show_trans and not ctx.is_vent(sid_to):
         return []
     n = SNode("conn", k)
     n.sid = sid_to
@@ -1102,6 +1168,8 @@ class Branch(object):
         self.no = 0
         self.y = 0.0
         self.sid = None
+        self.attach = None
+        self.ez = None          # real model Z of the junction (sub-stack joins)
 
 
 class Stack(object):
@@ -1124,6 +1192,8 @@ class Stack(object):
         self.risers = []
         self.y_main = 0.0
         self.x_out = 0.0
+        self.main = []
+        self.attach = None
 
 
 class Ctx(object):
@@ -1141,14 +1211,207 @@ def node_lids(nodes, ctx):
     return out
 
 
-def analyse(tree, rk, label, meta, ctx):
+# ----------------------------------------------------------------------------
+# LINK  drafting element  ->  model element IDs (Extensible Storage + log "draw")
+# ----------------------------------------------------------------------------
+LINK_SCHEMA_GUID = "6f1d2c9a-3b7e-4c51-9a2e-5d8b7c4e1a23"
+LINK_SCHEMA_NAME = "DrainageSchematicLink"
+LINK_FIELD = "ModelIds"
+TOPO_MAX = 3000
+
+
+class Topo(object):
+    """Parent pointers of all flow trees (toward the outlet) -> pipe runs per drawn line."""
+
+    def __init__(self):
+        self.parent = {}
+        self.nch = {}
+        self.items = set()
+        self.stop = set()        # main path / stack nodes
+        self.zl = {}             # element id -> level id of its mid-point
+
+    def add_tree(self, tree):
+        for k in tree.nodes:
+            self.parent[k] = tree.parent.get(k)
+            self.nch[k] = len(tree.children.get(k, []))
+
+    def _brk(self, k):
+        return k in self.items or k in self.stop or self.nch.get(k, 0) >= 2
+
+    def arm(self, k):
+        ids, cur, n = [], self.parent.get(k), 0
+        while cur is not None and n < TOPO_MAX:
+            n += 1
+            if self._brk(cur):
+                return ids, cur
+            ids.append(cur)
+            cur = self.parent.get(cur)
+        return ids, cur
+
+    def arms(self, ks):
+        ids, jn = [], None
+        for i, k in enumerate(ks or []):
+            a, j = self.arm(k)
+            if i == 0:
+                jn = j
+            for x in a:
+                if x not in ids:
+                    ids.append(x)
+        return ids, jn
+
+    def path_to(self, a, b):
+        ids, cur, n = [], self.parent.get(a), 0
+        while cur is not None and cur != b and n < TOPO_MAX:
+            n += 1
+            if cur in self.stop:
+                break
+            ids.append(cur)
+            cur = self.parent.get(cur)
+        return ids
+
+    def between(self, a, b):
+        if a is None:
+            return []
+        ids, cur, n = [], a, 0
+        while cur is not None and n < TOPO_MAX:
+            n += 1
+            if cur not in self.items:
+                ids.append(cur)
+            if cur == b or (cur in self.stop and cur != a):
+                break
+            if cur in self.stop and b is None:
+                break
+            cur = self.parent.get(cur)
+            if cur is not None and cur in self.items and cur != b:
+                break
+        return ids
+
+    def up_to_junction(self, a):
+        if a is None:
+            return [], None
+        ids = [] if a in self.items else [a]
+        cur, n = self.parent.get(a), 0
+        while cur is not None and n < TOPO_MAX:
+            n += 1
+            if self._brk(cur):
+                if cur not in self.items:
+                    ids.append(cur)
+                return ids, cur
+            ids.append(cur)
+            cur = self.parent.get(cur)
+        return ids, cur
+
+
+TOPO = Topo()
+_LINK_SCHEMA = [None]
+
+
+def link_schema():
+    if _LINK_SCHEMA[0] is not None:
+        return _LINK_SCHEMA[0]
+    guid = System.Guid(LINK_SCHEMA_GUID)
+    sch = Schema.Lookup(guid)
+    if sch is None:
+        sb = SchemaBuilder(guid)
+        sb.SetSchemaName(LINK_SCHEMA_NAME)
+        sb.SetReadAccessLevel(AccessLevel.Public)
+        sb.SetWriteAccessLevel(AccessLevel.Public)
+        sb.AddSimpleField(LINK_FIELD, clr.GetClrType(System.String))
+        sch = sb.Finish()
+    _LINK_SCHEMA[0] = sch
+    return sch
+
+
+def write_links(links, warn):
+    try:
+        sch = link_schema()
+        fld = sch.GetField(LINK_FIELD)
+    except Exception as ex:
+        warn.append(u"Cannot create link schema (" + str(ex) + u") - links only in log.")
+        return 0
+    n = 0
+    for eid, ids in links.items():
+        if not ids:
+            continue
+        el = doc.GetElement(to_eid(eid))
+        if el is None:
+            continue
+        try:
+            ent = Entity(sch)
+            ent.Set[System.String](fld, u";".join(str(i) for i in ids))
+            el.SetEntity(ent)
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def _node_sids(nodes, out):
+    for n in nodes:
+        if n.sid is not None:
+            out.append(n.sid)
+        _node_sids(n.children, out)
+    return out
+
+
+def drain_sid(ctx, sid, nodes=None, fallback=None):
+    """A pipe that carries fixture discharge is DRAINAGE: never return a vent system
+    when a drainage system is available (nodes of the branch, then fallback)."""
+    if sid is not None and not ctx.is_vent(sid):
+        return sid
+    if nodes:
+        has_item = any(n.kind == "item" for n in nodes) or bool(flat_items(nodes))
+        if has_item:
+            ds = [i for i in _node_sids(nodes, []) if not ctx.is_vent(i)]
+            if ds:
+                return max(set(ds), key=ds.count)
+            if fallback is not None and not ctx.is_vent(fallback):
+                return fallback
+    return sid
+
+
+def subtree_drain_sid(tree, rk, ctx):
+    """Most common drainage (non-vent) system in the sub-tree below rk."""
+    cnt, todo, seen = {}, [rk], set()
+    while todo:
+        k = todo.pop()
+        if k in seen:
+            continue
+        seen.add(k)
+        if ctx.kind.get(k) != "fix":
+            s0 = ctx.esys.get(k)
+            if s0 is not None and not ctx.is_vent(s0):
+                cnt[s0] = cnt.get(s0, 0) + 1
+        todo.extend(tree.children.get(k, []))
+    return max(cnt.keys(), key=lambda i: cnt[i]) if cnt else None
+
+
+def analyse(tree, rk, label, meta, ctx, sid_in=None):
     """VERTICAL stack: every tee on the main with item(s) on its side = 1 branch."""
     st = Stack(label, meta, "net")
     main = tree.main_path(rk)
+    st.main = list(main)
+    TOPO.stop.update(main)
     mset = set(main)
     subn = 0
     msids = [ctx.esys.get(t) for t in main if ctx.esys.get(t) is not None]
-    st.sid = max(set(msids), key=msids.count) if msids else ctx.default_sid
+    dsids = [i for i in msids if not ctx.is_vent(i)]      # drainage part of the stack
+    pick = dsids or msids
+    st.sid = max(set(pick), key=pick.count) if pick else ctx.default_sid
+    if st.sid is None or ctx.is_vent(st.sid):
+        # stack path runs (partly) through vent pipework but fixtures discharge into it:
+        # it is a DRAINAGE stack -> drainage system of its sub-tree, else of the parent
+        ds = subtree_drain_sid(tree, rk, ctx)
+        if ds is None and sid_in is not None and not ctx.is_vent(sid_in):
+            ds = sid_in
+        if ds is None and ctx.default_sid is not None and not ctx.is_vent(ctx.default_sid):
+            ds = ctx.default_sid
+        if ds is not None:
+            st.sid = ds
+    # stack continues upward as a vent (top element of the stack path is vent)
+    top_sid = next((ctx.esys.get(t) for t in reversed(main) if ctx.esys.get(t) is not None), None)
+    st.vent_top = top_sid is not None and ctx.is_vent(top_sid)
+    st.vent_sid = top_sid if st.vent_top else None
     cur = st.sid
     for t in main:
         prev = cur
@@ -1193,20 +1456,22 @@ def analyse(tree, rk, label, meta, ctx):
                      if ctx.item_level.get(x) is not None]
             ep = tree.entry[c]
             ez = ep.Z if ep is not None else 0.0
-            key = (tree.dist[t], tree.dist[c], ez)
+            key = (tree.dist[t], tree.maxd[c], ez)   # far from outlet -> left
             if tree.topv[c] is not None and len(set(ilids)) > 1:
                 subn += 1
-                sub = analyse(tree, c, label + u"." + str(subn), meta, ctx)
+                sub = analyse(tree, c, label + u"." + str(subn), meta, ctx, cur)
                 sub.is_root = False
                 br = Branch([], key, ctx.level_of_z(ez), sub)
-                br.sid = csid
+                br.ez = ez if ep is not None else None
+                br.sid = csid if (csid is not None and not ctx.is_vent(csid)) else sub.sid
                 st.branches.append(br)
             else:
                 if len(nodes) == 1 and nodes[0].kind == "grp":
                     nodes = nodes[0].children
                 pick = ilids or lids
                 br = Branch(nodes, key, max(set(pick), key=pick.count))
-                br.sid = cur if (nodes and nodes[0].kind == "conn" and nodes[0].switch) else csid
+                br.sid = drain_sid(ctx, cur if (nodes and nodes[0].kind == "conn" and nodes[0].switch)
+                               else csid, nodes, cur)
                 st.branches.append(br)
     st.branches.sort(key=lambda b: b.key)
     for i, b in enumerate(st.branches):
@@ -1224,12 +1489,23 @@ def analyse_h(tree, rk, label, meta, ctx, ref=None):
     if not any(ctx.kind.get(t) == "pipe" and t not in ctx.stk for t in main):
         return None
     hm = Stack(label, meta, "hmain")
+    hm.main = list(main)
+    TOPO.stop.update(main)
     mset = set(main)
     msids = [ctx.esys.get(t) for t in main if ctx.esys.get(t) is not None]
     hm.sid = max(set(msids), key=msids.count) if msids else ctx.default_sid
     zs = [ctx.zof(t) for t in main if ctx.kind.get(t) == "pipe" and ctx.zof(t) is not None]
     zs.sort()
     hm.lid = ctx.level_of_z(zs[len(zs) // 2]) if zs else ctx.level_of_k(rk)
+    # REAL elevation of the main (model Z, internal units) -> interpolated on the schematic
+    hm.z_avg = zs[len(zs) // 2] if zs else None
+    zlow = []
+    for t in main:
+        if ctx.kind.get(t) == "pipe" and t not in ctx.stk:
+            cp = curve_pts(ctx.net.nodes[t]) if ctx.net is not None and t in ctx.net.nodes else None
+            if cp:
+                zlow.extend([cp[0].Z, cp[1].Z])
+    hm.z_low = min(zlow) if zlow else hm.z_avg
     cur = hm.sid
     rn = 0
     for t in main:
@@ -1244,6 +1520,7 @@ def analyse_h(tree, rk, label, meta, ctx, ref=None):
                 nodes = own + build_nodes(tree, t, ctx, cur)
                 br = Branch(nodes, (tree.dist[t], 1e9, 0.0), ctx.item_level[t])
                 br.sid = cur
+                br.attach = t
                 hm.slots.append((br.key, "b", br))
                 continue
             it = ctx.mk_item(t)
@@ -1257,6 +1534,7 @@ def analyse_h(tree, rk, label, meta, ctx, ref=None):
         if own:
             br = Branch(own, (tree.dist[t], -1.0, 0.0), node_lids(own, ctx)[0])
             br.sid = cur
+            br.attach = t
             hm.slots.append((br.key, "b", br))
         for c in tree.ordered_children(t):
             if c in mset:
@@ -1264,16 +1542,17 @@ def analyse_h(tree, rk, label, meta, ctx, ref=None):
             csid = edge_sid(ctx, c, cur)
             ep = tree.entry[c]
             ez = ep.Z if ep is not None else 0.0
-            key = (tree.dist[t], tree.dist[c], ez)
+            key = (tree.dist[t], tree.maxd[c], ez)   # far from outlet -> left
             if tree.topv[c] is not None:
-                sub = analyse(tree, c, u"", meta, ctx)
+                sub = analyse(tree, c, u"", meta, ctx, cur)
                 if not sub.branches and not sub.inline:
                     continue
                 rn += 1
                 sub.label = (ctx.sys_short(sub.sid) if sub.sid is not None else u"R") + \
                     u" R" + str(rn)
                 sub.is_root = False
-                sub.vent_top = ctx.is_vent(sub.sid)
+                # vent_top / vent_sid already set by analyse() (top of the stack path)
+                sub.attach = t
                 hm.slots.append((key, "r", sub))
                 hm.risers.append(sub)
                 continue
@@ -1288,9 +1567,11 @@ def analyse_h(tree, rk, label, meta, ctx, ref=None):
                 nodes = nodes[0].children
             pick = ilids or lids
             br = Branch(nodes, key, max(set(pick), key=pick.count))
-            br.sid = cur if (nodes and nodes[0].kind == "conn" and nodes[0].switch) else csid
+            br.sid = drain_sid(ctx, cur if (nodes and nodes[0].kind == "conn" and nodes[0].switch)
+                               else csid, nodes, cur)
+            br.attach = t
             hm.slots.append((key, "b", br))
-    hm.slots.sort(key=lambda s: s[0])
+    hm.slots.sort(key=lambda s: s[0])          # [0] nearest outlet (right) ... [-1] end of run (left)
     no = 0
     for _k, kind, obj in hm.slots:
         if kind == "b":
@@ -1323,7 +1604,8 @@ def _new_table(cols):
 
 class SchematicWindow(forms.WPFWindow):
     def __init__(self, P, sys_rows, map_rows, extra_cands, saved_map,
-                 sym_options, view_names, ls_names, tt_names):
+                 sym_options, view_names, ls_names, tt_names,
+                 saved_labels=None, log_info=None):
         forms.WPFWindow.__init__(self, XAML_FILE)
         self.P = dict(P)
         self.sym_options = sym_options
@@ -1331,6 +1613,9 @@ class SchematicWindow(forms.WPFWindow):
         self.view_names = view_names
         self.extra_cands = extra_cands
         self.saved_map = saved_map
+        self.saved_labels = saved_labels or {}
+        self.log_info = log_info
+        self.labels = {}
         self.mapping = {}
         self.extras = []
         self.checked = []
@@ -1350,10 +1635,14 @@ class SchematicWindow(forms.WPFWindow):
         self._fill(self.cb_netmode, [NET_PHYS, NET_SYS], P["net_mode"])
         self._fill(self.cb_mainmode, [MAIN_H_AUTO, MAIN_H_PICK, MAIN_V], P["main_mode"])
         self.tb_hdrop.Text = str(P["hmain_drop_mm"])
+        self.ck_hreal.IsChecked = bool(P.get("hmain_real_z", True))
+        self._fill(self.cb_hz, [HZ_AVG, HZ_LOW], P.get("hmain_z_mode", HZ_AVG))
+        self.tb_hclear.Text = str(P.get("hmain_clear_mm", 3.0))
         self._fill(self.cb_root, [ROOT_AUTO, ROOT_PICK], P["root_mode"])
         self.tb_stackmin.Text = str(P["stack_min_mm"])
         self._fill(self.cb_group, [LABEL_NAME, LABEL_ABBR], P["group_by"])
         self.ck_btag.IsChecked = bool(P["show_branch_tag"])
+        self.ck_nocross.IsChecked = bool(P.get("no_cross", True))
         self.ck_xconn.IsChecked = bool(P["show_xconn"])
 
         self._fill(self.cb_lmethod, ["Reference Level", "Elevation (Z)"], P["level_method"])
@@ -1363,6 +1652,10 @@ class SchematicWindow(forms.WPFWindow):
         self.ck_lowest.IsChecked = bool(P["from_lowest"])
 
         self.tb_lsp.Text = str(P["level_spacing_mm"])
+        self.ck_autolsp.IsChecked = bool(P.get("auto_lsp", True))
+        self.tb_lfree.Text = str(P.get("lvl_free_mm", 15.0))
+        self.tb_hgap.Text = str(P.get("hmain_gap_mm", 6.0))
+        self.tb_habove.Text = str(P.get("hmain_above_mm", 8.0))
         self.tb_ssp.Text = str(P["symbol_spacing_mm"])
         self.tb_bgap.Text = str(P["branch_gap_mm"])
         self.tb_bstep.Text = str(P["branch_step_mm"])
@@ -1374,8 +1667,13 @@ class SchematicWindow(forms.WPFWindow):
         self.tb_gap.Text = str(P["stack_gap_mm"])
         self.tb_soff.Text = str(P["symbol_offset_mm"])
         self.tb_boff.Text = str(P["branch_offset_mm"])
-        self.tb_loff.Text = str(P["label_offset_mm"])
+        self.tb_loff.Text = str(P.get("label_gap_mm", 1.5))
         self.tb_ltw.Text = str(P["level_text_width_mm"])
+        self.tb_fwgnames.Text = str(P.get("fwg_names", "FWG, FW"))
+        self.tb_fwgdrop.Text = str(P.get("fwg_drop_mm", 3.0))
+        self._fill(self.cb_fwgside, ["Left", "Right", "Center"], P.get("fwg_single_side", "Left"))
+        self.ck_fwg45.IsChecked = bool(P.get("fwg_45", True))
+        self.tb_fwg45.Text = str(P.get("fwg_45_mm", 2.5))
 
         ls_default = P["level_line_style"] or next((n for n in ls_names if "Thin" in n), "")
         self._fill(self.cb_lstyle, ls_names, ls_default)
@@ -1385,6 +1683,11 @@ class SchematicWindow(forms.WPFWindow):
         self.ck_ph.IsChecked = bool(P["placeholder"])
         self.ck_vent.IsChecked = bool(P["vent_to_atm"])
 
+        self.ck_mark.IsChecked = bool(P["mark_changes"])
+        self._fill(self.cb_markstyle, [MARK_CIRCLE, MARK_CLOUD], P["mark_style"])
+        self.tb_mrad.Text = str(P["mark_radius_mm"])
+        self.tb_mtol.Text = str(P["move_tol_mm"])
+
         self.dt_sys = _new_table([("Name", System.String), ("Label", System.String),
                                   ("Checked", System.Boolean)])
         for name, lbl, chk in sys_rows:
@@ -1393,9 +1696,9 @@ class SchematicWindow(forms.WPFWindow):
 
         self.dt_map = _new_table([("Category", System.String), ("ModelKey", System.String),
                                   ("Qty", System.Int32), ("Symbol", System.String),
-                                  ("IsExtra", System.Boolean)])
-        for cat, key, cnt, val, extra in map_rows:
-            self._add_row(cat, key, cnt, val, extra)
+                                  ("IsExtra", System.Boolean), ("SchName", System.String)])
+        for cat, key, cnt, val, extra, lbl in map_rows:
+            self._add_row(cat, key, cnt, val, extra, lbl)
         self.grid_map.Columns[3].ItemsSource = List[System.String](sym_options)
         self.grid_map.ItemsSource = self.dt_map.DefaultView
         self.ck_extra.IsChecked = bool(P["use_extras"])
@@ -1404,6 +1707,8 @@ class SchematicWindow(forms.WPFWindow):
         self.rb_over.Checked += self.on_vmode
         self.cb_order.SelectionChanged += self.on_order
         self.cb_mainmode.SelectionChanged += self.on_order
+        self.ck_hreal.Checked += self.on_order
+        self.ck_hreal.Unchecked += self.on_order
         self.btn_all.Click += self.on_all
         self.btn_none.Click += self.on_none
         self.btn_auto.Click += self.on_auto
@@ -1414,11 +1719,18 @@ class SchematicWindow(forms.WPFWindow):
         self.ck_extra.Unchecked += self.on_extra
         self.btn_run.Click += self.on_run
         self.btn_cancel.Click += self.on_cancel
+        self.rb_new.Checked += self.on_loginfo
+        self.rb_over.Checked += self.on_loginfo
+        self.tb_vname.TextChanged += self.on_loginfo
+        self.cb_view.SelectionChanged += self.on_loginfo
+        self.ck_mark.Checked += self.on_mark
+        self.ck_mark.Unchecked += self.on_mark
         self.tb_filter.TextChanged += self.on_filter
         self.grid_map.CellEditEnding += self.on_cell_edit
         self.on_vmode(None, None)
         self.on_order(None, None)
         self.on_extra(None, None)
+        self.on_mark(None, None)
 
     @staticmethod
     def _fill(cb, items, value):
@@ -1434,9 +1746,16 @@ class SchematicWindow(forms.WPFWindow):
     def _sel(cb):
         return str(cb.SelectedItem) if cb.SelectedItem is not None else ""
 
-    def _add_row(self, cat, key, cnt, val, extra):
+    def _add_row(self, cat, key, cnt, val, extra, lbl=u""):
         self.dt_map.Rows.Add(cat, key, int(cnt), val if val in self.opt_set else NONE_OPT,
-                             bool(extra))
+                             bool(extra), lbl or u"")
+
+    @staticmethod
+    def _cell(r, col):
+        v = r[col]
+        if v is None or v is System.DBNull.Value:
+            return u""
+        return str(v)
 
     def _keys_in_grid(self):
         return set(str(r["ModelKey"]) for r in self.dt_map.Rows)
@@ -1461,7 +1780,7 @@ class SchematicWindow(forms.WPFWindow):
             .replace("*", "[*]").replace("%", "[%]")
         if txt:
             conds.append("(ModelKey LIKE '%" + txt + "%' OR Category LIKE '%" + txt +
-                         "%' OR Symbol LIKE '%" + txt + "%')")
+                         "%' OR Symbol LIKE '%" + txt + "%' OR SchName LIKE '%" + txt + "%')")
         self.dt_map.DefaultView.RowFilter = " AND ".join(conds)
 
     def _update_status(self):
@@ -1474,6 +1793,25 @@ class SchematicWindow(forms.WPFWindow):
                                 u" accessory/fitting types" + (u"" if use else u" (off)") +
                                 u"  |  " + str(len(unm)) + u" unmapped")
 
+    def _log_name(self):
+        if self.rb_over.IsChecked:
+            return self._sel(self.cb_view)
+        return (self.tb_vname.Text or u"").strip() or DEFAULTS["new_view_name"]
+
+    def on_loginfo(self, sender, args):
+        if self.log_info is None:
+            return
+        try:
+            self.txt_loginfo.Text = self.log_info(self._log_name())
+        except Exception:
+            self.txt_loginfo.Text = u""
+
+    def on_mark(self, sender, args):
+        on = bool(self.ck_mark.IsChecked)
+        for c in (self.cb_markstyle, self.tb_mrad, self.tb_mtol):
+            c.IsEnabled = on
+        self.on_loginfo(None, None)
+
     def on_vmode(self, sender, args):
         over = bool(self.rb_over.IsChecked)
         self.cb_view.IsEnabled = over
@@ -1485,7 +1823,12 @@ class SchematicWindow(forms.WPFWindow):
         for c in (self.cb_root, self.tb_stackmin, self.ck_btag, self.ck_xconn,
                   self.cb_netmode, self.cb_mainmode):
             c.IsEnabled = net
-        self.tb_hdrop.IsEnabled = net and self._sel(self.cb_mainmode) != MAIN_V
+        hmode = net and self._sel(self.cb_mainmode) != MAIN_V
+        real = bool(self.ck_hreal.IsChecked)
+        self.ck_hreal.IsEnabled = hmode
+        self.cb_hz.IsEnabled = hmode and real
+        self.tb_hclear.IsEnabled = hmode and real
+        self.tb_hdrop.IsEnabled = hmode and not real
 
     def on_extra(self, sender, args):
         use = bool(self.ck_extra.IsChecked)
@@ -1517,7 +1860,8 @@ class SchematicWindow(forms.WPFWindow):
             if key is None:
                 continue
             cat, qty = self.extra_cands[key]
-            self._add_row(cat, key, qty, self.saved_map.get(key, NONE_OPT), True)
+            self._add_row(cat, key, qty, self.saved_map.get(key, NONE_OPT), True,
+                          self.saved_labels.get(key, u""))
         self._apply_filter()
         self._update_status()
 
@@ -1602,10 +1946,14 @@ class SchematicWindow(forms.WPFWindow):
         P["net_mode"] = self._sel(self.cb_netmode)
         P["main_mode"] = self._sel(self.cb_mainmode)
         P["hmain_drop_mm"] = max(0.0, to_float(self.tb_hdrop.Text, 12.0))
+        P["hmain_real_z"] = bool(self.ck_hreal.IsChecked)
+        P["hmain_z_mode"] = self._sel(self.cb_hz) or HZ_AVG
+        P["hmain_clear_mm"] = max(0.0, to_float(self.tb_hclear.Text, 3.0))
         P["root_mode"] = self._sel(self.cb_root)
         P["stack_min_mm"] = max(100.0, to_float(self.tb_stackmin.Text, 2000.0))
         P["group_by"] = self._sel(self.cb_group)
         P["show_branch_tag"] = bool(self.ck_btag.IsChecked)
+        P["no_cross"] = bool(self.ck_nocross.IsChecked)
         P["show_xconn"] = bool(self.ck_xconn.IsChecked)
         P["use_extras"] = bool(self.ck_extra.IsChecked)
         P["level_method"] = self._sel(self.cb_lmethod)
@@ -1614,6 +1962,10 @@ class SchematicWindow(forms.WPFWindow):
         P["story_only"] = bool(self.ck_story.IsChecked)
         P["from_lowest"] = bool(self.ck_lowest.IsChecked)
         P["level_spacing_mm"] = to_float(self.tb_lsp.Text, 40.0)
+        P["auto_lsp"] = bool(self.ck_autolsp.IsChecked)
+        P["lvl_free_mm"] = max(0.0, to_float(self.tb_lfree.Text, 15.0))
+        P["hmain_gap_mm"] = max(0.0, to_float(self.tb_hgap.Text, 6.0))
+        P["hmain_above_mm"] = max(0.0, to_float(self.tb_habove.Text, 8.0))
         P["symbol_spacing_mm"] = to_float(self.tb_ssp.Text, 12.0)
         P["branch_gap_mm"] = to_float(self.tb_bgap.Text, 8.0)
         P["branch_step_mm"] = to_float(self.tb_bstep.Text, 4.0)
@@ -1625,18 +1977,28 @@ class SchematicWindow(forms.WPFWindow):
         P["stack_gap_mm"] = to_float(self.tb_gap.Text, 25.0)
         P["symbol_offset_mm"] = to_float(self.tb_soff.Text, 0.0)
         P["branch_offset_mm"] = to_float(self.tb_boff.Text, 5.0)
-        P["label_offset_mm"] = to_float(self.tb_loff.Text, 6.0)
+        P["label_gap_mm"] = max(0.0, to_float(self.tb_loff.Text, 1.5))
         P["level_text_width_mm"] = to_float(self.tb_ltw.Text, 45.0)
+        P["fwg_names"] = (self.tb_fwgnames.Text or u"").strip()
+        P["fwg_drop_mm"] = max(0.0, to_float(self.tb_fwgdrop.Text, 3.0))
+        P["fwg_single_side"] = self._sel(self.cb_fwgside) or "Left"
+        P["fwg_45"] = bool(self.ck_fwg45.IsChecked)
+        P["fwg_45_mm"] = max(0.0, to_float(self.tb_fwg45.Text, 2.5))
         P["level_line_style"] = self._sel(self.cb_lstyle)
         P["text_type"] = self._sel(self.cb_ttype)
         P["combine"] = bool(self.ck_combine.IsChecked)
         P["add_label"] = bool(self.ck_label.IsChecked)
         P["placeholder"] = bool(self.ck_ph.IsChecked)
         P["vent_to_atm"] = bool(self.ck_vent.IsChecked)
+        P["mark_changes"] = bool(self.ck_mark.IsChecked)
+        P["mark_style"] = self._sel(self.cb_markstyle) or MARK_CIRCLE
+        P["mark_radius_mm"] = max(1.0, to_float(self.tb_mrad.Text, 6.0))
+        P["move_tol_mm"] = max(0.0, to_float(self.tb_mtol.Text, 20.0))
 
-        self.mapping, self.extras = {}, []
+        self.mapping, self.extras, self.labels = {}, [], {}
         for r in self.dt_map.Rows:
             key = str(r["ModelKey"])
+            self.labels[key] = self._cell(r, "SchName").strip()
             v = r["Symbol"]
             self.mapping[key] = str(v) if v not in (None, System.DBNull.Value) else NONE_OPT
             if bool(r["IsExtra"]):
@@ -1658,6 +2020,7 @@ class Drawer(object):
         self.scale = view.Scale
         self.tt = text_type
         self.ids = []
+        self.links = OrderedDict()   # drafting element id -> [model ids]
         self.tol = doc.Application.ShortCurveTolerance
         self.text_h = 2.5 * MM * self.scale
         if text_type is not None:
@@ -1668,7 +2031,40 @@ class Drawer(object):
     def pm(self, mm):
         return mm * MM * self.scale
 
-    def line(self, x1, y1, x2, y2, gs):
+    def sym_extent(self, sym, inst, x, y):
+        """(left, right, bottom, top) of the symbol graphics relative to its
+        insertion point, measured once per type in this view. None if unknown."""
+        if not hasattr(self, "_ext"):
+            self._ext = {}
+        key = int(id_val(sym.Id))
+        if key in self._ext:
+            return self._ext[key]
+        ext = None
+        try:
+            doc.Regenerate()
+            bb = inst.get_BoundingBox(self.view)
+            if bb is not None and bb.Max.Y - bb.Min.Y > 1e-9:
+                ext = (bb.Min.X - x, bb.Max.X - x, bb.Min.Y - y, bb.Max.Y - y)
+        except Exception:
+            ext = None
+        self._ext[key] = ext
+        return ext
+
+    def link(self, el, ids):
+        if el is None or not ids:
+            return
+        out = []
+        for i in ids:
+            try:
+                i = int(i)
+            except Exception:
+                continue
+            if i not in out:
+                out.append(i)
+        if out:
+            self.links[int(id_val(el.Id))] = out
+
+    def line(self, x1, y1, x2, y2, gs, ids=None):
         p1 = DB.XYZ(x1, y1, 0)
         p2 = DB.XYZ(x2, y2, 0)
         if p1.DistanceTo(p2) < self.tol:
@@ -1680,6 +2076,7 @@ class Drawer(object):
             except Exception:
                 pass
         self.ids.append(c.Id)
+        self.link(c, ids)
         return c
 
     def dot(self, x, y, r, gs):
@@ -1693,7 +2090,7 @@ class Drawer(object):
         except Exception:
             pass
 
-    def text(self, x, y, s, center=False):
+    def text(self, x, y, s, center=False, ids=None):
         if self.tt is None or not s:
             return None
         opts = DB.TextNoteOptions(self.tt.Id)
@@ -1701,15 +2098,28 @@ class Drawer(object):
                                     else DB.HorizontalTextAlignment.Left)
         tn = DB.TextNote.Create(doc, self.view.Id, DB.XYZ(x, y, 0), s, opts)
         self.ids.append(tn.Id)
+        self.link(tn, ids)
         return tn
 
-    def symbol(self, sym, x, y):
+    def symbol(self, sym, x, y, ids=None):
         if not sym.IsActive:
             sym.Activate()
             doc.Regenerate()
         inst = doc.Create.NewFamilyInstance(DB.XYZ(x, y, 0), sym, self.view)
         self.ids.append(inst.Id)
+        self.link(inst, ids)
         return inst
+
+
+def _neg_key(k):
+    """Sort helper: reverse order of a branch key (number / tuple / text)."""
+    try:
+        return -float(k)
+    except Exception:
+        pass
+    if isinstance(k, (tuple, list)):
+        return tuple(_neg_key(i) for i in k)
+    return tuple(-ord(c) for c in u"%s" % (k,))
 
 
 class Layout(object):
@@ -1728,6 +2138,166 @@ class Layout(object):
         # 45 deg join (branch -> riser, riser foot -> horizontal main)
         self.jch = pm(P.get("join_chamfer_mm", 4.0)) if self.ch_stack else 0.0
         self.stats = {"placed": 0, "placeholder": 0, "skipped": 0, "conn": 0, "riser": 0}
+        self.pos = {}           # element id -> (x, y) of its symbol in the drafting view
+        self.esys = {}          # element id -> system id (set after construction)
+        self.is_vent = lambda sid: False
+        # floor waste (FWG / FW): horizontal pipes of upstream fixtures enter BELOW the level
+        self.fwg_names = set(t.strip().upper() for t in
+                             re.split(r"[,;]", P.get("fwg_names", "FWG, FW") or u"") if t.strip())
+        self.fwg_drop = pm(max(0.0, to_float(P.get("fwg_drop_mm", 3.0), 3.0)))
+        side = P.get("fwg_single_side", "Left")
+        self.fwg_side = -1.0 if side == "Left" else (1.0 if side == "Right" else 0.0)
+        self.fwg45 = pm(max(0.0, to_float(P.get("fwg_45_mm", 2.5), 2.5))) if P.get("fwg_45", True) else 0.0
+        self._yline = None      # branch line Y under the host being drawn
+        self.topo = TOPO
+        self.last_tail = ([], None)
+        self.lz = {}            # level id -> ProjectElevation (set after construction)
+        self.ldepth = {}        # level id -> paper depth used by branches BELOW that level
+        self.lup = {}
+
+    def join_lid(self, b):
+        """Storey of a sub-stack junction from its REAL model Z.
+        Branches are drawn hanging BELOW their level, so a junction that sits ABOVE
+        its snapped level (inside the storey above that level) belongs to the next
+        drawn level up. A junction at / below a level (within tolerance) keeps it.
+        Nothing is ever forced above or below a level: the model Z decides."""
+        if b.ez is None or b.lid not in self.lz:
+            return b.lid
+        eps = 1e-3
+        if b.ez <= self.lz[b.lid] + eps:
+            return b.lid
+        ups = [(z, l) for l, z in self.lz.items() if l in self.ly and z > self.lz[b.lid] + eps]
+        if not ups:
+            return b.lid                       # above the top drawn level: keep
+        return min(ups)[1]
+
+    # ---------- auto level spacing ----------
+    def _walk_branches(self, st, out):
+        if st.kind == "hmain":
+            for _k, kind, obj in st.slots:
+                if kind == "r":
+                    self._walk_branches(obj, out)
+            return out
+        for b in st.branches:
+            if b.lid in self.ly:
+                out.append(b)
+            if b.sub is not None:
+                self._walk_branches(b.sub, out)
+        for r in getattr(st, "risers", []) or []:
+            self._walk_branches(r, out)
+        return out
+
+    def measure_depth(self, stacks):
+        """Depth (below its level) of the lowest branch hanging from every level.
+        Independent of the absolute level Y (b.y is laid out relative to its level)."""
+        d = {}
+        self.lup = {}           # level id -> height used by lifted joins ABOVE that level
+        for st in stacks:
+            for b in self._walk_branches(st, []):
+                dep = self.ly[b.lid] - b.y + self.jch
+                if dep > d.get(b.lid, 0.0):
+                    d[b.lid] = dep
+                if dep < 0:
+                    h = -dep + self.jch
+                    if h > self.lup.get(b.lid, 0.0):
+                        self.lup[b.lid] = h
+        self.ldepth = d
+        return d
+
+    def expand_levels(self, levels_draw, stacks, id_of):
+        """Rebuild level Y: gap(lower -> upper) = max(level spacing,
+        depth of branches under upper + free space above lower
+        [+ room for a horizontal main sitting in this storey])."""
+        pm = self.dr.pm
+        free = pm(max(0.0, to_float(self.P.get("lvl_free_mm", 15.0), 15.0)))
+        hgap = pm(max(0.0, to_float(self.P.get("hmain_gap_mm", 6.0), 6.0)))
+        hclr = pm(max(0.0, to_float(self.P.get("hmain_clear_mm", 3.0), 3.0)))
+        ids = [id_of(l) for l in levels_draw]
+        zs = [self.lz.get(i) for i in ids]
+        mains = [st for st in stacks if st.kind == "hmain"]
+        y = 0.0
+        new = OrderedDict()
+        new[ids[0]] = 0.0
+        self.gaps = {}
+        for i in range(1, len(ids)):
+            lo, up = ids[i - 1], ids[i]
+            need = self.ldepth.get(up, 0.0) + free
+            if self.lup.get(lo, 0.0) > 0:
+                # lifted sub-stack joins of the lowest level sit in this storey
+                need = max(need, self.ldepth.get(up, 0.0) + self.bstep + self.lup[lo])
+            for hm in mains:
+                z = hm.z_low if self.P.get("hmain_z_mode") == HZ_LOW else hm.z_avg
+                if z is None or zs[i - 1] is None or zs[i] is None:
+                    inside = hm.lid == lo
+                else:
+                    inside = zs[i - 1] - 1e-6 <= z < zs[i] - 1e-6
+                if inside:
+                    habv = pm(max(0.0, to_float(self.P.get("hmain_above_mm", 8.0), 8.0)))
+                    need = max(need, self.ldepth.get(up, 0.0) + hgap + max(hclr, habv) * 2.0)
+            g = max(self.lsp, need)
+            y += g
+            new[up] = y
+            self.gaps[up] = g
+        for k, v in new.items():
+            self.ly[k] = v
+
+    def y_of_z(self, z):
+        """Model Z -> schematic Y, linear interpolation between the two drawn levels
+        that bracket Z (extrapolated below the lowest / above the highest level)."""
+        pts = sorted((self.lz[l], y) for l, y in self.ly.items() if l in self.lz)
+        if z is None or not pts:
+            return None
+        if len(pts) == 1:
+            return pts[0][1]
+        if z <= pts[0][0]:
+            a, b = pts[0], pts[1]
+        elif z >= pts[-1][0]:
+            a, b = pts[-2], pts[-1]
+        else:
+            a, b = pts[0], pts[1]
+            for i in range(len(pts) - 1):
+                if pts[i][0] <= z <= pts[i + 1][0]:
+                    a, b = pts[i], pts[i + 1]
+                    break
+        dz = b[0] - a[0]
+        if abs(dz) < 1e-9:
+            return a[1]
+        return a[1] + (z - a[0]) / dz * (b[1] - a[1])
+
+    def main_y(self, hm):
+        """Y of a horizontal main: real elevation (option) or old 'level - drop'."""
+        pm = self.dr.pm
+        lid = hm.lid if hm.lid in self.ly else min(self.ly.keys(), key=lambda i: self.ly[i])
+        old = self.ly[lid] - pm(self.P["branch_offset_mm"]) - pm(self.P["hmain_drop_mm"])
+        if not self.P.get("hmain_real_z", True):
+            return old
+        z = hm.z_low if self.P.get("hmain_z_mode") == HZ_LOW else hm.z_avg
+        y = self.y_of_z(z)
+        if y is None:
+            return old
+        clr = pm(max(0.0, to_float(self.P.get("hmain_clear_mm", 3.0), 3.0)))
+        if clr > 0:
+            yl = min(self.ly.values(), key=lambda v: abs(v - y))
+            if abs(y - yl) < clr:
+                y = yl - clr if y <= yl else yl + clr
+        if self.ldepth:
+            # keep the main BELOW the lowest branch hanging from the level above it
+            hgap = pm(max(0.0, to_float(self.P.get("hmain_gap_mm", 6.0), 6.0)))
+            above = [(v, l) for l, v in self.ly.items() if v > y + 1e-9]
+            below = [v for v in self.ly.values() if v <= y + 1e-9]
+            top_lim = None
+            if above:
+                vu, lu = min(above)
+                top_lim = vu - self.ldepth.get(lu, 0.0) - hgap
+            bot_lim = (max(below) + max(clr, pm(to_float(self.P.get("hmain_above_mm", 8.0), 8.0)))
+                       if below else None)
+            if top_lim is not None and y > top_lim:
+                # pushed down by the branches above -> centre in the free band,
+                # never hugging the level line below
+                y = top_lim if bot_lim is None else max(bot_lim, (top_lim + bot_lim) * 0.5)
+            elif bot_lim is not None and y < bot_lim:
+                y = bot_lim
+        return y
 
     def g(self, sid, default):
         if sid is None:
@@ -1744,11 +2314,41 @@ class Layout(object):
                 out.extend(self.up_items(c))
         return out
 
+    def host_ups(self, n):
+        """Upstream nodes of a host symbol. A system-change marker (trans, not riser)
+        followed by its item gets no own slot (no stub past the host centre); it is
+        drawn on that item's drop instead. -> (nodes with slot, {id(item): [markers]})"""
+        raw = self.up_items(n)
+        out, att, pend = [], {}, []
+        for u in raw:
+            if u.kind == "conn" and u.trans and not u.riser:
+                pend.append(u)
+                continue
+            if pend:
+                if u.kind == "item":
+                    att.setdefault(id(u), []).extend(pend)
+                else:
+                    out.extend(pend)
+                pend = []
+            out.append(u)
+        out.extend(pend)
+        return out, att
+
+    def draw_trans_on_drop(self, m, x, y):
+        dr, pm = self.dr, self.dr.pm
+        gs = self.conn_gs.get(m.sid)
+        ids = list(m.ks)
+        dr.dot(x, y, pm(0.6), gs)
+        dr.text(x + pm(1.2), y + dr.text_h * 0.5, m.label, False, ids)
+        for k in ids:
+            self.pos.setdefault(int(k), (x, y))
+        self.stats["conn"] += 1
+
     def w_node(self, n):
         if n.kind == "conn":
             return self.sp
         if n.kind == "item":
-            ups = self.up_items(n)
+            ups = self.host_ups(n)[0]
             return max(self.sp, sum(self.w_node(u) for u in ups))
         return self.w_list(n.children) + self.tstep
 
@@ -1767,25 +2367,61 @@ class Layout(object):
     def slots(self, st):
         by = OrderedDict()
         for b in st.branches:
+            if b.sub is not None:
+                b.lid = self.join_lid(b)
             if b.lid in self.ly:
                 by.setdefault(b.lid, []).append(b)
         for lid, brs in by.items():
-            ordered = [b for b in brs if b.sub is not None] + [b for b in brs if b.sub is None]
+            # flow order: end of the run (far from outlet) -> left, near outlet -> right
+            far_first = lambda lst: sorted(lst, key=lambda b: b.key, reverse=True)
+            ordered = far_first([b for b in brs if b.sub is not None]) + \
+                far_first([b for b in brs if b.sub is None])
+            # lay out every sub-stack FIRST: its own branches on this storey must sit
+            # ABOVE the point where it joins this stack (else they hang below its foot)
+            for b in ordered:
+                if b.sub is not None:
+                    self.slots(b.sub)
             cur = self.ly[lid] - self.dr.pm(self.P["branch_offset_mm"])
             for b in reversed(ordered):
                 depth = 0 if b.sub is not None else tier_depth(b.nodes)
                 b.y = cur - depth * self.tstep
+                if b.sub is None and self.fwg45 > self.dr.tol and self.has_fwg(b.nodes):
+                    # room for the 45 deg inlet into FWG / FW above the branch line
+                    sy0 = self.ly[lid] + self.dr.pm(self.P["symbol_offset_mm"])
+                    need = self.fwg_drop + self.fwg45 + self.ch + self.dr.pm(1.0) + depth * self.tstep
+                    b.y = min(b.y, sy0 - need)
+                if b.sub is not None:
+                    low = self.sub_low(b.sub, lid)
+                    if low is not None:
+                        b.y = min(b.y, low - self.bstep - self.jch)
                 cur = b.y - self.bstep - self.jch
             by[lid] = ordered
             for b in ordered:
                 if b.sub is not None:
                     b.sub.bottom_y = b.y
-                    self.slots(b.sub)
         st.by_level = by
 
+    def sub_low(self, st, lid):
+        """Lowest branch Y of stack st (and its sub-stacks) hanging from level lid."""
+        ys = []
+        for b in st.by_level.get(lid, []) if getattr(st, "by_level", None) else []:
+            ys.append(b.y)
+            if b.sub is not None:
+                v = self.sub_low(b.sub, lid)
+                if v is not None:
+                    ys.append(v)
+        return min(ys) if ys else None
+
     def place(self, st, x):
-        subs = sorted([b for b in st.branches if b.sub is not None and b.lid in self.ly],
-                      key=lambda b: b.y)
+        subs = [b for b in st.branches if b.sub is not None and b.lid in self.ly]
+        if self.P.get("no_cross", True):
+            # junction LOWEST on the stack -> left-most. Its horizontal join then passes
+            # BELOW the bottom of every sub-stack placed to its right (they all join
+            # higher), so a branch never crosses another riser. Tie: farthest left.
+            subs = sorted(subs, key=lambda b: (round(b.y if b.y is not None else 0.0, 6),
+                                               _neg_key(b.key)))
+        else:
+            subs = sorted(subs, key=lambda b: b.key, reverse=True)  # farthest sub-stack left-most
         for b in subs:
             x = self.place(b.sub, x)
         st.x0 = x
@@ -1798,8 +2434,7 @@ class Layout(object):
         """Lay out a horizontal main: outlet on the right, slots (branches /
         risers) right -> left in flow order from the outlet."""
         pm = self.dr.pm
-        lid = hm.lid if hm.lid in self.ly else min(self.ly.keys(), key=lambda i: self.ly[i])
-        hm.y_main = self.ly[lid] - pm(self.P["branch_offset_mm"]) - pm(self.P["hmain_drop_mm"])
+        hm.y_main = self.main_y(hm)
         gap = pm(self.P["stack_gap_mm"])
         widths = []
         for _k, kind, obj in hm.slots:
@@ -1841,52 +2476,78 @@ class Layout(object):
             x_min = min(x_min, left)
             if P["show_branch_tag"]:
                 dr.text(left, y - pm(0.8), u"B{} ({})".format(b.no, flat_count(b.nodes)))
-        dr.line(x_min, y, hm.x_out, y, gs)                       # reference main
+        main = list(hm.main or [])
+        idx = dict((k, i) for i, k in enumerate(main))
+        cuts = [(hm.x_out, 0)]
+        for (_k, kind, obj), xr in zip(hm.slots, hm.pos):
+            i = idx.get(getattr(obj, "attach", None))
+            if i is not None and x_min < xr < hm.x_out:
+                cuts.append((xr, i))
+        cuts.append((x_min, len(main) - 1 if main else 0))
+        for (xa, ia), (xb, ib) in zip(cuts, cuts[1:]):
+            lo, hi = min(ia, ib), max(ia, ib)
+            ids = [k for k in main[lo:hi + 1] if k not in self.topo.items]
+            dr.line(xb, y, xa, y, gs, ids)                       # reference main (split)
         a = pm(1.5)                                              # flow arrow at outlet
-        dr.line(hm.x_out - a, y + a * 0.5, hm.x_out, y, gs)
-        dr.line(hm.x_out - a, y - a * 0.5, hm.x_out, y, gs)
+        dr.line(hm.x_out - a, y + a * 0.5, hm.x_out, y, gs, main[:1])
+        dr.line(hm.x_out - a, y - a * 0.5, hm.x_out, y, gs, main[:1])
         dr.text(hm.x_out - pm(2), y - pm(4), hm.label)
 
     # ---------- primitives ----------
-    def drop(self, x, y_top, y_line, gs):
-        c = self.ch
-        if c > self.dr.tol and (y_top - y_line) > 2 * c:
-            self.dr.line(x, y_top, x, y_line + c, gs)
-            self.dr.line(x, y_line + c, x + c, y_line, gs)
+    def drop(self, x, y_top, y_line, gs, ids=None):
+        """Fixture drop -> 45 deg into the horizontal branch. Short drops (e.g. into a
+        sub-branch tier just under the level) get a smaller 45 deg segment instead of
+        a straight vertical, so EVERY drop enters its branch at 45 deg."""
+        span = y_top - y_line
+        c = min(self.ch, span * 0.5) if self.ch > self.dr.tol else 0.0
+        if c > self.dr.tol:
+            self.dr.line(x, y_top, x, y_line + c, gs, ids)
+            self.dr.line(x, y_line + c, x + c, y_line, gs, ids)
             return x + c
-        self.dr.line(x, y_top, x, y_line, gs)
+        self.dr.line(x, y_top, x, y_line, gs, ids)
         return x
 
-    def join_stack(self, xa, y, xs, gs):
+    def join_stack(self, xa, y, xs, gs, ids=None):
         """Horizontal branch -> 45 deg -> riser / stack. Returns y on the riser."""
         c = self.jch
         if c > self.dr.tol:
             c = min(c, max(xs - xa, self.dr.tol * 2) + self.bgap * 0.5)
-            self.dr.line(min(xa, xs - c), y, xs - c, y, gs)
-            self.dr.line(xs - c, y, xs, y - c, gs)
+            self.dr.line(min(xa, xs - c), y, xs - c, y, gs, ids)
+            self.dr.line(xs - c, y, xs, y - c, gs, ids)
             return y - c
-        self.dr.line(xa, y, xs, y, gs)
+        self.dr.line(xa, y, xs, y, gs, ids)
         return y
 
     def put_symbol(self, en, ex, sy, center_label=True):
         dr, P, pm = self.dr, self.P, self.dr.pm
         n = en["count"]
+        for k in en.get("ks") or []:
+            self.pos[int(k)] = (ex, sy)
         lab = en["label"] + (u" x" + str(n) if n > 1 else u"")
+        ks = list(en.get("ks") or [])
         sym = self.sym_map.get(en["key"])
         if sym is not None:
-            dr.symbol(sym, ex, sy)
+            inst = dr.symbol(sym, ex, sy, ks)
             self.stats["placed"] += n
             if P["add_label"]:
+                gap = pm(P.get("label_gap_mm", 1.5))
+                ext = dr.sym_extent(sym, inst, ex, sy)
                 if center_label:
-                    dr.text(ex, sy + pm(P["label_offset_mm"]) + dr.text_h, lab, True)
+                    if ext is not None:
+                        tx = ex + (ext[0] + ext[1]) * 0.5
+                        ty = sy + max(ext[3], 0.0) + gap + dr.text_h
+                    else:
+                        tx, ty = ex, sy + pm(P["label_offset_mm"]) + dr.text_h
+                    dr.text(tx, ty, lab, True, ks)
                 else:
-                    dr.text(ex + pm(2), sy + dr.text_h * 0.5, lab)
+                    tx = ex + (max(ext[1], 0.0) if ext is not None else 0.0) + max(gap, pm(1))
+                    dr.text(tx, sy + dr.text_h * 0.5, lab, False, ks)
             return True
         if P["placeholder"]:
             if center_label:
-                dr.text(ex, sy + pm(2) + dr.text_h, lab or "?", True)
+                dr.text(ex, sy + pm(2) + dr.text_h, lab or "?", True, ks)
             else:
-                dr.text(ex + pm(2), sy + dr.text_h * 0.5, lab or "?")
+                dr.text(ex + pm(2), sy + dr.text_h * 0.5, lab or "?", False, ks)
             self.stats["placeholder"] += n
             return True
         self.stats["skipped"] += n
@@ -1895,77 +2556,196 @@ class Layout(object):
     def draw_conn(self, n, x0, y0, x1, y1):
         dr, pm = self.dr, self.dr.pm
         gs = self.conn_gs.get(n.sid)
+        ids = list(n.ks)
         if n.trans and not n.riser:
             dr.dot(x0, y0, pm(0.6), gs)
-            dr.text(x0, y0 + pm(1) + dr.text_h, n.label, True)
+            dr.text(x0, y0 + pm(1) + dr.text_h, n.label, True, ids)
             self.stats["conn"] += 1
             return
-        dr.line(x0, y0, x1, y1, gs)
+        dr.line(x0, y0, x1, y1, gs, ids)
         if abs(x1 - x0) < 1e-9:
-            dr.text(x1, y1 + pm(1) + dr.text_h, n.label, True)
+            dr.text(x1, y1 + pm(1) + dr.text_h, n.label, True, ids)
         else:
-            dr.text(x1 + pm(1), y1 + dr.text_h * 0.5, n.label)
+            dr.text(x1 + pm(1), y1 + dr.text_h * 0.5, n.label, False, ids)
         self.stats["riser"] += 1
 
     # ---------- drawing ----------
+    def is_fwg(self, n):
+        """Host symbol whose Schematic Name (label) is FWG / FW ..."""
+        if n is None or n.kind != "item" or not self.fwg_names:
+            return False
+        return (n.label or u"").strip().upper() in self.fwg_names
+
+    def has_fwg(self, nodes):
+        """True when a FWG / FW host with upstream inlets is inside these nodes."""
+        for n in nodes or []:
+            if n.kind == "item" and self.is_fwg(n) and self.host_ups(n)[0]:
+                return True
+            if self.has_fwg(n.children):
+                return True
+        return False
+
+    def fw_inlet(self, ucx, cx, hy, s, c, gs, ids, done45):
+        """Horizontal pipe from an upstream drop at the inlet level (hy), ending with a
+        45 deg segment falling DOWN into the FWG / FW drop (flow direction correct).
+        c = 0 -> old straight horizontal into the FWG centre."""
+        tol = self.dr.tol
+        xk = cx + s * c                     # start of the 45 deg segment
+        if abs(ucx - xk) > tol:
+            self.dr.line(ucx, hy, xk, hy, gs, ids)
+        if c > tol and s not in done45:
+            self.dr.line(xk, hy, cx, hy - c, gs, ids)
+            done45.add(s)
+
     def draw_item(self, n, cx, sy, gs, loose):
-        ok = self.put_symbol({"key": n.key, "label": n.label, "count": n.count}, cx, sy)
+        ok = self.put_symbol({"key": n.key, "label": n.label, "count": n.count, "ks": n.ks},
+                             cx, sy)
         gs = self.g(n.sid, gs)
-        ups = self.up_items(n)
+        y_line = self._yline            # branch line under this host (None = unknown)
+        self._yline = None              # upstream items never inherit it
+        ups, att = self.host_ups(n)
         if ups:
+            tol = self.dr.tol
             uy = sy + self.rise
+            fwg = self.is_fwg(n)
+            # host = FWG / FW -> inlet point slightly BELOW the level line
+            hy = sy - self.fwg_drop if (fwg and self.fwg_drop > tol) else sy
             total = sum(self.w_node(u) for u in ups)
             xr = cx + total * 0.5
+            # FWG / FW with ONE inlet: shift it half a slot aside
+            if fwg and len(ups) == 1 and self.fwg_side:
+                xr += self.fwg_side * self.sp * 0.5
+            ucs = []
             for u in ups:
                 wu = self.w_node(u)
-                ucx = xr - wu * 0.5
+                ucs.append((u, xr - wu * 0.5))
+                xr -= wu
+            # 45 deg inlet size per side (-1 left, +1 right) of the FWG / FW
+            c45 = {-1: 0.0, 1: 0.0}
+            if fwg and self.fwg45 > tol and not loose:
+                lim = self.fwg45
+                if y_line is not None and hy > y_line:
+                    # 45 deg end point (hy - c) stays above the FWG drop chamfer / branch
+                    lim = min(lim, hy - y_line - self.ch - self.dr.pm(1.0))
+                for s in (-1, 1):
+                    ds = [abs(x - cx) for _u, x in ucs if (x - cx) * s > tol]
+                    if ds and lim > tol:
+                        c45[s] = min(lim, min(ds))                  # always exactly 45 deg
+            done45 = set()
+            for u, ucx in ucs:
+                s = 1 if ucx > cx + tol else (-1 if ucx < cx - tol else 0)
+                c = c45.get(s, 0.0) if s else 0.0
+                yh = hy                         # horizontal stays at inlet level
                 if u.kind == "conn":
                     if not loose:
-                        self.dr.line(ucx, sy, cx, sy, gs)
-                        self.draw_conn(u, ucx, sy, ucx, uy)
+                        self.fw_inlet(ucx, cx, hy, s, c, gs, list(u.ks), done45)
+                        self.draw_conn(u, ucx, yh, ucx, uy)
                 elif self.draw_item(u, ucx, uy, gs, loose) and not loose:
                     ugs = self.g(u.sid, gs)
-                    self.dr.line(ucx, uy, ucx, sy, ugs)
-                    self.dr.line(ucx, sy, cx, sy, ugs)
-                xr -= wu
+                    uids = []
+                    for uk in u.ks:
+                        for x in self.topo.path_to(uk, n.k):
+                            if x not in uids:
+                                uids.append(x)
+                    self.dr.line(ucx, uy, ucx, yh, ugs, uids)          # fixture drop
+                    self.fw_inlet(ucx, cx, hy, s, c, ugs, uids, done45)
+                    for i, m in enumerate(att.get(id(u)) or []):      # system change on the drop
+                        f = min(0.35 + 0.2 * i, 0.8)
+                        self.draw_trans_on_drop(m, ucx, yh + (uy - yh) * f)
         return ok
 
-    def draw_list(self, nodes, y_line, x_right, sy, gs, loose, base=True):
-        """Draw nodes right -> left and (if base) the horizontal line they sit on.
-        Returns the left-most connection x on y_line."""
+    def draw_list(self, nodes, y_line, x_right, sy, gs, loose, base=True, top=True):
+        """Draw nodes right -> left; base line split at every drop, each piece
+        linked to the model pipes between the two junctions."""
+        topo = self.topo
         x = x_right
         x_min = x_right
         breaks = []
+        drops = []
         for n in nodes:
             w = self.w_node(n)
             ngs = self.g(n.sid, gs)
             cx = x - w * 0.5
             if n.kind == "item":
+                self._yline = y_line
                 if self.draw_item(n, cx, sy, gs, loose) and not loose:
-                    x_min = min(x_min, self.drop(cx, sy, y_line, ngs))
+                    arm, jn = topo.arms(n.ks)
+                    xd = self.drop(cx, sy, y_line, ngs, arm)
+                    x_min = min(x_min, xd)
+                    drops.append((xd, jn))
             elif n.kind == "conn":
                 if not loose:
-                    top = max(sy + self.rise * 0.5, y_line + self.rise * 0.5)
-                    self.draw_conn(n, cx, y_line, cx, top)
+                    top_y = max(sy + self.rise * 0.5, y_line + self.rise * 0.5)
+                    self.draw_conn(n, cx, y_line, cx, top_y)
                     x_min = min(x_min, cx)
+                    drops.append((cx, n.k))
                     if n.switch:
                         breaks.append((cx, ngs))
             else:
                 yj = y_line + self.tstep
                 xd = x - self.tstep
-                self.draw_list(n.children, yj, xd, sy, ngs, loose)
+                self.draw_list(n.children, yj, xd, sy, ngs, loose, True, False)
+                tail_ids, tail_jn = self.last_tail
                 if not loose:
-                    self.dr.line(xd, yj, x, y_line, ngs)
+                    self.dr.line(xd, yj, x, y_line, ngs, tail_ids)
                     x_min = min(x_min, x)
+                    drops.append((x, tail_jn))
             x -= w
+        j0 = drops[0][1] if drops else None
+        tail = (topo.between(j0, None), None) if top else topo.up_to_junction(j0)
         if not loose and base:
-            start, cgs = x_right, gs
-            for bx, bgs in breaks:
-                if bx > x_min:
-                    self.dr.line(bx, y_line, start, y_line, cgs)
-                    start, cgs = bx, bgs
-            self.dr.line(x_min, y_line, start, y_line, cgs)
+            xs = [x_right, x_min] + [d[0] for d in drops if x_min < d[0] < x_right] + \
+                 [bx for bx, _g in breaks if x_min < bx < x_right]
+            cuts = sorted(set(round(v, 9) for v in xs), reverse=True)
+            for xa, xb in zip(cuts, cuts[1:]):
+                mid = (xa + xb) * 0.5
+                cgs = gs
+                for bx, bgs in breaks:
+                    if bx > x_min and mid < bx:
+                        cgs = bgs
+                right = [i for i, d in enumerate(drops) if d[0] >= xa - 1e-9]
+                if not right:
+                    ids = tail[0]
+                else:
+                    i = right[-1]
+                    ids = topo.between(drops[i + 1][1], drops[i][1]) if i + 1 < len(drops) else []
+                self.dr.line(xb, y_line, xa, y_line, cgs, ids)
+        self.last_tail = tail
         return x_min
+
+    def seg_gs(self, ids, gs):
+        """Graphics of a stack piece = system of ITS OWN pipes (vent part -> vent colour)."""
+        sids = [self.esys.get(k) for k in ids if self.esys.get(k) is not None]
+        if not sids:
+            return gs
+        dr_ = [i for i in sids if not self.is_vent(i)]
+        if dr_:                       # any drainage pipe in this piece -> drainage colour
+            return gs
+        return self.g(max(set(sids), key=sids.count), gs)
+
+    def stack_line(self, st, y0, y1, gs, y_vent=None, y_dtop=None):
+        """Stack line split at every level; each piece links the stack pipes of that storey
+        and takes the colour of those pipes. Above y_vent (top drainage junction of a
+        stack that continues as a vent) the line is drawn in the vent colour."""
+        main = [k for k in (st.main or []) if k not in self.topo.items]
+        lv = sorted(self.ly.items(), key=lambda kv: kv[1])
+        cut_pts = [v for _l, v in lv if y0 + 1e-9 < v < y1 - 1e-9]
+        if y_vent is not None and y0 + 1e-9 < y_vent < y1 - 1e-9:
+            cut_pts.append(y_vent)
+        cuts = [y0] + sorted(set(cut_pts)) + [y1]
+        vgs = self.g(getattr(st, "vent_sid", None), gs) if y_vent is not None else None
+        for ya, yb in zip(cuts, cuts[1:]):
+            below = [l for l, v in lv if v <= ya + 1e-9]
+            lid = below[-1] if below else None
+            ids = [k for k in main if self.topo.zl.get(k) == lid] if lid is not None else []
+            if vgs is not None and ya >= y_vent - 1e-9:
+                vids = [k for k in ids if self.is_vent(self.esys.get(k))]
+                self.dr.line(st.stack_x, ya, st.stack_x, yb, vgs, vids or ids or main)
+            elif y_dtop is not None and yb <= y_dtop + 1e-9:
+                # below the top branch junction the stack carries discharge -> drainage colour
+                self.dr.line(st.stack_x, ya, st.stack_x, yb, gs, ids or main)
+            else:
+                self.dr.line(st.stack_x, ya, st.stack_x, yb, self.seg_gs(ids, gs), ids or main)
 
     def draw(self, st):
         if st.kind == "hmain":
@@ -1981,7 +2761,11 @@ class Layout(object):
                 w = self.bwidth(b)
                 bgs = self.g(b.sid, gs)
                 if b.sub is not None:
-                    ys.append(self.join_stack(b.sub.stack_x, b.y, st.stack_x, bgs))
+                    # sub-stack ends with its own 45 deg foot -> horizontal starts after it
+                    xa = b.sub.stack_x + (self.jch if self.jch > dr.tol else 0.0)
+                    ys.append(self.join_stack(xa, b.y, st.stack_x, bgs,
+                                              [k for k in b.sub.main[:2]
+                                               if k not in self.topo.items]))
                     if P["show_branch_tag"]:
                         dr.text(b.sub.stack_x + pm(1), b.y - pm(0.8), u"B" + str(b.no))
                     xr -= w
@@ -1989,7 +2773,7 @@ class Layout(object):
                 x_right = xr - self.bgap * 0.5
                 left = self.draw_list(b.nodes, b.y, x_right, sy, bgs, loose)
                 if not loose:
-                    ys.append(self.join_stack(x_right, b.y, st.stack_x, bgs))
+                    ys.append(self.join_stack(x_right, b.y, st.stack_x, bgs, self.last_tail[0]))
                     if st.kind == "net" and P["show_branch_tag"]:
                         dr.text(left, b.y - pm(0.8),
                                 u"B{} ({})".format(b.no, flat_count(b.nodes)))
@@ -2005,7 +2789,8 @@ class Layout(object):
                 if n.kind == "conn":
                     self.draw_conn(n, st.stack_x, y, st.stack_x + pm(10), y)
                 else:
-                    self.put_symbol({"key": n.key, "label": n.label, "count": n.count},
+                    self.put_symbol({"key": n.key, "label": n.label, "count": n.count,
+                                     "ks": n.ks},
                                     st.stack_x, y, center_label=False)
                 ys.append(y)
 
@@ -2015,16 +2800,27 @@ class Layout(object):
         elif ys:
             y_bot = st.bottom_y if st.bottom_y is not None else min(ys) - self.lsp * 0.15
             y_top = max(ys)
+            y_dtop = y_top
+            y_vent = None
             vent_top = (st.is_root and st.meta.get("cls") == "Vent") or getattr(st, "vent_top", False)
             if vent_top and P["vent_to_atm"]:
+                # drainage stack continuing as a vent: vent colour above the top junction
+                if getattr(st, "vent_sid", None) is not None and not self.is_vent(st.sid):
+                    y_vent = y_top
                 y_top = self.top_y + self.lsp * 0.6
                 dr.text(st.stack_x, y_top + pm(2) + dr.text_h, "VENT TO ATMOSPHERE", True)
             c = self.jch
-            if getattr(st, "on_main", False) and c > dr.tol and (y_top - y_bot) > 2 * c:
-                dr.line(st.stack_x, y_bot + c, st.stack_x, y_top, gs)
-                dr.line(st.stack_x, y_bot + c, st.stack_x + c, y_bot, gs)
-            else:
-                dr.line(st.stack_x, y_bot, st.stack_x, y_top, gs)
+            # 45 deg foot at the LOWEST point of every riser that turns into a horizontal
+            # (horizontal main OR the branch of a parent stack). Short risers get a smaller
+            # 45 deg + a short horizontal so the parent line still starts at stack_x + jch.
+            foot = st.bottom_y is not None and c > dr.tol and (y_top - y_bot) > dr.tol
+            cf = min(c, (y_top - y_bot) * 0.5) if foot else 0.0
+            self.stack_line(st, y_bot + cf if foot else y_bot, y_top, gs, y_vent, y_dtop)
+            if foot:
+                fids = [k for k in st.main[:2] if k not in self.topo.items]
+                dr.line(st.stack_x, y_bot + cf, st.stack_x + cf, y_bot, gs, fids)
+                if c - cf > dr.tol:
+                    dr.line(st.stack_x + cf, y_bot, st.stack_x + c, y_bot, gs, fids)
             if st.bottom_y is None:
                 dr.text(st.stack_x, y_bot - pm(1.5), st.label, True)
             elif not vent_top:
@@ -2035,6 +2831,293 @@ class Layout(object):
         for b in st.branches:
             if b.sub is not None and b.lid in self.ly:
                 self.draw(b.sub)
+
+
+# ----------------------------------------------------------------------------
+# CHANGE LOG  (snapshot of every Element ID per run + diff with previous run)
+# ----------------------------------------------------------------------------
+def _fnv(s):
+    """Stable short hash (same result in every session / engine)."""
+    h = 2166136261
+    for ch in (s or u""):
+        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
+    return "%08x" % h
+
+
+def _safe(s, n):
+    return re.sub(r'[\\/:*?"<>|\s]+', "_", s or "X").strip("_")[:n] or "X"
+
+
+def log_base_name(name):
+    """'HYD SCHEMATIC (2)' -> 'HYD SCHEMATIC' so new copies share one log."""
+    return re.sub(r"\s*\(\d+\)$", "", (name or u"").strip()) or DEFAULTS["new_view_name"]
+
+
+def log_dir(dkey, sch_name):
+    sch_name = log_base_name(sch_name)
+    mdl = os.path.splitext(os.path.basename(dkey or "model"))[0]
+    return os.path.join(LOG_ROOT, _safe(mdl, 40) + "_" + _fnv(dkey),
+                        _safe(sch_name, 60) + "_" + _fnv(sch_name))
+
+
+def load_last_log(path):
+    f = os.path.join(path, "last.json")
+    if not os.path.exists(f):
+        return None
+    try:
+        with open(f, "r") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and isinstance(data.get("elements"), dict):
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def save_log(path, data, keep):
+    try:
+        if not os.path.exists(path):
+            os.makedirs(path)
+        txt = json.dumps(data, indent=0, sort_keys=True)
+        with open(os.path.join(path, "run_" + data["stamp"] + ".json"), "w") as fh:
+            fh.write(txt)
+        with open(os.path.join(path, "last.json"), "w") as fh:
+            fh.write(txt)
+        runs = sorted(f for f in os.listdir(path) if f.startswith("run_") and f.endswith(".json"))
+        for f in runs[:max(0, len(runs) - max(1, keep))]:
+            try:
+                os.remove(os.path.join(path, f))
+            except Exception:
+                pass
+        return True
+    except Exception as ex:
+        output.print_md(u"**Warning:** cannot save change log: " + str(ex))
+        return False
+
+
+_LOGINFO_CACHE = {}
+
+
+def log_info_text(dkey, sch_name):
+    path = log_dir(dkey, sch_name)
+    f = os.path.join(path, "last.json")
+    if not os.path.exists(f):
+        return u"Log '" + log_base_name(sch_name) + u"': no previous log - this run = baseline"
+    try:
+        mt = os.path.getmtime(f)
+    except Exception:
+        mt = 0
+    if _LOGINFO_CACHE.get(path, (None,))[0] != mt:
+        d = load_last_log(path) or {}
+        _LOGINFO_CACHE[path] = (mt, d.get("time", "?"), len(d.get("elements", {})))
+    _mt, tm, n = _LOGINFO_CACHE[path]
+    return (u"Log '" + log_base_name(sch_name) + u"': previous run " + tm +
+            u"  (" + str(n) + u" elements)")
+
+
+def neighbour_ids(el):
+    k = int(id_val(el.Id))
+    res = set()
+    for c in get_connectors(el):
+        try:
+            if not c.IsConnected:
+                continue
+            for r in c.AllRefs:
+                ow = r.Owner
+                if ow is None or isinstance(ow, DB.MEPSystem):
+                    continue
+                if r.ConnectorType == DB.ConnectorType.Logical:
+                    continue
+                o = int(id_val(ow.Id))
+                if o != k:
+                    res.add(o)
+        except Exception:
+            continue
+    return res
+
+
+def conn_sizes_mm(el):
+    out = set()
+    for c in get_connectors(el):
+        try:
+            if c.Shape == DB.ConnectorProfileType.Round:
+                out.add(int(round(c.Radius * 2.0 / MM)))
+        except Exception:
+            pass
+    return sorted(out)
+
+
+def snap_points_mm(el):
+    cp = curve_pts(el)
+    pts = list(cp) if cp else ([elem_pt(el)] if elem_pt(el) is not None else [])
+    return [[int(round(p.X / MM)), int(round(p.Y / MM)), int(round(p.Z / MM))] for p in pts]
+
+
+def pts_shift(a, b):
+    """Max point displacement (mm) between two snapshots, None if not comparable."""
+    if not a or not b or len(a) != len(b):
+        return None
+
+    def dist(p, q):
+        return ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2) ** 0.5
+
+    d1 = max(dist(p, q) for p, q in zip(a, b))
+    if len(a) == 2:
+        d1 = min(d1, max(dist(a[0], b[1]), dist(a[1], b[0])))
+    return d1
+
+
+def diff_logs(prev_el, cur_el, tol_mm):
+    """-> OrderedDict  id(str) -> (status NEW / MOD / DEL, [reasons])"""
+    ch = OrderedDict()
+    for sk, c in cur_el.items():
+        p = prev_el.get(sk)
+        if p is None:
+            ch[sk] = ("NEW", [u"added"])
+            continue
+        rs = []
+        if p.get("t") != c.get("t"):
+            rs.append(u"type: " + (p.get("t") or u"?") + u" -> " + (c.get("t") or u"?"))
+        elif p.get("tm") != c.get("tm"):
+            rs.append(u"type mark: " + (p.get("tm") or u"-") + u" -> " + (c.get("tm") or u"-"))
+        if p.get("sz") != c.get("sz"):
+            rs.append(u"size: " + str(p.get("sz")) + u" -> " + str(c.get("sz")))
+        if p.get("s") != c.get("s"):
+            rs.append(u"system: " + u", ".join(p.get("s") or []) + u" -> " +
+                      u", ".join(c.get("s") or []))
+        if p.get("l") != c.get("l"):
+            rs.append(u"level: " + (p.get("l") or u"?") + u" -> " + (c.get("l") or u"?"))
+        d = pts_shift(p.get("p"), c.get("p"))
+        if d is None:
+            if p.get("p") != c.get("p"):
+                rs.append(u"geometry")
+        elif d > tol_mm:
+            rs.append(u"moved " + str(int(round(d))) + u" mm")
+        if (p.get("n") or []) != (c.get("n") or []):
+            rs.append(u"connection")
+        if rs:
+            ch[sk] = ("MOD", rs)
+    for sk in prev_el:
+        if sk not in cur_el:
+            ch[sk] = ("DEL", [u"removed / out of scope"])
+    return ch
+
+
+def mark_targets(changes, pos, prev_el, cur_el, max_hops=60):
+    """Changed element -> drafting position to circle.
+    Drawn item                  -> its own symbol.
+    Pipe / fitting / not drawn  -> nearest drawn symbol(s) through the pipework.
+    Removed drawn item          -> its position in the previous schematic.
+    Returns list of dicts {x, y, st:set, ids:list}, merged by position."""
+    adj = {}
+    for sk, c in cur_el.items():
+        k = int(sk)
+        for o in c.get("n") or []:
+            if str(o) in cur_el:
+                adj.setdefault(k, set()).add(o)
+                adj.setdefault(o, set()).add(k)
+
+    def nearest(starts):
+        seen = set(starts)
+        front = list(starts)
+        for _h in range(max_hops):
+            hit = [k for k in front if k in pos]
+            if hit:
+                return hit[:3]
+            nxt = []
+            for k in front:
+                for o in adj.get(k, ()):
+                    if o not in seen:
+                        seen.add(o)
+                        nxt.append(o)
+            if not nxt:
+                return []
+            front = nxt
+        return []
+
+    marks = OrderedDict()
+
+    def add(x, y, st, sk):
+        key = (round(x, 3), round(y, 3))
+        m = marks.get(key)
+        if m is None:
+            m = {"x": x, "y": y, "st": set(), "ids": []}
+            marks[key] = m
+        m["st"].add(st)
+        m["ids"].append(sk)
+
+    unplaced = []
+    for sk, (st, _rs) in changes.items():
+        k = int(sk)
+        if st == "DEL":
+            p = prev_el.get(sk, {})
+            if p.get("sx") is not None and p.get("sy") is not None:
+                add(p["sx"], p["sy"], st, sk)
+                continue
+            starts = [o for o in (p.get("n") or []) if str(o) in cur_el]
+        else:
+            starts = [k]
+        hits = nearest(starts) if starts else []
+        if not hits:
+            unplaced.append(sk)
+            continue
+        for h in hits:
+            add(pos[h][0], pos[h][1], st, sk)
+    return list(marks.values()), unplaced
+
+
+def latest_open_revision():
+    best = None
+    try:
+        for i in DB.Revision.GetAllRevisionIds(doc):
+            r = doc.GetElement(i)
+            if r is not None and not r.Issued:
+                best = r
+    except Exception:
+        return None
+    return best.Id if best is not None else None
+
+
+def draw_marks(dr, marks, P, warn):
+    """Circle / cloud each changed position + tag 'C<n> NEW/MOD/DEL'."""
+    if not marks:
+        return 0
+    r = dr.pm(P["mark_radius_mm"])
+    gs = get_or_create_line_style(MARK_STYLE_NAME, DB.Color(*MARK_COLOR), 5)
+    rev_id = None
+    if P["mark_style"] == MARK_CLOUD:
+        rev_id = latest_open_revision()
+        if rev_id is None:
+            warn.append(u"No un-issued revision in the project - changes marked with circles.")
+    for i, m in enumerate(marks):
+        x, y = m["x"], m["y"]
+        done = False
+        if rev_id is not None:
+            try:
+                p = [DB.XYZ(x - r, y - r, 0), DB.XYZ(x + r, y - r, 0),
+                     DB.XYZ(x + r, y + r, 0), DB.XYZ(x - r, y + r, 0)]
+                crv = List[DB.Curve]([DB.Line.CreateBound(p[j], p[(j + 1) % 4]) for j in range(4)])
+                rc = DB.RevisionCloud.Create(doc, dr.view, rev_id, crv)
+                dr.ids.append(rc.Id)
+                done = True
+            except Exception as ex:
+                if not warn or not warn[-1].startswith(u"Revision cloud"):
+                    warn.append(u"Revision cloud failed (" + str(ex) + u") - circles used.")
+        if not done:
+            dr.dot(x, y, r, gs)
+        st = u"/".join(s for s in ("NEW", "MOD", "DEL") if s in m["st"])
+        m["no"] = i + 1
+        dr.text(x + r * 0.75, y + r * 0.75 + dr.text_h, u"C" + str(i + 1) + u" " + st)
+    return len(marks)
+
+
+def to_eid(k):
+    try:
+        if int(doc.Application.VersionNumber) >= 2024:
+            return DB.ElementId(System.Int64(k))
+    except Exception:
+        pass
+    return DB.ElementId(int(k))
 
 
 # ----------------------------------------------------------------------------
@@ -2106,6 +3189,7 @@ def create_drafting_view(base_name):
 # MAIN
 # ----------------------------------------------------------------------------
 def main():
+    TOPO.__init__()
     view = doc.ActiveView
     if view is None or view.IsTemplate or isinstance(view, (DB.ViewDrafting, DB.ViewSheet,
                                                             DB.ViewSchedule)):
@@ -2234,12 +3318,14 @@ def main():
     sym_lookup = collect_symbols()
     sym_options = [NONE_OPT] + sorted(sym_lookup.keys(), key=nat_key)
     smap = settings["mapping"]
-    map_rows = [(cats[mk], mk, counts[mk], smap.get(mk, NONE_OPT), False)
+    slabels = settings["labels"]
+    map_rows = [(cats[mk], mk, counts[mk], smap.get(mk, NONE_OPT), False, slabels.get(mk, u""))
                 for mk in sorted(counts.keys(), key=lambda m: (cats[m], nat_key(m)))]
     for mk in settings["extras"]:
         if mk in extra_cands and mk not in counts:
             map_rows.append((extra_cands[mk][0], mk, extra_cands[mk][1],
-                             smap.get(mk, NONE_OPT), True))
+                             smap.get(mk, NONE_OPT), True, slabels.get(mk, u"")))
+    dkey = doc_key()
 
     dviews = collect_drafting_views()
     lstyles = collect_line_styles()
@@ -2248,7 +3334,9 @@ def main():
     frm = SchematicWindow(P, sys_rows, map_rows, extra_cands, smap, sym_options,
                           sorted(dviews.keys(), key=nat_key),
                           sorted(lstyles.keys(), key=nat_key),
-                          sorted(ttypes.keys(), key=nat_key))
+                          sorted(ttypes.keys(), key=nat_key),
+                          saved_labels=slabels,
+                          log_info=lambda nm: log_info_text(dkey, nm))
     frm.ShowDialog()
     if not frm.ok:
         return
@@ -2261,6 +3349,11 @@ def main():
             smap[mk] = v
         elif mk in smap:
             del smap[mk]
+    for mk, v in frm.labels.items():
+        if v:
+            slabels[mk] = v
+        elif mk in slabels:
+            del slabels[mk]
     settings["extras"] = [mk for mk in settings["extras"] if mk not in extra_cands] + frm.extras
     save_settings(settings)
 
@@ -2331,7 +3424,7 @@ def main():
     def mk_item(k):
         n = SNode("item", k)
         n.key = MKEY[k]
-        n.label = label_text(scope[k])
+        n.label = slabels.get(MKEY[k]) or label_text(scope[k])
         return n
 
     def level_of_z(z):
@@ -2415,13 +3508,21 @@ def main():
             z = zof(k)
             return level_of_z(z) if z is not None else None
         ctx.level_of_k = level_of_k
+        TOPO.items = set(sym_ids)
+        for _k in scope:
+            _z = zof(_k)
+            if _z is not None:
+                TOPO.zl[_k] = level_of_z(_z)
 
         def mk_conns(k):
-            if not P["show_xconn"] or ctx.net is None or KIND.get(k) == "fix":
+            if ctx.net is None or KIND.get(k) == "fix":
                 return []
             out = []
             for csid, sobj, org in ctx.net.cross.get(k, []):
                 if not ensure_sys(csid, sobj):
+                    continue
+                # option OFF: only vent risers are kept (connection points hidden)
+                if not P["show_xconn"] and not is_vent(csid):
                     continue
                 n = SNode("conn", k)
                 n.sid = csid
@@ -2480,8 +3581,10 @@ def main():
                     root, root_pt = find_root(subnet, order, KIND, picked_roots)
                     if root is None:
                         break
-                    tree = Tree(subnet, root, root_pt, KIND, ctx.stk, TOPZ)
+                    tree = Tree(subnet, root, root_pt, KIND, ctx.stk, TOPZ,
+                                vent_k=lambda k: KIND.get(k) != "fix" and is_vent(ESYS.get(k)))
                     tree.is_item = ctx.is_item
+                    TOPO.add_tree(tree)
                     remaining -= set(tree.nodes)
                     sids = [ESYS[k] for k in tree.nodes
                             if KIND.get(k) == "pipe" and ESYS.get(k) is not None]
@@ -2526,6 +3629,7 @@ def main():
                         continue
                     tree = Tree(net, root, root_pt, KIND, ctx.stk, TOPZ)
                     tree.is_item = ctx.is_item
+                    TOPO.add_tree(tree)
                     n += 1
                     lbl = meta["label"] if len(pipe_comps) == 1 else meta["label"] + u"-" + str(n)
                     stacks.append(build_network(tree, root, lbl, meta))
@@ -2613,8 +3717,47 @@ def main():
                 _walk(b.nodes)
             _walk([n for n, _l in st.inline])
 
+    # ---- change log: snapshot of every element ID in scope ----
+    chk_sids = set(sd.id for sd in sysdata.values() if sd.name in checked)
+
+    def in_log(k):
+        ids = SYS_IDS.get(k) or set()
+        if not ids:
+            return NO_SYS in checked
+        return bool(ids & chk_sids)
+
+    sys_name_by_id = dict((sd.id, sd.name) for sd in sysdata.values())
+    cur_el = OrderedDict()
+    for k, e in scope.items():
+        if not in_log(k):
+            continue
+        try:
+            lv = resolve_level(e, levels, P["level_method"], tol)
+            rec = {
+                "c": KIND.get(k),
+                "cat": cat_name(e),
+                "t": MKEY.get(k) or model_key(e),
+                "tm": label_text(e),
+                "sz": conn_sizes_mm(e),
+                "s": sorted(sys_name_by_id.get(i, str(i)) for i in SYS_IDS.get(k, ())),
+                "l": lv.Name if lv is not None else u"",
+                "p": snap_points_mm(e),
+                "n": sorted(neighbour_ids(e)),
+            }
+            if KIND.get(k) in ("fix", "acc", "fit"):
+                rec["lb"] = slabels.get(MKEY[k]) or rec["tm"]
+            cur_el[str(k)] = rec
+        except Exception:
+            continue
+    log_name = log_base_name(P["target_view"] if (P["view_mode"] == VIEW_OVER and
+                                                 P["target_view"] in dviews)
+                             else P["new_view_name"])
+    log_path = log_dir(dkey, log_name)
+    prev_log = load_last_log(log_path)
+    changes = diff_logs(prev_log["elements"], cur_el, P["move_tol_mm"]) if prev_log else None
+    marks, unplaced = [], []
+
     # ---- transaction ----
-    dkey = doc_key()
     gen = settings["generated"].setdefault(dkey, {})
     warn = []
     weight = int(P.get("pipe_line_weight", 4))
@@ -2649,14 +3792,30 @@ def main():
         lsp = pm(P["level_spacing_mm"])
         ly = OrderedDict((id_val(l.Id), i * lsp) for i, l in enumerate(levels_draw))
         lay = Layout(dr, P, ly, ly[id_val(top.Id)], sym_map, conn_gs)
+        lay.esys = ESYS
+        lay.lz = dict((id_val(l.Id), l.ProjectElevation) for l in levels_draw)
+        lay.is_vent = is_vent
 
-        x = 0.0
-        for st in stacks:
-            if st.kind == "hmain":
-                x = lay.place_h(st, x)
-            else:
-                lay.slots(st)
-                x = lay.place(st, x)
+        def _place_all():
+            xx = 0.0
+            for st in stacks:
+                if st.kind == "hmain":
+                    xx = lay.place_h(st, xx)
+                else:
+                    lay.slots(st)
+                    xx = lay.place(st, xx)
+            return xx
+
+        x = _place_all()
+        if P.get("auto_lsp", True) and len(levels_draw) > 1:
+            lay.measure_depth(stacks)                 # pass 1: how deep is every level?
+            lay.expand_levels(levels_draw, stacks, lambda l: id_val(l.Id))
+            lay.top_y = ly[id_val(top.Id)]
+            x = _place_all()                          # pass 2: final layout
+            grown = [l.Name for l in levels_draw
+                     if lay.gaps.get(id_val(l.Id), 0.0) > lsp + 1e-9]
+            if grown:
+                output.print_md(u"Level spacing expanded below: **" + u", ".join(grown) + u"**")
         for st in stacks:
             lay.draw(st)
 
@@ -2668,6 +3827,7 @@ def main():
             dr.text(x_left, y + dr.text_h * 3.0 + pm(1),
                     l.Name + u"\rRL " + u"{:+.3f}".format(l.Elevation * 0.3048))
 
+        n_links = write_links(dr.links, warn)       # model IDs -> drafting elements
         if P["group_output"] and dr.ids:
             try:
                 grp = doc.Create.NewGroup(List[DB.ElementId](dr.ids))
@@ -2678,6 +3838,10 @@ def main():
                     pass
             except Exception as ex:
                 warn.append("Could not group generated items: " + str(ex))
+        # marks are NOT grouped (easy to delete), but tracked for overwrite clean-up
+        if P["mark_changes"] and changes:
+            marks, unplaced = mark_targets(changes, lay.pos, prev_log["elements"], cur_el)
+            draw_marks(dr, marks, P, warn)
         created_uids = []
         for i in dr.ids:
             e = doc.GetElement(i)
@@ -2691,6 +3855,26 @@ def main():
 
     gen[sview.UniqueId] = created_uids
     save_settings(settings)
+
+    # ---- save change log (schematic position of every drawn element) ----
+    for k, (sx, sy) in lay.pos.items():
+        rec = cur_el.get(str(k))
+        if rec is not None:
+            rec["sx"], rec["sy"] = sx, sy
+    now = System.DateTime.Now
+    log_data = {
+        "time": now.ToString("yyyy-MM-dd HH:mm:ss"),
+        "stamp": now.ToString("yyyyMMdd_HHmmss"),
+        "user": doc.Application.Username,
+        "model": dkey,
+        "schematic": log_name,
+        "view": sview.Name,
+        "view_uid": sview.UniqueId,
+        "systems": sorted(checked),
+        "elements": cur_el,
+        "draw": dict((str(k), v) for k, v in dr.links.items()),
+    }
+    log_saved = save_log(log_path, log_data, int(P.get("log_keep", 20)))
 
     try:
         uidoc.ActiveView = sview
@@ -2708,11 +3892,20 @@ def main():
                         u"** | Placeholders: **" + str(s["placeholder"]) +
                         u"** | Skipped: **" + str(s["skipped"]) +
                         u"** | Vent risers: **" + str(s["riser"]) +
-                        u"** | System change points: **" + str(s["conn"]) + u"**")
+                        u"** | System change points: **" + str(s["conn"]) + u"**" +
+                        u" | Linked drafting elements: **" + str(n_links) + u"**")
         if P["order_by"] == ORDER_NET:
             output.print_md(u"Sequence: `>` start -> end, `{...}` sub-branch tier, "
                             u"`[...]` drains into item, `<VP^>` vent riser, `<SD>` system change. "
                             u"Main: **" + P["main_mode"] + u"**, grouping: **" + P["net_mode"] + u"**.")
+        for root_st in stacks:
+            if root_st.kind == "hmain":
+                z = root_st.z_low if P.get("hmain_z_mode") == HZ_LOW else root_st.z_avg
+                if z is not None:
+                    output.print_md(u"Horizontal main **" + root_st.label + u"**: RL " +
+                                    u"{:+.3f}".format(z * 0.3048) + u" (project origin) - " +
+                                    (u"drawn at real elevation" if P.get("hmain_real_z", True)
+                                     else u"drawn at level - drop"))
         rows = []
 
         def add_stack_rows(st):
@@ -2755,6 +3948,60 @@ def main():
                 output.print_md(u"- " + mk)
     except Exception as ex:
         output.print_md(u"Schematic created. Report could not be printed: " + str(ex))
+
+    # ---- change report ----
+    try:
+        output.print_md(u"---")
+        output.print_md(u"## Change log - **" + log_name + u"**")
+        output.print_md(u"Log folder: `" + log_path + u"`" +
+                        (u"" if log_saved else u"  (**not saved**)"))
+        if prev_log is None:
+            output.print_md(u"No previous log - this run (" + str(len(cur_el)) +
+                            u" elements) is saved as the **baseline**. "
+                            u"Changes will be detected from the next run.")
+            return
+        cnt = {"NEW": 0, "MOD": 0, "DEL": 0}
+        for st, _rs in changes.values():
+            cnt[st] += 1
+        output.print_md(u"Compared with run **" + prev_log.get("time", "?") + u"** (" +
+                        prev_log.get("user", "?") + u", " + str(len(prev_log["elements"])) +
+                        u" elements)  ->  now " + str(len(cur_el)) + u" elements.  " +
+                        u"**NEW: " + str(cnt["NEW"]) + u"  |  MOD: " + str(cnt["MOD"]) +
+                        u"  |  DEL: " + str(cnt["DEL"]) + u"**")
+        if not changes:
+            output.print_md(u"No change since the previous run.")
+            return
+        if set(prev_log.get("systems") or []) != set(checked):
+            output.print_md(u"**Note:** ticked systems differ from the previous run - "
+                            u"elements of un-ticked systems are reported as DEL / NEW.")
+        mark_of = {}
+        for m in marks:
+            for sk in m["ids"]:
+                mark_of.setdefault(sk, []).append(u"C" + str(m.get("no", "?")))
+        if P["mark_changes"]:
+            output.print_md(u"Marked positions in view: **" + str(len(marks)) + u"**" +
+                            (u"  |  not placeable: " + str(len(unplaced)) if unplaced else u""))
+        rows = []
+        order = {"NEW": 0, "MOD": 1, "DEL": 2}
+        for sk, (st, rs) in sorted(changes.items(), key=lambda kv: (order[kv[1][0]], int(kv[0]))):
+            rec = cur_el.get(sk) or prev_log["elements"].get(sk) or {}
+            if st == "DEL":
+                eid = sk
+            else:
+                try:
+                    eid = output.linkify(to_eid(int(sk)))
+                except Exception:
+                    eid = sk
+            rows.append([u", ".join(mark_of.get(sk, [])) or u"-", st, eid,
+                         rec.get("cat", u"?"), rec.get("lb") or rec.get("t", u"?"),
+                         rec.get("l", u""), u"; ".join(rs)])
+        output.print_table(table_data=rows[:1000],
+                           columns=["Mark", "Status", "Element ID", "Category",
+                                    "Type / Label", "Level", "Change"])
+        if len(rows) > 1000:
+            output.print_md(u"... " + str(len(rows) - 1000) + u" more (see log files).")
+    except Exception as ex:
+        output.print_md(u"Change report could not be printed: " + str(ex))
 
 
 main()

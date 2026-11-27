@@ -204,8 +204,12 @@
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
 
-                <TextBlock Text="Kết quả sẽ xuất thêm ElementId có thể click/zoom trong pyRevit Output."
-                           VerticalAlignment="Center" Foreground="#64748B"/>
+                <StackPanel VerticalAlignment="Center" Margin="0,0,12,0">
+                    <TextBlock Text="Khi chạy sẽ hiện progress bar trên đầu Revit; có thể bấm Cancel để dừng (chọn giữ kết quả hoặc rollback)."
+                               Foreground="#64748B" TextWrapping="Wrap"/>
+                    <TextBlock Text="Kết quả xuất ElementId có thể click/zoom trong pyRevit Output."
+                               Foreground="#94A3B8" FontSize="11" Margin="0,2,0,0" TextWrapping="Wrap"/>
+                </StackPanel>
                 <Button Grid.Column="1" Name="BtnCancel" Content="Hủy" Width="95" Height="36"
                         Margin="0,0,9,0" Background="#F8FAFC" Foreground="#475569"
                         BorderBrush="#CBD5E1"/>

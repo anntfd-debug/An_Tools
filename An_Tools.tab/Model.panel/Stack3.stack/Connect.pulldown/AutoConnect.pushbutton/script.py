@@ -18,13 +18,15 @@ Gioi han / nguyen tac:
 - Hai pipe phai cung duong kinh va cung Piping System Type.
 - Moi pipe chi duoc ghep mot lan trong mot lan chay.
 - Pipe Type can co Routing Preferences va elbow family ho tro goc da chon.
+- Neu pipe cu co Pipe Insulation thi pipe noi moi va 2 elbow moi cung duoc
+  gan Insulation cung Type va cung Thickness.
 """
 
 import math
 import traceback
 
 from pyrevit import revit, DB, forms, script, EXEC_PARAMS
-from Autodesk.Revit.DB.Plumbing import Pipe
+from Autodesk.Revit.DB.Plumbing import Pipe, PipeInsulation
 from Autodesk.Revit.UI.Selection import ISelectionFilter
 from Autodesk.Revit.Exceptions import OperationCanceledException
 
@@ -53,6 +55,12 @@ MAX_BASE_PIPE_SLOPE_DEG = 10.0    # Ho tro slope den ~17.6%; pipe dung van bo qu
 DIAMETER_TOLERANCE_MM = 0.2
 CONNECTOR_SEARCH_TOLERANCE_MM = 5.0
 MIN_NEW_PIPE_LENGTH_MM = 10.0
+
+# Insulation cho pipe / elbow moi.
+COPY_INSULATION = True
+# False: neu gan insulation loi thi van giu ket noi, chi ghi chu trong report.
+# True : neu gan insulation loi thi rollback ca cap pipe do.
+ROLLBACK_IF_INSULATION_FAILS = False
 
 # Bao ve slope cua 2 pipe goc.
 # Slope duoc kiem tra tu chinh Location.Curve, khong phu thuoc cach family elbow solve.
@@ -344,6 +352,118 @@ def create_elbow(connector1, connector2):
         return doc.Create.NewElbowFitting(connector2, connector1)
     except Exception:
         raise first_error
+
+
+# -----------------------------------------------------------------------------
+# INSULATION
+# -----------------------------------------------------------------------------
+def get_insulation_elements(element):
+    """Tra ve danh sach PipeInsulation dang gan tren element."""
+    result = []
+    if element is None:
+        return result
+    try:
+        insulation_ids = DB.InsulationLiningBase.GetInsulationIds(doc, element.Id)
+    except Exception:
+        return result
+    for insulation_id in insulation_ids:
+        insulation = doc.GetElement(insulation_id)
+        if isinstance(insulation, PipeInsulation):
+            result.append(insulation)
+    return result
+
+
+def get_insulation_info(element):
+    """Doc Insulation Type + Thickness cua pipe cu. Khong co thi tra ve None."""
+    for insulation in get_insulation_elements(element):
+        try:
+            type_id = insulation.GetTypeId()
+            thickness = insulation.Thickness
+            if type_id is None or eid_value(type_id) <= 0:
+                continue
+            if thickness is None or thickness <= EPS:
+                continue
+            return {
+                "type_id": type_id,
+                "thickness": thickness,
+                "source_id": eid_value(element.Id)
+            }
+        except Exception:
+            continue
+    return None
+
+
+def choose_insulation_info(pipe1, pipe2):
+    """
+    Chon insulation de copy cho doan noi moi.
+    - Ca 2 pipe co insulation: lay loai DAY HON (an toan hon).
+    - Chi 1 pipe co insulation: lay theo pipe do.
+    - Khong pipe nao co: tra ve None.
+    """
+    info1 = get_insulation_info(pipe1)
+    info2 = get_insulation_info(pipe2)
+    if info1 is None:
+        return info2
+    if info2 is None:
+        return info1
+    if info2["thickness"] > info1["thickness"] + EPS:
+        return info2
+    return info1
+
+
+def apply_insulation(element, insulation_info):
+    """
+    Gan insulation cho pipe / fitting moi.
+    Tra ve: "created", "existing", "none", hoac raise Exception neu loi.
+    """
+    if element is None or insulation_info is None:
+        return "none"
+    if get_insulation_elements(element):
+        # Revit da tu gan insulation, khong tao trung.
+        return "existing"
+    PipeInsulation.Create(
+        doc,
+        element.Id,
+        insulation_info["type_id"],
+        insulation_info["thickness"]
+    )
+    return "created"
+
+
+def apply_insulation_to_new_elements(elements, insulation_info):
+    """Gan insulation cho pipe noi + 2 elbow. Tra ve chuoi ghi chu cho report."""
+    if not COPY_INSULATION:
+        return u"Tat"
+    if insulation_info is None:
+        return u"Pipe cu khong co"
+
+    created = 0
+    existing = 0
+    errors = []
+    for element in elements:
+        if element is None:
+            continue
+        try:
+            status = apply_insulation(element, insulation_info)
+            if status == "created":
+                created += 1
+            elif status == "existing":
+                existing += 1
+        except Exception as ex:
+            message = u"Id {0}: {1}".format(eid_value(element.Id), text_type(ex))
+            if ROLLBACK_IF_INSULATION_FAILS:
+                raise Exception(u"Gan insulation loi - " + message)
+            errors.append(message)
+
+    note = u"{0:g} mm (tu Pipe {1}) - tao {2}, co san {3}".format(
+        round(ft_to_mm(insulation_info["thickness"]), 1),
+        insulation_info["source_id"],
+        created,
+        existing
+    )
+    if errors:
+        note += u" | LOI: " + u"; ".join(errors)
+    return note
 
 
 # -----------------------------------------------------------------------------
@@ -806,6 +926,9 @@ def connect_pair(pair):
     point1 = pair["new_point1"]
     point2 = pair["new_point2"]
 
+    # Doc insulation cua pipe cu TRUOC khi sua hinh hoc.
+    insulation_info = choose_insulation_info(pipe1, pipe2)
+
     # Hai diem moi da duoc tinh tren true 3D centerline cua tung pipe.
     set_pipe_endpoint(pipe1, endpoint1["endpoint_index"], point1)
     set_pipe_endpoint(pipe2, endpoint2["endpoint_index"], point2)
@@ -845,7 +968,7 @@ def connect_pair(pair):
     if new_connector1 is None:
         raise Exception(u"Khong tim duoc connector dau 1 cua pipe noi moi.")
 
-    create_elbow(connector1, new_connector1)
+    elbow1 = create_elbow(connector1, new_connector1)
     doc.Regenerate()
 
     # Elbow dau tien co the trim pipe moi, nen doc lai connector dau thu hai.
@@ -855,7 +978,7 @@ def connect_pair(pair):
     if connector2 is None or new_connector2 is None:
         raise Exception(u"Khong tim duoc connector de tao elbow thu hai.")
 
-    create_elbow(connector2, new_connector2)
+    elbow2 = create_elbow(connector2, new_connector2)
     doc.Regenerate()
 
     # Revit co the solve/trim khi tao fitting. Kiem tra lan cuoi:
@@ -863,7 +986,18 @@ def connect_pair(pair):
     validate_pipe_geometry_preserved(endpoint1)
     validate_pipe_geometry_preserved(endpoint2)
 
-    return new_pipe
+    # Gan insulation cho pipe noi moi va 2 elbow moi (neu pipe cu co insulation).
+    insulation_note = apply_insulation_to_new_elements(
+        [new_pipe, elbow1, elbow2],
+        insulation_info
+    )
+    doc.Regenerate()
+
+    return {
+        "pipe": new_pipe,
+        "elbows": [elbow1, elbow2],
+        "insulation_note": insulation_note
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -952,7 +1086,8 @@ def main():
             transaction.SetFailureHandlingOptions(failure_options)
 
             try:
-                new_pipe = connect_pair(pair)
+                result = connect_pair(pair)
+                new_pipe = result["pipe"]
                 transaction.Commit()
 
                 success_rows.append([
@@ -963,7 +1098,8 @@ def main():
                     "{0:.2f}".format(pair["actual_angle2"]),
                     "{0:.1f}".format(ft_to_mm(pair["move1"])),
                     "{0:.1f}".format(ft_to_mm(pair["move2"])),
-                    "{0:.1f}".format(ft_to_mm(pair["new_length"]))
+                    "{0:.1f}".format(ft_to_mm(pair["new_length"])),
+                    result["insulation_note"]
                 ])
 
             except Exception as ex:
@@ -989,7 +1125,50 @@ def main():
             pass
         raise
 
-    
+    report_results(success_rows, failure_rows, requested_angle)
+
+
+def report_results(success_rows, failure_rows, requested_angle):
+    try:
+        output.print_md(u"# Auto Connect Offset Pipes - goc {0:g} do".format(requested_angle))
+        if success_rows:
+            output.print_md(u"## Noi thanh cong: {0}".format(len(success_rows)))
+            output.print_table(
+                table_data=[
+                    [output.linkify(DB.ElementId(r[0])),
+                     output.linkify(DB.ElementId(r[1])),
+                     output.linkify(DB.ElementId(r[2]))] + list(r[3:])
+                    for r in success_rows
+                ],
+                columns=[
+                    u"Pipe 1", u"Pipe 2", u"Pipe moi",
+                    u"Goc 1", u"Goc 2", u"Move 1 (mm)", u"Move 2 (mm)",
+                    u"Dai pipe moi (mm)", u"Insulation"
+                ]
+            )
+        if failure_rows:
+            output.print_md(u"## That bai: {0}".format(len(failure_rows)))
+            output.print_table(
+                table_data=[
+                    [output.linkify(DB.ElementId(r[0])),
+                     output.linkify(DB.ElementId(r[1])),
+                     r[2]]
+                    for r in failure_rows
+                ],
+                columns=[u"Pipe 1", u"Pipe 2", u"Ly do"]
+            )
+        output.show()
+    except Exception:
+        pass
+
+    safe_alert(
+        u"Hoan tat.\n\nThanh cong: {0} cap\nThat bai: {1} cap\n\n"
+        u"Chi tiet (bao gom Insulation) xem trong pyRevit Output."
+        .format(len(success_rows), len(failure_rows)),
+        warn=bool(failure_rows)
+    )
+
+
 # Khong dung dieu kien __name__ == "__main__" vi mot so pyRevit executor
 # co the gan ten module khac, lam script im lang va khong goi main().
 try:

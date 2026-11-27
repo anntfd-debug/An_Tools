@@ -4,8 +4,9 @@ import sys
 import re
 import json
 import math
-
+import time
 import clr
+
 clr.AddReference("PresentationFramework")
 clr.AddReference("PresentationCore")
 clr.AddReference("WindowsBase")
@@ -14,16 +15,18 @@ clr.AddReference("System.Xaml")
 from pyrevit import forms, script
 from Autodesk.Revit.DB import *
 from Autodesk.Revit.DB.Structure import StructuralType
+
 try:
     from Autodesk.Revit.DB.Plumbing import PipeInsulation
 except Exception:
     PipeInsulation = None
+
 from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
 from Autodesk.Revit.Exceptions import OperationCanceledException
+
 import System
 from System.Collections.Generic import List
 from System.Windows.Markup import XamlReader
-
 
 doc = __revit__.ActiveUIDocument.Document
 uidoc = __revit__.ActiveUIDocument
@@ -52,11 +55,56 @@ MIN_PENETRATION_ANGLE_TO_SURFACE_DEG = 30.0
 
 # Bỏ các đoạn giao cực ngắn do tiếp tuyến/sai số hình học.
 MIN_INTERSECTION_LENGTH_FT = 2.0 / 304.8  # 2 mm
+
+# Trục MEP được kéo dài để tìm TOÀN BỘ chiều dày host (canh tâm sleeve), nhưng
+# phần THẬT của đối tượng MEP phải nằm trong host ít nhất giá trị này thì mới đặt
+# sleeve. Chặn trường hợp ống chỉ dừng gần tường/sàn mà vẫn bị đặt sleeve.
+MIN_REAL_OVERLAP_FT = 10.0 / 304.8  # 10 mm
+
+# Chỉ xử lý đối tượng MEP thật sự hiển thị trong Active View
+# (Visibility/Filter/View Range + Section Box + Crop Region).
+ONLY_ACTIVE_VIEW_ELEMENTS = True
+
+# Ghi chú bổ sung in đầu báo cáo pyRevit Output.
+REPORT_NOTES = []
 ANGLE_EPSILON = 1.0e-9
 
 # So sánh size theo 0.1 mm để loại sai số số thực do đơn vị nội bộ của Revit.
 # Đây vẫn là khớp bằng nhau, không còn dùng dung sai ±5 mm như bản cũ.
 SIZE_KEY_DECIMALS = 1
+
+# ==============================================================================
+# CẤU HÌNH PROGRESS BAR
+# ==============================================================================
+# Chỉ vẽ lại progress bar sau mỗi khoảng thời gian này (giây) để không làm chậm tool.
+# Nút Cancel cũng chỉ được ghi nhận khi progress bar được vẽ lại.
+PROGRESS_REFRESH_SECONDS = 0.15
+
+# ==============================================================================
+# CẤU HÌNH ỐNG ĐỨNG XUYÊN SÀN DỐC
+# ==============================================================================
+# Ống được xem là "ống đứng" khi trục lệch khỏi phương thẳng đứng không quá giá trị này.
+VERTICAL_PIPE_TOLERANCE_DEG = 2.0
+
+# Sàn / mặt dầm được xem là "dốc" khi pháp tuyến lệch khỏi trục Z lớn hơn giá trị này.
+# Sàn phẳng (<= giá trị này) vẫn host trực tiếp lên mặt sàn như bản cũ.
+SLOPED_SURFACE_TOLERANCE_DEG = 0.5
+
+# Ống đứng xuyên sàn dốc: sleeve được host lên Reference Plane NẰM NGANG tại cao độ
+# tâm đoạn xuyên, nên trục sleeve luôn thẳng đứng 90° và không nghiêng theo sàn.
+VERTICAL_SLEEVE_REF_PLANE_PREFIX = "AUTO_SLEEVE_H_"
+
+# ==============================================================================
+# CẤU HÌNH SÀN + DẦM CHỒNG NHAU
+# ==============================================================================
+# Khi cùng một ống xuyên Floor và Structural Framing tại cùng vị trí (các đoạn xuyên
+# chồng lên nhau hoặc sát nhau theo trục ống), chỉ đặt MỘT sleeve và ưu tiên dầm:
+# host lên mặt dầm + chiều dày sleeve lấy theo chiều dày dầm.
+PRIORITIZE_BEAM_OVER_FLOOR = True
+
+# Hai đoạn xuyên được xem là cùng vị trí khi khoảng hở giữa chúng theo trục ống
+# không vượt quá giá trị này (bao gồm cả trường hợp sàn/dầm join, tiếp giáp nhau).
+OVERLAP_GAP_TOLERANCE_FT = 5.0 / 304.8  # 5 mm
 
 
 # ==============================================================================
@@ -198,14 +246,12 @@ def get_link_instance_name(link_instance):
             return safe_text(name)
     except Exception:
         pass
-
     try:
         link_type = link_instance.Document.GetElement(link_instance.GetTypeId())
         if link_type:
             return safe_text(link_type.Name)
     except Exception:
         pass
-
     return "Revit Link ID {}".format(get_element_id_value(link_instance.Id))
 
 
@@ -214,6 +260,56 @@ def get_document_title(link_doc):
         return safe_text(link_doc.Title)
     except Exception:
         return ""
+
+
+# ==============================================================================
+# PROGRESS BAR
+# ==============================================================================
+class ProgressTracker(object):
+    """
+    Bọc pyRevit forms.ProgressBar:
+      - Giới hạn tần suất vẽ lại (PROGRESS_REFRESH_SECONDS) để không làm chậm tool.
+      - Cho phép đổi tiêu đề theo từng giai đoạn.
+      - Đọc trạng thái nút Cancel.
+    """
+
+    def __init__(self, progress_bar):
+        self.pb = progress_bar
+        self.last_refresh = 0.0
+
+    @staticmethod
+    def _escape(text):
+        # Title của pyRevit dùng .format(value=, max_value=), nên phải escape ngoặc nhọn.
+        return safe_text(text).replace("{", "{{").replace("}", "}}")
+
+    def set_title(self, text):
+        try:
+            self.pb.title = self._escape(text) + "  ({value}/{max_value})"
+        except Exception:
+            pass
+
+    def set_indeterminate(self, state):
+        try:
+            self.pb.indeterminate = bool(state)
+        except Exception:
+            pass
+
+    def update(self, value, maximum, force=False):
+        now = time.time()
+        if not force and (now - self.last_refresh) < PROGRESS_REFRESH_SECONDS:
+            return
+        self.last_refresh = now
+        try:
+            self.pb.update_progress(int(value), max(1, int(maximum)))
+        except Exception:
+            pass
+
+    @property
+    def cancelled(self):
+        try:
+            return bool(self.pb.cancelled)
+        except Exception:
+            return False
 
 
 # ==============================================================================
@@ -366,7 +462,6 @@ def collect_nested_link_targets(root_instance, max_depth=MAX_NESTED_DEPTH):
                 nested_doc = nested_instance.GetLinkDocument()
             except Exception:
                 nested_doc = None
-
             if not nested_doc:
                 continue
 
@@ -376,7 +471,6 @@ def collect_nested_link_targets(root_instance, max_depth=MAX_NESTED_DEPTH):
                 nested_doc_key = safe_text(nested_doc.PathName) or safe_text(nested_doc.Title)
             except Exception:
                 nested_doc_key = safe_text(nested_doc.Title)
-
             if nested_doc_key in ancestry_docs:
                 continue
 
@@ -430,7 +524,6 @@ def collect_targets_from_root_ids(root_link_ids):
         elem = doc.GetElement(element_id)
         if not isinstance(elem, RevitLinkInstance):
             continue
-
         root_id = get_element_id_value(elem.Id)
         if root_id in seen_root_ids:
             continue
@@ -597,9 +690,15 @@ class ReportApp(object):
 # ==============================================================================
 # PYREVIT OUTPUT
 # ==============================================================================
-def print_pyrevit_report(placed_records, skipped_records, missing_size_records, total_deleted, total_placed, scan_wall, scan_floor, scan_beam):
+def print_pyrevit_report(placed_records, skipped_records, missing_size_records, total_deleted, total_placed,
+                         scan_wall, scan_floor, scan_beam, cancel_note=""):
     output.set_title("Auto Sleeve - Kết quả")
     output.print_md("# KẾT QUẢ AUTO PLACE SLEEVE")
+
+    if cancel_note:
+        output.print_md("> ⚠ **{}**".format(safe_markdown_text(cancel_note)))
+    for note in REPORT_NOTES:
+        output.print_md("> ℹ {}".format(safe_markdown_text(note)))
 
     missing_size_groups = {}
     for item in missing_size_records:
@@ -694,7 +793,6 @@ def print_pyrevit_report(placed_records, skipped_records, missing_size_records, 
         output.print_md("## Sleeve hiện có được bỏ qua do trùng")
         output.print_md("| STT | Sleeve hiện có | Đối tượng MEP | ĐK ống | Cách nhiệt | Required diameter | Link / Nested link |")
         output.print_md("|---:|---|---|---:|---:|---:|---|")
-
         for index, item in enumerate(skipped_records, 1):
             existing_link = output.linkify(
                 item["sleeve_id"],
@@ -726,6 +824,7 @@ def print_pyrevit_report(placed_records, skipped_records, missing_size_records, 
             "| STT | Required diameter cần bổ sung | Công thức xuất hiện | Số đối tượng | Chọn / zoom |"
         )
         output.print_md("|---:|---:|---|---:|---|")
+
         for index, required_key in enumerate(sorted(missing_size_groups.keys()), 1):
             group = missing_size_groups[required_key]
             combinations = ", ".join(sorted(group["combinations"]))
@@ -923,6 +1022,7 @@ class AutoSleeveApp(object):
             "Required diameter (mm) = đường kính ống + 2 × chiều dày cách nhiệt. "
             "Danh sách được quét từ toàn bộ Pipe trong model; vẫn có thể gõ số."
         )
+
         default_size_text = safe_text(default_size).strip()
         if default_size_text:
             default_number = extract_single_number(default_size_text)
@@ -1066,6 +1166,7 @@ class AutoSleeveApp(object):
                 self.refresh_link_display()
 
             btn_remove.Click += remove_root
+
             title_grid.Children.Add(title)
             title_grid.Children.Add(btn_remove)
             panel.Children.Add(title_grid)
@@ -1125,7 +1226,6 @@ class AutoSleeveApp(object):
                 "Hãy chọn ít nhất Wall, Floor hoặc Structural Framing. "
                 "Có thể chọn đồng thời nhiều loại kết cấu."
             )
-
         if not self.selected_root_ids:
             return "Chưa có Revit Link nào được pick."
 
@@ -1136,7 +1236,6 @@ class AutoSleeveApp(object):
                 break
         if not has_valid_mapping:
             return "Hãy nhập ít nhất một kích thước hợp lệ và chọn Sleeve Type."
-
         return ""
 
     def run_click(self, sender, event_args):
@@ -1256,11 +1355,13 @@ def get_size_string(elem):
 def get_length_parameter_mm(parameter):
     if not parameter or not parameter.HasValue:
         return None
+
     try:
         if parameter.StorageType == StorageType.Double:
             return internal_length_to_mm(parameter.AsDouble())
     except Exception:
         pass
+
     try:
         return extract_single_number(parameter.AsValueString())
     except Exception:
@@ -1330,7 +1431,7 @@ def get_insulation_element_thickness_mm(insulation_element):
     return 0.0
 
 
-def build_pipe_insulation_index(document):
+def build_pipe_insulation_index(document, tracker=None):
     """Map HostElementId -> chiều dày cách nhiệt lớn nhất, đơn vị mm."""
     result = {}
     try:
@@ -1343,7 +1444,13 @@ def build_pipe_insulation_index(document):
     except Exception:
         insulation_elements = []
 
-    for insulation_element in insulation_elements:
+    total = len(insulation_elements)
+    for index, insulation_element in enumerate(insulation_elements, 1):
+        if tracker:
+            if tracker.cancelled:
+                return None
+            tracker.update(index, total)
+
         try:
             host_id = get_element_id_value(insulation_element.HostElementId)
         except Exception:
@@ -1353,6 +1460,9 @@ def build_pipe_insulation_index(document):
         thickness_mm = get_insulation_element_thickness_mm(insulation_element)
         if thickness_mm > result.get(host_id, 0.0):
             result[host_id] = thickness_mm
+
+    if tracker:
+        tracker.update(total, total, force=True)
     return result
 
 
@@ -1382,7 +1492,6 @@ def get_insulation_thickness_mm(elem, insulation_index=None):
             doc.GetElement(insulation_id)
         )
         maximum_thickness = max(maximum_thickness, thickness_mm)
-
     if maximum_thickness > 0:
         return maximum_thickness
 
@@ -1423,6 +1532,7 @@ def get_required_diameter_info(elem, insulation_index=None):
 
     insulation_mm = get_insulation_thickness_mm(elem, insulation_index)
     required_mm = nominal_mm + 2.0 * insulation_mm
+
     return {
         "nominal_diameter_mm": normalize_size_mm(nominal_mm),
         "insulation_thickness_mm": normalize_size_mm(insulation_mm) or 0.0,
@@ -1431,7 +1541,7 @@ def get_required_diameter_info(elem, insulation_index=None):
     }
 
 
-def collect_model_required_pipe_sizes(document, insulation_index=None):
+def collect_model_required_pipe_sizes(document, insulation_index=None, tracker=None):
     size_values = set()
     try:
         pipe_elements = list(
@@ -1443,10 +1553,19 @@ def collect_model_required_pipe_sizes(document, insulation_index=None):
     except Exception:
         pipe_elements = []
 
-    for pipe_element in pipe_elements:
+    total = len(pipe_elements)
+    for index, pipe_element in enumerate(pipe_elements, 1):
+        if tracker:
+            if tracker.cancelled:
+                return None
+            tracker.update(index, total)
+
         info = get_required_diameter_info(pipe_element, insulation_index)
         if info and info["required_size_key"] is not None:
             size_values.add(info["required_size_key"])
+
+    if tracker:
+        tracker.update(total, total, force=True)
     return sorted(size_values)
 
 
@@ -1481,7 +1600,6 @@ def reset_sleeve_host_offset(sleeve):
         return False
 
     candidate_parameters = []
-
     try:
         parameter = sleeve.get_Parameter(
             BuiltInParameter.INSTANCE_FREE_HOST_OFFSET_PARAM
@@ -1757,7 +1875,6 @@ def get_structural_framing_host_label(global_normal):
 def get_host_surface_normal_local(host_element, local_point, fallback_face, fallback_projection):
     """
     Xác định pháp tuyến đại diện của bề mặt cần xuyên.
-
     - Wall: ưu tiên Wall.Orientation để không nhầm mặt đầu/mặt trên của tường.
     - Floor: ưu tiên mặt Top/Bottom để không nhầm cạnh đứng của sàn.
     - Structural Framing được chọn riêng theo hướng xuyên trước khi gọi hàm này.
@@ -1792,7 +1909,6 @@ def get_penetration_angles(axis_direction, surface_normal):
     Trả về:
       - góc giữa trục MEP và pháp tuyến bề mặt;
       - góc giữa trục MEP và chính bề mặt.
-
     Dùng trị tuyệt đối dot product vì chiều vector không ảnh hưởng kết quả.
     """
     if not axis_direction or not surface_normal:
@@ -1824,9 +1940,100 @@ def is_valid_penetration_angle(axis_direction, surface_normal):
     return is_valid, angle_to_normal, angle_to_surface
 
 
+_REAL_EXTENT_CACHE = {}
+
+
+def _project_t(point, origin, direction):
+    return (point - origin).DotProduct(direction)
+
+
+def get_real_points_of_mep(mep_element):
+    """Các điểm đại diện cho phần THẬT của MEP (không kéo dài)."""
+    # 1. Location curve (Pipe): đúng 2 đầu ống.
+    try:
+        location = mep_element.Location
+        if location and hasattr(location, "Curve") and location.Curve:
+            curve = location.Curve
+            return [curve.GetEndPoint(0), curve.GetEndPoint(1)]
+    except Exception:
+        pass
+
+    # 2. Fitting / Accessory: các connector vật lý.
+    points = []
+    try:
+        if mep_element.MEPModel and mep_element.MEPModel.ConnectorManager:
+            for connector in mep_element.MEPModel.ConnectorManager.Connectors:
+                if connector.ConnectorType != ConnectorType.Logical:
+                    points.append(connector.Origin)
+    except Exception:
+        pass
+    if len(points) >= 2:
+        return points
+
+    # 3. Dự phòng: 8 góc bounding box (Plumbing Fixture, family 1 connector...).
+    try:
+        bbox = mep_element.get_BoundingBox(None)
+        if bbox:
+            mn = bbox.Transform.OfPoint(bbox.Min) if bbox.Transform else bbox.Min
+            mx = bbox.Transform.OfPoint(bbox.Max) if bbox.Transform else bbox.Max
+            for x in (mn.X, mx.X):
+                for y in (mn.Y, mx.Y):
+                    for z in (mn.Z, mx.Z):
+                        points.append(XYZ(x, y, z))
+    except Exception:
+        pass
+    return points
+
+
+def get_real_axis_extent(mep_element, axis_curve):
+    """
+    Trả về (origin, direction, t_min, t_max): phạm vi thật của MEP dọc theo trục
+    đã kéo dài, tính trong hệ tọa độ host model.
+    """
+    key = get_element_id_value(mep_element.Id)
+    if key in _REAL_EXTENT_CACHE:
+        return _REAL_EXTENT_CACHE[key]
+
+    result = None
+    direction = get_curve_direction(axis_curve)
+    if direction:
+        try:
+            origin = axis_curve.GetEndPoint(0)
+            points = get_real_points_of_mep(mep_element)
+            if points:
+                t_values = [_project_t(p, origin, direction) for p in points]
+                result = (origin, direction, min(t_values), max(t_values))
+        except Exception:
+            result = None
+
+    _REAL_EXTENT_CACHE[key] = result
+    return result
+
+
+def segment_overlaps_real_mep(intersect_segment, local_to_global, real_extent):
+    """Đoạn xuyên (trên trục kéo dài) có chồng lên phần thật của MEP không?"""
+    if real_extent is None:
+        return False
+    origin, direction, real_t0, real_t1 = real_extent
+    try:
+        p0 = local_to_global.OfPoint(intersect_segment.GetEndPoint(0))
+        p1 = local_to_global.OfPoint(intersect_segment.GetEndPoint(1))
+    except Exception:
+        return False
+    t0 = _project_t(p0, origin, direction)
+    t1 = _project_t(p1, origin, direction)
+    seg_t0, seg_t1 = min(t0, t1), max(t0, t1)
+    overlap = min(seg_t1, real_t1) - max(seg_t0, real_t0)
+    return overlap >= MIN_REAL_OVERLAP_FT
+
+
 def get_linked_face_reference(link_target, host_element, mep_element):
     pipe_curve_global = get_axis_curve(mep_element)
     if not pipe_curve_global:
+        return None
+
+    real_extent = get_real_axis_extent(mep_element, pipe_curve_global)
+    if real_extent is None:
         return None
 
     try:
@@ -1846,7 +2053,6 @@ def get_linked_face_reference(link_target, host_element, mep_element):
         geometry_element = host_element.get_Geometry(geometry_options)
     except Exception:
         geometry_element = None
-
     if not geometry_element:
         return None
 
@@ -1906,6 +2112,17 @@ def get_linked_face_reference(link_target, host_element, mep_element):
                 if intersect_segment.Length < MIN_INTERSECTION_LENGTH_FT:
                     continue
             except Exception:
+                continue
+
+            # Chỉ nhận khi phần THẬT của MEP nằm trong host, không chỉ phần trục kéo dài.
+            try:
+                local_to_global = link_target.transform.Multiply(
+                    geometry_to_element_transform
+                )
+            except Exception:
+                continue
+            if not segment_overlaps_real_mep(
+                    intersect_segment, local_to_global, real_extent):
                 continue
 
             local_point = intersect_segment.Evaluate(0.5, True)
@@ -2002,6 +2219,12 @@ def get_linked_face_reference(link_target, host_element, mep_element):
                         normal_global
                     )
 
+                try:
+                    # Transform link/geometry là phép biến đổi cứng -> chiều dài giữ nguyên.
+                    axial_length = intersect_segment.Length
+                except Exception:
+                    axial_length = None
+
                 return (
                     global_point,
                     host_reference,
@@ -2009,7 +2232,8 @@ def get_linked_face_reference(link_target, host_element, mep_element):
                     thickness,
                     angle_to_surface,
                     angle_to_normal,
-                    host_label
+                    host_label,
+                    axial_length
                 )
             except Exception:
                 continue
@@ -2018,8 +2242,298 @@ def get_linked_face_reference(link_target, host_element, mep_element):
 
 
 # ==============================================================================
+# ỐNG ĐỨNG XUYÊN SÀN DỐC -> SLEEVE GIỮ THẲNG ĐỨNG 90°
+# ==============================================================================
+def is_vertical_axis(direction):
+    if not direction:
+        return False
+    try:
+        return abs(direction.Normalize().Z) >= math.cos(
+            math.radians(VERTICAL_PIPE_TOLERANCE_DEG)
+        )
+    except Exception:
+        return False
+
+
+def get_surface_slope_deg(normal):
+    """Độ dốc của bề mặt so với mặt phẳng ngang (0° = phẳng)."""
+    try:
+        nz = clamp(abs(normal.Normalize().Z), 0.0, 1.0)
+        return math.degrees(math.acos(nz))
+    except Exception:
+        return None
+
+
+def should_keep_vertical(mep_element, global_normal):
+    """
+    True khi: MEP là ống đứng + bề mặt xuyên là mặt ngang (Floor / mặt trên-dưới dầm)
+    nhưng bị dốc. Khi đó không host theo mặt dốc mà dùng Reference Plane nằm ngang.
+    """
+    pipe_direction = get_curve_direction(get_axis_curve(mep_element))
+    if not is_vertical_axis(pipe_direction):
+        return False, None
+    slope_deg = get_surface_slope_deg(global_normal)
+    if slope_deg is None:
+        return False, None
+    # Mặt gần đứng (Wall / mặt bên dầm) không thuộc trường hợp này.
+    if slope_deg >= 45.0:
+        return False, slope_deg
+    return slope_deg > SLOPED_SURFACE_TOLERANCE_DEG, slope_deg
+
+
+_HORIZONTAL_PLANE_CACHE = {}
+_REF_PLANE_VIEW = [None]
+
+
+def _get_view_for_reference_plane():
+    if _REF_PLANE_VIEW[0] is not None:
+        return _REF_PLANE_VIEW[0]
+    candidates = []
+    try:
+        active_view = doc.ActiveView
+        if active_view and not active_view.IsTemplate:
+            candidates.append(active_view)
+    except Exception:
+        pass
+    try:
+        for view in FilteredElementCollector(doc).OfClass(ViewPlan):
+            if not view.IsTemplate:
+                candidates.append(view)
+                break
+    except Exception:
+        pass
+    _REF_PLANE_VIEW[0] = candidates
+    return candidates
+
+
+def _plane_z_key(z_value):
+    # Gom theo 0.1 mm.
+    return int(round(z_value * 304.8 * 10.0))
+
+
+def get_horizontal_reference(point):
+    """
+    Lấy (hoặc tạo) Reference Plane nằm ngang tại cao độ point.Z.
+    Pháp tuyến = +Z (BasisX × BasisY) -> face-based sleeve có trục thẳng đứng.
+    Tái sử dụng plane cùng cao độ (kể cả plane tạo từ lần chạy trước).
+    """
+    key = _plane_z_key(point.Z)
+    if key in _HORIZONTAL_PLANE_CACHE:
+        return _HORIZONTAL_PLANE_CACHE[key]
+
+    plane_name = "{}{}".format(VERTICAL_SLEEVE_REF_PLANE_PREFIX, key)
+
+    # Plane cùng tên từ lần chạy trước.
+    try:
+        for ref_plane in FilteredElementCollector(doc).OfClass(ReferencePlane):
+            try:
+                if ref_plane.Name == plane_name:
+                    reference = ref_plane.GetReference()
+                    _HORIZONTAL_PLANE_CACHE[key] = reference
+                    return reference
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    bubble_end = XYZ(point.X - 1.0, point.Y, point.Z)
+    free_end = XYZ(point.X + 1.0, point.Y, point.Z)
+    cut_vector = XYZ.BasisY
+
+    last_error = None
+    for view in _get_view_for_reference_plane():
+        try:
+            ref_plane = doc.Create.NewReferencePlane(
+                bubble_end, free_end, cut_vector, view
+            )
+            try:
+                ref_plane.Name = plane_name
+            except Exception:
+                pass
+            reference = ref_plane.GetReference()
+            _HORIZONTAL_PLANE_CACHE[key] = reference
+            return reference
+        except Exception as ex:
+            last_error = ex
+            continue
+
+    if last_error:
+        logger.warning("Không tạo được Reference Plane ngang: {}".format(last_error))
+    _HORIZONTAL_PLANE_CACHE[key] = None
+    return None
+
+
+# ==============================================================================
+# GỘP VỊ TRÍ SÀN + DẦM CHỒNG NHAU
+# ==============================================================================
+def is_category(elem, built_in_category):
+    try:
+        return get_element_id_value(elem.Category.Id) == int(built_in_category)
+    except Exception:
+        return False
+
+
+def get_axis_interval(mep_element, point, axial_length):
+    """Khoảng [t0, t1] (ft) của đoạn xuyên theo trục ống, trong hệ tọa độ host."""
+    curve = get_axis_curve(mep_element)
+    direction = get_curve_direction(curve)
+    if not curve or not direction:
+        return None
+    try:
+        origin = curve.GetEndPoint(0)
+        t_center = (point - origin).DotProduct(direction)
+    except Exception:
+        return None
+    half = (axial_length or 0.0) / 2.0
+    return (t_center - half, t_center + half)
+
+
+def resolve_beam_floor_overlaps(candidates):
+    """
+    Input: danh sách candidate của MỘT đối tượng MEP (có thể từ nhiều link).
+    Gom các candidate có đoạn xuyên chồng/sát nhau theo trục ống.
+    Trong nhóm có dầm: bỏ các candidate Floor, chỉ giữ dầm (host + chiều dày dầm).
+    Wall và các nhóm không có dầm giữ nguyên như cũ.
+    """
+    if not PRIORITIZE_BEAM_OVER_FLOOR or len(candidates) < 2:
+        return candidates
+
+    with_interval = [c for c in candidates if c.get("interval")]
+    without_interval = [c for c in candidates if not c.get("interval")]
+    with_interval.sort(key=lambda c: c["interval"][0])
+
+    clusters = []
+    for candidate in with_interval:
+        if clusters and candidate["interval"][0] <= clusters[-1]["end"] + OVERLAP_GAP_TOLERANCE_FT:
+            clusters[-1]["items"].append(candidate)
+            clusters[-1]["end"] = max(clusters[-1]["end"], candidate["interval"][1])
+        else:
+            clusters.append({"items": [candidate], "end": candidate["interval"][1]})
+
+    result = list(without_interval)
+    for cluster in clusters:
+        items = cluster["items"]
+        beams = [c for c in items if c["is_beam"]]
+        floors = [c for c in items if c["is_floor"]]
+        if not beams or not floors:
+            result.extend(items)
+            continue
+
+        dropped_ids = [get_element_id_value(c["host_element"].Id) for c in floors]
+        for beam in beams:
+            beam["overlap_note"] = "ưu tiên dầm (bỏ Floor ID {})".format(
+                ", ".join(str(x) for x in dropped_ids)
+            )
+            result.append(beam)
+        # Giữ các host khác (ví dụ Wall) trong nhóm.
+        result.extend([c for c in items if not c["is_beam"] and not c["is_floor"]])
+
+    return result
+
+
+# ==============================================================================
 # MAIN
 # ==============================================================================
+def _bbox_world_corners(bbox):
+    corners = []
+    transform = bbox.Transform if bbox.Transform else Transform.Identity
+    for x in (bbox.Min.X, bbox.Max.X):
+        for y in (bbox.Min.Y, bbox.Max.Y):
+            for z in (bbox.Min.Z, bbox.Max.Z):
+                corners.append(transform.OfPoint(XYZ(x, y, z)))
+    return corners
+
+
+def _element_intersects_box(elem, box, check_z=True):
+    """Bbox của element có giao với BoundingBoxXYZ (section box / crop box) không."""
+    try:
+        elem_bbox = elem.get_BoundingBox(None)
+    except Exception:
+        elem_bbox = None
+    if not elem_bbox or not box:
+        return True  # Không xác định được -> không loại.
+    try:
+        inverse = (box.Transform if box.Transform else Transform.Identity).Inverse
+        local_points = [inverse.OfPoint(p) for p in _bbox_world_corners(elem_bbox)]
+    except Exception:
+        return True
+
+    tol = 1.0e-4
+    min_x = min(p.X for p in local_points); max_x = max(p.X for p in local_points)
+    min_y = min(p.Y for p in local_points); max_y = max(p.Y for p in local_points)
+    min_z = min(p.Z for p in local_points); max_z = max(p.Z for p in local_points)
+
+    if max_x < box.Min.X - tol or min_x > box.Max.X + tol:
+        return False
+    if max_y < box.Min.Y - tol or min_y > box.Max.Y + tol:
+        return False
+    if check_z and (max_z < box.Min.Z - tol or min_z > box.Max.Z + tol):
+        return False
+    return True
+
+
+def filter_elements_in_active_view(elements):
+    """
+    Giữ lại đối tượng hiển thị trong Active View:
+      - FilteredElementCollector(doc, view.Id): Visibility/Graphics, Filter, Hide,
+        View Range, Phase...
+      - Section Box (3D view) và Crop Region (nếu đang bật).
+    Trả về (kept, excluded).
+    """
+    view = doc.ActiveView
+    if view is None:
+        return list(elements), []
+
+    try:
+        visible_ids = set(
+            get_element_id_value(element_id)
+            for element_id in FilteredElementCollector(doc, view.Id)
+            .WhereElementIsNotElementType()
+            .ToElementIds()
+        )
+    except Exception:
+        visible_ids = None
+
+    section_box = None
+    try:
+        if isinstance(view, View3D) and view.IsSectionBoxActive:
+            section_box = view.GetSectionBox()
+    except Exception:
+        section_box = None
+
+    crop_box = None
+    try:
+        if view.CropBoxActive:
+            crop_box = view.CropBox
+    except Exception:
+        crop_box = None
+
+    kept = []
+    excluded = []
+    for elem in elements:
+        is_visible = True
+        if visible_ids is not None and get_element_id_value(elem.Id) not in visible_ids:
+            is_visible = False
+        if is_visible and section_box is not None:
+            is_visible = _element_intersects_box(elem, section_box, check_z=True)
+        if is_visible and crop_box is not None:
+            # Crop của plan/3D chỉ chắc chắn theo X/Y của view; Z do View Range quyết định.
+            check_z = False
+            try:
+                check_z = bool(view.CropBoxActive) and view.ViewType in (
+                    ViewType.Section, ViewType.Elevation, ViewType.Detail
+                )
+            except Exception:
+                check_z = False
+            is_visible = _element_intersects_box(elem, crop_box, check_z=check_z)
+
+        if is_visible:
+            kept.append(elem)
+        else:
+            excluded.append(elem)
+    return kept, excluded
+
+
 def get_selected_mep_elements():
     selected_elements = []
     selected_ids = uidoc.Selection.GetElementIds()
@@ -2105,6 +2619,7 @@ def build_numeric_mapping(app):
 
 def collect_host_elements(link_target, scan_wall, scan_floor, scan_beam):
     elements = []
+
     if scan_wall:
         try:
             elements.extend(list(
@@ -2141,20 +2656,65 @@ def collect_host_elements(link_target, scan_wall, scan_floor, scan_beam):
     return elements
 
 
+def scan_model_sizes_with_progress():
+    """Giai đoạn trước khi mở UI: quét insulation + size Pipe, có progress và Cancel."""
+    insulation_index = None
+    available_required_sizes = None
+
+    with forms.ProgressBar(title="Auto Sleeve", cancellable=True, step=1) as pb:
+        tracker = ProgressTracker(pb)
+
+        tracker.set_title("Auto Sleeve | 1/2 Đang đọc Pipe Insulation")
+        insulation_index = build_pipe_insulation_index(doc, tracker)
+        if insulation_index is None:
+            return None, None
+
+        tracker.set_title("Auto Sleeve | 2/2 Đang quét kích thước Pipe trong model")
+        available_required_sizes = collect_model_required_pipe_sizes(
+            doc, insulation_index, tracker
+        )
+        if available_required_sizes is None:
+            return None, None
+
+    return insulation_index, available_required_sizes
+
+
 def main():
+    del REPORT_NOTES[:]
+    _REAL_EXTENT_CACHE.clear()
+
     selected_elements = get_selected_mep_elements()
     if not selected_elements:
         return
+
+    if ONLY_ACTIVE_VIEW_ELEMENTS:
+        selected_elements, excluded_elements = filter_elements_in_active_view(
+            selected_elements
+        )
+        if excluded_elements:
+            REPORT_NOTES.append(
+                "Đã bỏ {} đối tượng MEP không hiển thị trong Active View '{}' "
+                "(ẩn, ngoài View Range, Section Box hoặc Crop Region).".format(
+                    len(excluded_elements), safe_text(doc.ActiveView.Name)
+                )
+            )
+        if not selected_elements:
+            forms.alert(
+                "Không có đối tượng MEP nào đã chọn hiển thị trong Active View.\n"
+                "Hãy chọn lại trong view đang mở.",
+                title="Auto Sleeve"
+            )
+            return
 
     current_dir = os.path.dirname(__file__)
     xaml_path = os.path.join(current_dir, "ui.xaml")
     if not os.path.exists(xaml_path):
         forms.alert("Không tìm thấy file ui.xaml trong cùng thư mục với script.py.", exitscript=True)
 
-    insulation_index = build_pipe_insulation_index(doc)
-    available_required_sizes = collect_model_required_pipe_sizes(
-        doc, insulation_index
-    )
+    insulation_index, available_required_sizes = scan_model_sizes_with_progress()
+    if insulation_index is None:
+        forms.alert("Đã hủy khi đang quét kích thước Pipe. Không có thay đổi nào.", title="Auto Sleeve")
+        return
 
     ui_state = load_settings()
     app = None
@@ -2245,6 +2805,61 @@ def main():
                 "required_diameter_mm": size_info["required_diameter_mm"]
             })
 
+    # Chỉ đưa vào vòng lặp các MEP có size mapping hợp lệ -> progress bar phản ánh đúng khối lượng.
+    mep_jobs = []
+    for mep_element in selected_elements:
+        size_info = selected_size_info.get(get_element_id_value(mep_element.Id))
+        if not size_info:
+            continue
+        if numeric_mapping.get(size_info["required_size_key"]) is None:
+            continue
+        mep_jobs.append((mep_element, size_info))
+
+    if not mep_jobs:
+        print_pyrevit_report(
+            placed_records, skipped_records, missing_size_records,
+            deleted_count, placed_count, scan_wall, scan_floor, scan_beam
+        )
+        return
+
+    # --------------------------------------------------------------------------
+    # GIAI ĐOẠN 1: gom Wall/Floor/Beam của từng link (có progress + Cancel)
+    # --------------------------------------------------------------------------
+    host_jobs = []
+    gather_cancelled = False
+    with forms.ProgressBar(title="Auto Sleeve", cancellable=True, step=1) as pb:
+        tracker = ProgressTracker(pb)
+        tracker.set_title("Auto Sleeve | Đang gom Wall/Floor/Beam trong link")
+        total_links = len(link_targets)
+        for link_index, link_target in enumerate(link_targets, 1):
+            if tracker.cancelled:
+                gather_cancelled = True
+                break
+            hosts = collect_host_elements(link_target, scan_wall, scan_floor, scan_beam)
+            if hosts:
+                host_jobs.append((link_target, hosts))
+            tracker.update(link_index, total_links, force=True)
+
+    if gather_cancelled:
+        forms.alert("Đã hủy khi đang gom đối tượng kết cấu. Không có thay đổi nào.", title="Auto Sleeve")
+        return
+
+    total_hosts = sum(len(hosts) for _, hosts in host_jobs)
+    total_steps = total_hosts * len(mep_jobs)
+    if total_steps <= 0:
+        print_pyrevit_report(
+            placed_records, skipped_records, missing_size_records,
+            deleted_count, placed_count, scan_wall, scan_floor, scan_beam
+        )
+        return
+
+    # --------------------------------------------------------------------------
+    # GIAI ĐOẠN 2: kiểm tra giao cắt + đặt sleeve (có progress + Cancel)
+    # --------------------------------------------------------------------------
+    run_cancelled = False
+    cancel_note = ""
+    total_link_jobs = len(host_jobs)
+
     with Transaction(doc, "Auto Place Sleeves MEP - Picked Links") as transaction:
         transaction.Start()
 
@@ -2253,171 +2868,322 @@ def main():
                 symbol.Activate()
         doc.Regenerate()
 
-        for link_target in link_targets:
-            host_elements = collect_host_elements(link_target, scan_wall, scan_floor, scan_beam)
-            if not host_elements:
-                continue
+        # ----------------------------------------------------------------------
+        # 2A. QUÉT GIAO CẮT (chưa thay đổi model) -> gom candidate theo từng MEP
+        # ----------------------------------------------------------------------
+        candidates_by_mep = {}
+        scan_cancelled = False
+        step_index = 0
 
-            for host_element in host_elements:
+        with forms.ProgressBar(title="Auto Sleeve", cancellable=True, step=1) as pb:
+            tracker = ProgressTracker(pb)
+
+            for link_job_index, (link_target, host_elements) in enumerate(host_jobs, 1):
+                if scan_cancelled:
+                    break
+
+                for host_element in host_elements:
+                    if scan_cancelled:
+                        break
+
+                    is_beam = is_category(host_element, BuiltInCategory.OST_StructuralFraming)
+                    is_floor = is_category(host_element, BuiltInCategory.OST_Floors)
+
+                    for mep_element, size_info in mep_jobs:
+                        step_index += 1
+                        if tracker.cancelled:
+                            scan_cancelled = True
+                            break
+                        tracker.set_title(
+                            "Auto Sleeve | Quét giao cắt · Link {}/{}".format(
+                                link_job_index, total_link_jobs
+                            )
+                        )
+                        tracker.update(step_index, total_steps)
+
+                        intersection_data = get_linked_face_reference(
+                            link_target,
+                            host_element,
+                            mep_element
+                        )
+                        if intersection_data is None:
+                            continue
+
+                        mep_key = get_element_id_value(mep_element.Id)
+                        candidates_by_mep.setdefault(mep_key, []).append({
+                            "mep_element": mep_element,
+                            "size_info": size_info,
+                            "link_target": link_target,
+                            "host_element": host_element,
+                            "data": intersection_data,
+                            "is_beam": is_beam,
+                            "is_floor": is_floor,
+                            "interval": get_axis_interval(
+                                mep_element, intersection_data[0], intersection_data[7]
+                            ),
+                            "overlap_note": ""
+                        })
+
+            if not scan_cancelled:
+                tracker.update(total_steps, total_steps, force=True)
+
+        if scan_cancelled:
+            transaction.RollBack()
+            forms.alert(
+                "Đã hủy khi đang quét giao cắt. Không có thay đổi nào.",
+                title="Auto Sleeve"
+            )
+            return
+
+        # Gộp vị trí sàn + dầm chồng nhau -> ưu tiên dầm.
+        placement_jobs = []
+        for mep_element, size_info in mep_jobs:
+            mep_key = get_element_id_value(mep_element.Id)
+            placement_jobs.extend(
+                resolve_beam_floor_overlaps(candidates_by_mep.get(mep_key, []))
+            )
+
+        # ----------------------------------------------------------------------
+        # 2B. ĐẶT SLEEVE
+        # ----------------------------------------------------------------------
+        total_place_steps = len(placement_jobs)
+        step_index = 0
+        total_steps = total_place_steps
+
+        with forms.ProgressBar(title="Auto Sleeve", cancellable=True, step=1) as pb:
+            tracker = ProgressTracker(pb)
+
+            for job in placement_jobs:
+                step_index += 1
+                if tracker.cancelled:
+                    run_cancelled = True
+                    break
+                tracker.set_title(
+                    "Auto Sleeve | Đặt sleeve · Đặt mới {} | Bỏ qua {} | Xóa {}".format(
+                        placed_count, len(skipped_records), deleted_count
+                    )
+                )
+                tracker.update(step_index, total_place_steps)
+
+                mep_element = job["mep_element"]
+                size_info = job["size_info"]
+                link_target = job["link_target"]
+                host_element = job["host_element"]
                 host_category_name = get_category_name(host_element)
 
-                for mep_element in selected_elements:
-                    size_info = selected_size_info.get(
-                        get_element_id_value(mep_element.Id)
+                nominal_diameter_mm = size_info["nominal_diameter_mm"]
+                insulation_thickness_mm = size_info["insulation_thickness_mm"]
+                required_diameter_mm = size_info["required_diameter_mm"]
+                required_size_key = size_info["required_size_key"]
+
+                chosen_symbol = numeric_mapping.get(required_size_key)
+                if not chosen_symbol:
+                    continue
+
+                (intersection_point, face_reference, global_normal, thickness_value,
+                 angle_to_surface, angle_to_normal, host_surface_label,
+                 axial_length) = job["data"]
+
+                # Ống đứng xuyên sàn/dầm dốc -> giữ sleeve thẳng đứng 90°.
+                keep_vertical, surface_slope_deg = should_keep_vertical(
+                    mep_element, global_normal
+                )
+                if keep_vertical:
+                    if axial_length:
+                        thickness_value = axial_length
+                    angle_to_surface = 90.0
+                    angle_to_normal = 0.0
+                    host_surface_label = "{} - dốc {:.1f}° · giữ đứng 90°".format(
+                        host_surface_label or host_category_name,
+                        surface_slope_deg
                     )
-                    if not size_info:
-                        continue
 
-                    nominal_diameter_mm = size_info["nominal_diameter_mm"]
-                    insulation_thickness_mm = size_info["insulation_thickness_mm"]
-                    required_diameter_mm = size_info["required_diameter_mm"]
-                    required_size_key = size_info["required_size_key"]
-
-                    # Khớp bằng nhau theo key 0.1 mm; không lấy sleeve gần nhất.
-                    chosen_symbol = numeric_mapping.get(required_size_key)
-                    if not chosen_symbol:
-                        continue
-
-                    intersection_data = get_linked_face_reference(
-                        link_target,
-                        host_element,
-                        mep_element
+                if job.get("overlap_note"):
+                    host_surface_label = "{} · {}".format(
+                        host_surface_label or host_category_name,
+                        job["overlap_note"]
                     )
-                    if intersection_data is None:
+
+                pipe_curve_global = get_axis_curve(mep_element)
+                is_duplicate = False
+                sleeve_to_delete = None
+
+                for existing_sleeve in list(existing_sleeves):
+                    try:
+                        sleeve_location = existing_sleeve.Location
+                        if not isinstance(sleeve_location, LocationPoint):
+                            continue
+                        sleeve_point = sleeve_location.Point
+                    except Exception:
                         continue
 
-                    (intersection_point, face_reference, global_normal, thickness_value,
-                     angle_to_surface, angle_to_normal, host_surface_label) = intersection_data
-                    pipe_curve_global = get_axis_curve(mep_element)
-                    is_duplicate = False
-                    sleeve_to_delete = None
+                    if sleeve_point.DistanceTo(intersection_point) >= 0.5:
+                        continue
 
-                    for existing_sleeve in list(existing_sleeves):
+                    if pipe_curve_global:
                         try:
-                            sleeve_location = existing_sleeve.Location
-                            if not isinstance(sleeve_location, LocationPoint):
-                                continue
-                            sleeve_point = sleeve_location.Point
+                            projection = pipe_curve_global.Project(sleeve_point)
                         except Exception:
-                            continue
+                            projection = None
+                        if projection and projection.Distance < 0.3:
+                            is_duplicate = True
+                            sleeve_to_delete = existing_sleeve
+                            break
 
-                        if sleeve_point.DistanceTo(intersection_point) >= 0.5:
-                            continue
+                if is_duplicate:
+                    duplicate_id_value = get_element_id_value(sleeve_to_delete.Id)
 
-                        if pipe_curve_global:
-                            try:
-                                projection = pipe_curve_global.Project(sleeve_point)
-                            except Exception:
-                                projection = None
-                            if projection and projection.Distance < 0.3:
-                                is_duplicate = True
-                                sleeve_to_delete = existing_sleeve
-                                break
+                    # Không xử lý lại sleeve vừa tạo trong chính lần chạy hiện tại.
+                    if duplicate_id_value in created_sleeve_ids:
+                        continue
 
-                    if is_duplicate:
-                        duplicate_id_value = get_element_id_value(sleeve_to_delete.Id)
+                    if not is_replace_mode:
+                        skip_key = (
+                            duplicate_id_value,
+                            get_element_id_value(mep_element.Id),
+                            link_target.path_name
+                        )
+                        if skip_key not in skipped_record_keys:
+                            skipped_record_keys.add(skip_key)
+                            skipped_records.append({
+                                "sleeve_id": sleeve_to_delete.Id,
+                                "source_id": mep_element.Id,
+                                "nominal_diameter_mm": nominal_diameter_mm,
+                                "insulation_thickness_mm": insulation_thickness_mm,
+                                "required_diameter_mm": required_diameter_mm,
+                                "link_name": link_target.path_name
+                            })
+                        continue
 
-                        # Không xử lý lại sleeve vừa tạo trong chính lần chạy hiện tại.
-                        if duplicate_id_value in created_sleeve_ids:
-                            continue
+                    try:
+                        doc.Delete(sleeve_to_delete.Id)
+                        if sleeve_to_delete in existing_sleeves:
+                            existing_sleeves.remove(sleeve_to_delete)
+                        deleted_count += 1
+                    except Exception:
+                        pass
 
-                        if not is_replace_mode:
-                            skip_key = (
-                                duplicate_id_value,
-                                get_element_id_value(mep_element.Id),
-                                link_target.path_name
+                try:
+                    vertical_reference = None
+                    if keep_vertical:
+                        vertical_reference = get_horizontal_reference(intersection_point)
+                        if vertical_reference is None:
+                            logger.warning(
+                                "Ống {}: không tạo được mặt ngang, sleeve sẽ nghiêng theo mặt dốc.".format(
+                                    get_element_id_value(mep_element.Id)
+                                )
                             )
-                            if skip_key not in skipped_record_keys:
-                                skipped_record_keys.add(skip_key)
-                                skipped_records.append({
-                                    "sleeve_id": sleeve_to_delete.Id,
-                                    "source_id": mep_element.Id,
-                                    "nominal_diameter_mm": nominal_diameter_mm,
-                                    "insulation_thickness_mm": insulation_thickness_mm,
-                                    "required_diameter_mm": required_diameter_mm,
-                                    "link_name": link_target.path_name
-                                })
-                            continue
 
+                    if vertical_reference is not None:
+                        new_sleeve = doc.Create.NewFamilyInstance(
+                            vertical_reference,
+                            intersection_point,
+                            XYZ.BasisX,
+                            chosen_symbol
+                        )
+                    elif face_reference:
+                        reference_direction = XYZ.BasisZ
+                        if abs(global_normal.Z) > 0.9:
+                            reference_direction = XYZ.BasisX
+                        new_sleeve = doc.Create.NewFamilyInstance(
+                            face_reference,
+                            intersection_point,
+                            reference_direction,
+                            chosen_symbol
+                        )
+                    else:
+                        new_sleeve = doc.Create.NewFamilyInstance(
+                            intersection_point,
+                            chosen_symbol,
+                            StructuralType.NonStructural
+                        )
+                except Exception as create_error:
+                    logger.warning(
+                        "Không tạo được sleeve tại {} / {}: {}".format(
+                            link_target.path_name,
+                            get_element_id_value(host_element.Id),
+                            create_error
+                        )
+                    )
+                    continue
+
+                if thickness_value:
+                    family_name = get_family_name(chosen_symbol)
+                    parameter_name = FAMILY_CONFIG.get(family_name, "NWCH_PEN_Thickness")
+                    parameter = new_sleeve.LookupParameter(parameter_name)
+                    if parameter and not parameter.IsReadOnly:
                         try:
-                            doc.Delete(sleeve_to_delete.Id)
-                            if sleeve_to_delete in existing_sleeves:
-                                existing_sleeves.remove(sleeve_to_delete)
-                            deleted_count += 1
+                            parameter.Set(thickness_value)
                         except Exception:
                             pass
 
-                    try:
-                        if face_reference:
-                            reference_direction = XYZ.BasisZ
-                            if abs(global_normal.Z) > 0.9:
-                                reference_direction = XYZ.BasisX
-                            new_sleeve = doc.Create.NewFamilyInstance(
-                                face_reference,
-                                intersection_point,
-                                reference_direction,
-                                chosen_symbol
-                            )
-                        else:
-                            new_sleeve = doc.Create.NewFamilyInstance(
-                                intersection_point,
-                                chosen_symbol,
-                                StructuralType.NonStructural
-                            )
-                    except Exception as create_error:
-                        logger.warning(
-                            "Không tạo được sleeve tại {} / {}: {}".format(
-                                link_target.path_name,
-                                get_element_id_value(host_element.Id),
-                                create_error
-                            )
-                        )
-                        continue
+                # Offset from Host = 0.0 là đúng tâm chiều dài host với family này.
+                reset_sleeve_host_offset(new_sleeve)
 
-                    if thickness_value:
-                        family_name = get_family_name(chosen_symbol)
-                        parameter_name = FAMILY_CONFIG.get(family_name, "NWCH_PEN_Thickness")
-                        parameter = new_sleeve.LookupParameter(parameter_name)
-                        if parameter and not parameter.IsReadOnly:
-                            try:
-                                parameter.Set(thickness_value)
-                            except Exception:
-                                pass
+                type_display = get_symbol_display_name(chosen_symbol)
+                tracker_key = (type_display, required_diameter_mm)
+                if tracker_key not in placed_tracker:
+                    placed_tracker[tracker_key] = []
+                placed_tracker[tracker_key].append(new_sleeve.Id)
 
-                    # Không cộng/trừ nửa chiều dày host. Với family sleeve này,
-                    # Offset from Host = 0.0 đã là đúng tâm chiều dài của host.
-                    # Revit có thể tự sinh offset khi điểm tạo nằm giữa solid,
-                    # nên luôn ép lại về 0 ngay sau khi tạo.
-                    reset_sleeve_host_offset(new_sleeve)
+                placed_records.append({
+                    "sleeve_id": new_sleeve.Id,
+                    "source_id": mep_element.Id,
+                    "source_category": get_category_name(mep_element),
+                    "nominal_diameter_mm": nominal_diameter_mm,
+                    "insulation_thickness_mm": insulation_thickness_mm,
+                    "required_diameter_mm": required_diameter_mm,
+                    "sleeve_type": type_display,
+                    "host_category": host_surface_label or host_category_name,
+                    "link_name": link_target.path_name,
+                    "host_id": get_element_id_value(host_element.Id),
+                    "angle_to_surface": angle_to_surface,
+                    "angle_to_normal": angle_to_normal
+                })
 
-                    type_display = get_symbol_display_name(chosen_symbol)
-                    tracker_key = (type_display, required_diameter_mm)
-                    if tracker_key not in placed_tracker:
-                        placed_tracker[tracker_key] = []
-                    placed_tracker[tracker_key].append(new_sleeve.Id)
+                existing_sleeves.append(new_sleeve)
+                created_sleeve_ids.add(get_element_id_value(new_sleeve.Id))
+                placed_count += 1
 
-                    placed_records.append({
-                        "sleeve_id": new_sleeve.Id,
-                        "source_id": mep_element.Id,
-                        "source_category": get_category_name(mep_element),
-                        "nominal_diameter_mm": nominal_diameter_mm,
-                        "insulation_thickness_mm": insulation_thickness_mm,
-                        "required_diameter_mm": required_diameter_mm,
-                        "sleeve_type": type_display,
-                        "host_category": host_surface_label or host_category_name,
-                        "link_name": link_target.path_name,
-                        "host_id": get_element_id_value(host_element.Id),
-                        "angle_to_surface": angle_to_surface,
-                        "angle_to_normal": angle_to_normal
-                    })
+            if not run_cancelled:
+                tracker.update(total_place_steps, total_place_steps, force=True)
 
-                    existing_sleeves.append(new_sleeve)
-                    created_sleeve_ids.add(get_element_id_value(new_sleeve.Id))
-                    placed_count += 1
+        # Progress bar đã đóng. Nếu người dùng bấm Cancel thì hỏi giữ hay hủy.
+        if run_cancelled:
+            keep_option = "Giữ {} sleeve đã đặt".format(placed_count)
+            rollback_option = "Hủy toàn bộ (Rollback)"
+            choice = forms.alert(
+                "Đã dừng tại bước {}/{}.\n\n"
+                "Đặt mới: {} · Bỏ qua trùng: {} · Xóa cũ: {}\n\n"
+                "Bạn muốn giữ kết quả đã chạy hay hủy toàn bộ thay đổi?".format(
+                    step_index, total_steps,
+                    placed_count, len(skipped_records), deleted_count
+                ),
+                title="Auto Sleeve - Đã hủy",
+                options=[keep_option, rollback_option]
+            )
 
-        transaction.Commit()
+            if choice == keep_option:
+                transaction.Commit()
+                cancel_note = "Đã dừng giữa chừng tại bước {}/{}; chỉ giữ kết quả đã chạy tới thời điểm hủy.".format(
+                    step_index, total_steps
+                )
+            else:
+                # Chọn Rollback hoặc đóng hộp thoại -> không thay đổi model.
+                transaction.RollBack()
+                save_settings(ui_state)
+                output.set_title("Auto Sleeve - Đã hủy")
+                output.print_md("# AUTO SLEEVE - ĐÃ HỦY")
+                output.print_md(
+                    "> Đã rollback toàn bộ. Không có sleeve nào được tạo hoặc xóa "
+                    "(dừng tại bước {}/{}).".format(step_index, total_steps)
+                )
+                return
+        else:
+            transaction.Commit()
 
     save_settings(ui_state)
+
     print_pyrevit_report(
         placed_records,
         skipped_records,
@@ -2426,7 +3192,8 @@ def main():
         placed_count,
         scan_wall,
         scan_floor,
-        scan_beam
+        scan_beam,
+        cancel_note
     )
 
     # Chỉ sử dụng pyRevit Output cho báo cáo sau khi chạy.

@@ -1,1114 +1,1375 @@
 # -*- coding: utf-8 -*-
+from __future__ import unicode_literals
+__title__ = u'Tag MEP Pro V3.2'
+__doc__ = u'Tạo mới, align hoặc chuẩn hóa Tag cho Pipe, Conduit, Fire Alarm Device, Plumbing Fixture và Pipe Accessory; vị trí tag trái/phải/trên/dưới; lọc chiều dài, kích thước, hướng, View Range và tự lưu cấu hình.'
 
-from pyrevit import revit, forms
 from Autodesk.Revit.DB import *
-from Autodesk.Revit.UI.Selection import ObjectType, ISelectionFilter
+from Autodesk.Revit.UI.Selection import ISelectionFilter, ObjectType
+from Autodesk.Revit.UI import TaskDialog
 from Autodesk.Revit.Exceptions import OperationCanceledException
-from System.Windows.Input import Keyboard, ModifierKeys
-from System.Windows import SystemParameters
-
+from pyrevit import revit, UI, script, forms
 import os
-import re
 import json
-import math
+import traceback
+
+# -----------------------------------------------------------------------------
+# UNICODE / TIẾNG VIỆT HELPERS
+# -----------------------------------------------------------------------------
+try:
+    unicode
+except NameError:
+    unicode = str
+
+TASK_DIALOG_TITLE = u'Tag MEP Pro'
 
 
-doc = revit.doc
-uidoc = revit.uidoc
-
-SCRIPT_DIR = os.path.dirname(__file__)
-XAML_PATH = os.path.join(SCRIPT_DIR, "ui.xaml")
-SETTINGS_PATH = os.path.join(SCRIPT_DIR, "settings.json")
-
-
-# ============================================================
-# Units
-# ============================================================
-
-def mm_to_ft(value_mm):
-    return float(value_mm) / 304.8
-
-
-def parse_mm(text_value):
-    if not text_value:
-        return 0.0
-
-    text_value = str(text_value)
-    text_value = text_value.replace(",", ".")
-
-    match = re.search(r"[-+]?\d*\.?\d+", text_value)
-
-    if not match:
-        return 0.0
-
-    return float(match.group())
-
-
-def format_mm(value):
+def ensure_unicode(value):
+    if value is None:
+        return u''
+    if isinstance(value, unicode):
+        return value
     try:
-        number_value = float(value)
-
-        if number_value == int(number_value):
-            return str(int(number_value)) + " mm"
-
-        return str(number_value) + " mm"
-
+        return value.decode('utf-8')
     except:
-        return "10 mm"
+        try:
+            return unicode(value)
+        except:
+            return str(value)
 
 
-def format_degree(value):
+def revit_message(message, title=TASK_DIALOG_TITLE):
+    msg = ensure_unicode(message)
+    ttl = ensure_unicode(title)
     try:
-        number_value = float(value)
-
-        if number_value == int(number_value):
-            return str(int(number_value)) + " deg"
-
-        return str(number_value) + " deg"
-
+        TaskDialog.Show(ttl, msg)
     except:
-        return "45 deg"
+        try:
+            print(msg)
+        except:
+            pass
 
 
-# ============================================================
-# Settings
-# ============================================================
-
-DEFAULT_SETTINGS = {
-    "shoulder_mm": 10,
-    "elbow_mm": 10,
-    "shoulder_enabled": True,
-    "elbow_enabled": True,
-    "tag_spacing_mm": 50,
-    "custom_angle_enabled": False,
-    "custom_angle_deg": 45,
-    "mode": "Customize",
-    "leader_types": ["90UD"],
-    "distribute_axis": "X"
-}
+def alert_msg(message):
+    revit_message(message)
 
 
-def get_default_settings():
-    data = {}
-    data["shoulder_mm"] = DEFAULT_SETTINGS["shoulder_mm"]
-    data["elbow_mm"] = DEFAULT_SETTINGS["elbow_mm"]
-    data["shoulder_enabled"] = DEFAULT_SETTINGS["shoulder_enabled"]
-    data["elbow_enabled"] = DEFAULT_SETTINGS["elbow_enabled"]
-    data["tag_spacing_mm"] = DEFAULT_SETTINGS["tag_spacing_mm"]
-    data["custom_angle_enabled"] = DEFAULT_SETTINGS["custom_angle_enabled"]
-    data["custom_angle_deg"] = DEFAULT_SETTINGS["custom_angle_deg"]
-    data["mode"] = DEFAULT_SETTINGS["mode"]
-    data["leader_types"] = list(DEFAULT_SETTINGS["leader_types"])
-    data["distribute_axis"] = DEFAULT_SETTINGS["distribute_axis"]
-    return data
+def toast_msg(message):
+    revit_message(message)
 
 
-def load_settings():
-    if not os.path.exists(SETTINGS_PATH):
-        return get_default_settings()
-
+def log(message):
     try:
-        f = open(SETTINGS_PATH, "r")
-        data = json.load(f)
-        f.close()
-
-        settings = get_default_settings()
-
-        for key in settings.keys():
-            if key in data:
-                settings[key] = data[key]
-
-        return settings
-
-    except:
-        return get_default_settings()
-
-
-def save_settings(settings):
-    try:
-        f = open(SETTINGS_PATH, "w")
-        json.dump(settings, f, indent=4)
-        f.close()
+        print(ensure_unicode(message))
     except:
         pass
 
 
-# ============================================================
-# Vector helpers
-# ============================================================
+# -----------------------------------------------------------------------------
+# ĐỊNH NGHĨA CÁC LOẠI ĐỐI TƯỢNG ĐƯỢC TAG
+# -----------------------------------------------------------------------------
+# kind: 'pipe' | 'conduit' | 'fa' | 'pf' | 'pa'
+#   - linear = True  -> đối tượng dạng đường (LocationCurve), xếp bậc theo cụm song song
+#   - linear = False -> đối tượng dạng điểm (FamilyInstance), tag lệch theo hướng chọn
+KIND_ORDER = ['pipe', 'conduit', 'fa', 'pf', 'pa']
 
-def normalize_vector(vector_value):
+KIND_INFO = {
+    'pipe': {
+        'label': u'Pipe',
+        'cat': BuiltInCategory.OST_PipeCurves,
+        'tag_cat': BuiltInCategory.OST_PipeTags,
+        'size_bip': BuiltInParameter.RBS_PIPE_DIAMETER_PARAM,
+        'linear': True,
+    },
+    'conduit': {
+        'label': u'Conduit',
+        'cat': BuiltInCategory.OST_Conduit,
+        'tag_cat': BuiltInCategory.OST_ConduitTags,
+        'size_bip': BuiltInParameter.RBS_CONDUIT_DIAMETER_PARAM,
+        'linear': True,
+    },
+    'fa': {
+        'label': u'Fire Alarm Device',
+        'cat': BuiltInCategory.OST_FireAlarmDevices,
+        'tag_cat': BuiltInCategory.OST_FireAlarmDeviceTags,
+        'size_bip': None,
+        'linear': False,
+    },
+    'pf': {
+        'label': u'Plumbing Fixture',
+        'cat': BuiltInCategory.OST_PlumbingFixtures,
+        'tag_cat': BuiltInCategory.OST_PlumbingFixtureTags,
+        'size_bip': None,
+        'linear': False,
+    },
+    'pa': {
+        'label': u'Pipe Accessory',
+        'cat': BuiltInCategory.OST_PipeAccessory,
+        'tag_cat': BuiltInCategory.OST_PipeAccessoryTags,
+        'size_bip': None,
+        'linear': False,
+    },
+}
+
+TAG_SIDES = ('left', 'right', 'top', 'bottom')
+
+
+# -----------------------------------------------------------------------------
+# HELPERS CHUNG
+# -----------------------------------------------------------------------------
+def get_id_value(element_id):
+    """Lấy ID dạng số, tương thích Revit 2024+ (Value) và bản cũ (IntegerValue)."""
     try:
-        return vector_value.Normalize()
+        return int(element_id.Value)
     except:
-        return vector_value
+        try:
+            return int(element_id.IntegerValue)
+        except:
+            return None
 
 
-def sign_from_dot(vector_value, axis_value):
+CAT_TO_KIND = {}
+TAG_CAT_TO_KIND = {}
+for _k in KIND_ORDER:
+    CAT_TO_KIND[int(KIND_INFO[_k]['cat'])] = _k
+    TAG_CAT_TO_KIND[int(KIND_INFO[_k]['tag_cat'])] = _k
+
+
+# -----------------------------------------------------------------------------
+# FILE PATHS / SETTINGS
+# -----------------------------------------------------------------------------
+SCRIPT_DIR = os.path.dirname(__file__)
+xaml_file = os.path.join(SCRIPT_DIR, 'ui_definition.xaml')
+CONFIG_FILENAME = 'tag_parallel_pipes_settings.json'
+CONFIG_FILE = os.path.join(SCRIPT_DIR, CONFIG_FILENAME)
+
+
+def get_fallback_config_file():
+    appdata = os.getenv('APPDATA')
+    if appdata:
+        folder = os.path.join(appdata, 'pyRevit_TagPipesPro')
+    else:
+        folder = os.path.join(os.path.expanduser('~'), '.pyRevit_TagPipesPro')
     try:
-        dot_value = vector_value.DotProduct(axis_value)
-
-        if dot_value >= 0:
-            return 1
-
-        return -1
-
+        if not os.path.exists(folder):
+            os.makedirs(folder)
     except:
-        return 1
+        pass
+    return os.path.join(folder, CONFIG_FILENAME)
 
 
-def get_view_axes():
-    active_view = doc.ActiveView
+FALLBACK_CONFIG_FILE = get_fallback_config_file()
 
-    right_axis = normalize_vector(active_view.RightDirection)
-    up_axis = normalize_vector(active_view.UpDirection)
+DEFAULT_SETTINGS = {
+    'spacing_mm': '5.0',
+    'min_length_mm': '500',
+    'max_length_mm': '10000',
+    'use_max_length': False,
+    'min_size_mm': '15',
+    'max_size_mm': '1000',
+    'use_max_size': True,
+    'scope': 'selection',          # selection | view
+    'orientation': 'all',          # all | horizontal | vertical
+    'tag_condition': 'all',        # all | untagged
+    'operation_mode': 'create',    # create | align | normalize
+    'tag_side': 'left',            # left | right | top | bottom
+    'view_range_mode': 'none',     # none | manual | active
+    'view_range_bottom_mm': '-1000',
+    'view_range_top_mm': '3000',
+    'use_pipe': True,
+    'use_conduit': False,
+    'use_fa': False,
+    'use_pf': False,
+    'use_pa': False,
+    'tag_type': '',                # Pipe tag (giữ key cũ để tương thích V2.0)
+    'conduit_tag_type': '',
+    'fa_tag_type': '',
+    'pf_tag_type': '',
+    'pa_tag_type': '',
+    'device_offset_mm': '6.0',
+    'device_leader': False,
+}
 
-    return right_axis, up_axis
+
+def to_text(value):
+    return ensure_unicode(value)
 
 
-def get_view_direction():
-    try:
-        return normalize_vector(doc.ActiveView.ViewDirection)
-    except:
-        return XYZ(0, 0, 1)
-
-
-def point_from_view_scalars(reference_point, right_axis, up_axis, right_scalar, up_scalar):
-    """
-    Rebuild a point from view X/Y scalar coordinates and keep the same
-    depth on the active view direction.
-
-    This avoids small diagonal errors when making 90-degree leaders.
-    """
-
-    view_direction = get_view_direction()
-    depth_scalar = reference_point.DotProduct(view_direction)
-
-    return (
-        right_axis.Multiply(right_scalar)
-        + up_axis.Multiply(up_scalar)
-        + view_direction.Multiply(depth_scalar)
-    )
-
-
-# ============================================================
-# Selection filter
-# ============================================================
-
-class IndependentTagSelectionFilter(ISelectionFilter):
-
-    def AllowElement(self, element):
-        if isinstance(element, IndependentTag):
-            return True
-
+def setting_to_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    text = to_text(value).strip().lower()
+    if text in ('true', '1', 'yes', 'on'):
+        return True
+    if text in ('false', '0', 'no', 'off', ''):
         return False
+    return default
+
+
+def load_settings():
+    settings = DEFAULT_SETTINGS.copy()
+    for path in [CONFIG_FILE, FALLBACK_CONFIG_FILE]:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            with open(path, 'r') as fp:
+                saved_data = json.load(fp)
+            if isinstance(saved_data, dict):
+                settings.update(saved_data)
+            break
+        except:
+            pass
+    return settings
+
+
+def write_settings_file(path, settings):
+    folder = os.path.dirname(path)
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder)
+    with open(path, 'w') as fp:
+        json.dump(settings, fp, indent=2, sort_keys=True)
+
+
+def save_settings(settings):
+    try:
+        write_settings_file(CONFIG_FILE, settings)
+        return CONFIG_FILE
+    except:
+        try:
+            write_settings_file(FALLBACK_CONFIG_FILE, settings)
+            return FALLBACK_CONFIG_FILE
+        except:
+            return None
+
+
+def mm_to_feet(mm, scale):
+    return (mm * scale) / 304.8
+
+
+def reverse_xyz(vec):
+    try:
+        return vec.Negate()
+    except:
+        return vec * -1.0
+
+
+def parse_mm_value(text_value, field_name):
+    try:
+        return float(to_text(text_value).replace(',', '.'))
+    except:
+        raise ValueError(u'{} phải là số hợp lệ.'.format(field_name))
+
+
+def get_element_kind(elem):
+    try:
+        if not elem or not elem.Category:
+            return None
+        return CAT_TO_KIND.get(get_id_value(elem.Category.Id))
+    except:
+        return None
+
+
+def get_tag_kind(tag):
+    try:
+        if not tag or not tag.Category:
+            return None
+        return TAG_CAT_TO_KIND.get(get_id_value(tag.Category.Id))
+    except:
+        return None
+
+
+def has_valid_curve(elem):
+    try:
+        return bool(elem.Location and hasattr(elem.Location, 'Curve') and elem.Location.Curve)
+    except:
+        return False
+
+
+def get_element_point(elem):
+    """Điểm đặt của thiết bị: LocationPoint, nếu không có thì tâm BoundingBox."""
+    try:
+        loc = elem.Location
+        if loc and hasattr(loc, 'Point') and loc.Point:
+            return loc.Point
+    except:
+        pass
+    try:
+        bb = elem.get_BoundingBox(None)
+        if bb:
+            return (bb.Min + bb.Max) * 0.5
+    except:
+        pass
+    return None
+
+
+def is_valid_target(elem, allowed_kinds):
+    kind = get_element_kind(elem)
+    if kind is None or kind not in allowed_kinds:
+        return False
+    if KIND_INFO[kind]['linear']:
+        return has_valid_curve(elem)
+    return get_element_point(elem) is not None
+
+
+def are_curves_parallel(e1, e2):
+    d1 = (e1.Location.Curve.GetEndPoint(1) - e1.Location.Curve.GetEndPoint(0)).Normalize()
+    d2 = (e2.Location.Curve.GetEndPoint(1) - e2.Location.Curve.GetEndPoint(0)).Normalize()
+    return abs(d1.DotProduct(d2)) > 0.95
+
+
+def get_perpendicular_distance(e1, e2):
+    pt1 = e1.Location.Curve.Evaluate(0.5, True)
+    pt2 = e2.Location.Curve.Evaluate(0.5, True)
+    d1 = (e1.Location.Curve.GetEndPoint(1) - e1.Location.Curve.GetEndPoint(0)).Normalize()
+    v = pt2 - pt1
+    return (v - d1 * v.DotProduct(d1)).GetLength()
+
+
+# -----------------------------------------------------------------------------
+# VIEW RANGE
+# -----------------------------------------------------------------------------
+def get_view_base_elevation(view):
+    try:
+        level = view.GenLevel
+        if level:
+            return level.Elevation
+    except:
+        pass
+    return 0.0
+
+
+def is_valid_level_id(level_id):
+    try:
+        return level_id and get_id_value(level_id) != -1
+    except:
+        return False
+
+
+def get_plan_view_plane_z(doc, view, plan_view_range, plane):
+    try:
+        level_id = plan_view_range.GetLevelId(plane)
+        offset = plan_view_range.GetOffset(plane)
+        level_elevation = get_view_base_elevation(view)
+        if is_valid_level_id(level_id):
+            level = doc.GetElement(level_id)
+            if level and hasattr(level, 'Elevation'):
+                level_elevation = level.Elevation
+        return level_elevation + offset
+    except:
+        return None
+
+
+def get_active_view_range_bounds(doc, view):
+    try:
+        pvr = view.GetViewRange()
+    except:
+        return None
+    top_z = get_plan_view_plane_z(doc, view, pvr, PlanViewPlane.TopClipPlane)
+    bottom_z = get_plan_view_plane_z(doc, view, pvr, PlanViewPlane.BottomClipPlane)
+    view_depth_z = get_plan_view_plane_z(doc, view, pvr, PlanViewPlane.ViewDepthPlane)
+    values = [v for v in (top_z, bottom_z, view_depth_z) if v is not None]
+    if len(values) < 2:
+        return None
+    upper = top_z if top_z is not None else max(values)
+    lower_candidates = [v for v in (bottom_z, view_depth_z) if v is not None]
+    lower = min(lower_candidates) if lower_candidates else min(values)
+    if upper < lower:
+        upper, lower = lower, upper
+    return (lower, upper)
+
+
+def get_element_z_span(elem):
+    try:
+        bb = elem.get_BoundingBox(None)
+        if bb:
+            return (bb.Min.Z, bb.Max.Z)
+    except:
+        pass
+    try:
+        curve = elem.Location.Curve
+        z0 = curve.GetEndPoint(0).Z
+        z1 = curve.GetEndPoint(1).Z
+        return (min(z0, z1), max(z0, z1))
+    except:
+        pass
+    pt = get_element_point(elem)
+    if pt is not None:
+        return (pt.Z, pt.Z)
+    return None
+
+
+def element_overlaps_z_range(elem, bottom_z, top_z):
+    span = get_element_z_span(elem)
+    if not span:
+        return False
+    return span[1] >= bottom_z and span[0] <= top_z
+
+
+# -----------------------------------------------------------------------------
+# SELECTION FILTER
+# -----------------------------------------------------------------------------
+class TagTargetSelectionFilter(ISelectionFilter):
+    def __init__(self, allowed_kinds, view_range_bounds=None):
+        self.allowed_kinds = list(allowed_kinds)
+        self.view_range_bounds = view_range_bounds
+
+    def AllowElement(self, elem):
+        try:
+            if not is_valid_target(elem, self.allowed_kinds):
+                return False
+            if self.view_range_bounds:
+                return element_overlaps_z_range(
+                    elem, self.view_range_bounds[0], self.view_range_bounds[1])
+            return True
+        except:
+            return False
 
     def AllowReference(self, reference, position):
         return False
 
 
-def is_shift_pressed():
-    try:
-        if Keyboard.Modifiers & ModifierKeys.Shift:
-            return True
+# -----------------------------------------------------------------------------
+# WPF WINDOW
+# -----------------------------------------------------------------------------
+class TagMEPWPF(forms.WPFWindow):
+    def __init__(self, xaml_file_path):
+        forms.WPFWindow.__init__(self, xaml_file_path)
+        self.result = None
+        self.settings = load_settings()
 
-        return False
+        # kind -> (checkbox, combobox, key checkbox, key tag type)
+        self.kind_controls = {
+            'pipe': (self.chkPipe, self.cbPipeTagTypes, 'use_pipe', 'tag_type'),
+            'conduit': (self.chkConduit, self.cbConduitTagTypes, 'use_conduit', 'conduit_tag_type'),
+            'fa': (self.chkFireAlarm, self.cbFireAlarmTagTypes, 'use_fa', 'fa_tag_type'),
+            'pf': (self.chkPlumbingFixture, self.cbPlumbingFixtureTagTypes, 'use_pf', 'pf_tag_type'),
+            'pa': (self.chkPipeAccessory, self.cbPipeAccessoryTagTypes, 'use_pa', 'pa_tag_type'),
+        }
+        self.tag_side_radios = {
+            'left': self.rbTagSideLeft,
+            'right': self.rbTagSideRight,
+            'top': self.rbTagSideTop,
+            'bottom': self.rbTagSideBottom,
+        }
+        self.tag_maps = {}
 
-    except:
-        return False
+        self.setup_tag_comboboxes()
+        self.apply_saved_settings()
 
+        for kind in KIND_ORDER:
+            if not KIND_INFO[kind]['linear']:
+                chk = self.kind_controls[kind][0]
+                chk.Checked += self.on_kind_toggled
+                chk.Unchecked += self.on_kind_toggled
+        self.on_kind_toggled(None, None)
 
-def pick_tags_after_apply(allow_multiple):
-    tag_filter = IndependentTagSelectionFilter()
-    tags = []
+        self.btnExecute.Click += self.on_execute_click
+        self.btnCancel.Click += self.on_close_click
 
-    if allow_multiple:
-        picked_refs = uidoc.Selection.PickObjects(
-            ObjectType.Element,
-            tag_filter,
-            "Select tags. Click Finish to apply this batch. Press Esc to exit."
-        )
+    def on_kind_toggled(self, sender, args):
+        try:
+            self.cardDevice.IsEnabled = any(
+                bool(self.kind_controls[k][0].IsChecked)
+                for k in KIND_ORDER if not KIND_INFO[k]['linear'])
+        except:
+            pass
 
-        for picked_ref in picked_refs:
-            element = doc.GetElement(picked_ref.ElementId)
+    # ------------------------------------------------------------------
+    def set_status(self, message):
+        try:
+            self.txtSettingsStatus.Text = message
+        except:
+            pass
 
-            if isinstance(element, IndependentTag):
-                tags.append(element)
+    def set_radio_value(self, radio_map, saved_value, default_value):
+        if saved_value not in radio_map:
+            saved_value = default_value
+        for key in radio_map:
+            radio_map[key].IsChecked = (key == saved_value)
 
-        return tags
+    # ------------------------------------------------------------------
+    def build_tag_map(self, doc, tag_bic):
+        symbols = FilteredElementCollector(doc)\
+            .OfClass(FamilySymbol)\
+            .OfCategory(tag_bic)\
+            .ToElements()
+        tag_map = {}
+        for t in symbols:
+            type_param = t.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)
+            type_name = type_param.AsString() if type_param else None
+            fam_param = t.get_Parameter(BuiltInParameter.SYMBOL_FAMILY_NAME_PARAM)
+            fam_name = fam_param.AsString() if fam_param else u'Unknown Family'
+            if type_name:
+                tag_map[u'{} - {}'.format(fam_name, type_name)] = t
+        return tag_map
 
-    picked_ref = uidoc.Selection.PickObject(
-        ObjectType.Element,
-        tag_filter,
-        "Select one tag. Hold Shift before selecting to use multiple selection. Press Esc to exit."
-    )
+    def setup_tag_comboboxes(self):
+        doc = revit.doc
+        for kind in KIND_ORDER:
+            chk, cb, _, _ = self.kind_controls[kind]
+            tag_map = self.build_tag_map(doc, KIND_INFO[kind]['tag_cat'])
+            self.tag_maps[kind] = tag_map
+            cb.ItemsSource = sorted(tag_map.keys())
+            if tag_map:
+                cb.SelectedIndex = 0
+            else:
+                try:
+                    chk.ToolTip = u'Model chưa load family {} Tag. Align vẫn dùng được; Tạo mới / Đổi Type cần load tag trước.'.format(
+                        KIND_INFO[kind]['label'])
+                except:
+                    pass
 
-    element = doc.GetElement(picked_ref.ElementId)
+    # ------------------------------------------------------------------
+    def apply_saved_settings(self):
+        s = self.settings
+        self.txtSpacing.Text = to_text(s.get('spacing_mm', DEFAULT_SETTINGS['spacing_mm']))
+        self.txtMinLength.Text = to_text(s.get('min_length_mm', DEFAULT_SETTINGS['min_length_mm']))
+        self.txtMaxLength.Text = to_text(s.get('max_length_mm', DEFAULT_SETTINGS['max_length_mm']))
+        self.chkLimitMaxLength.IsChecked = setting_to_bool(
+            s.get('use_max_length', DEFAULT_SETTINGS['use_max_length']), DEFAULT_SETTINGS['use_max_length'])
+        self.txtMinSize.Text = to_text(s.get('min_size_mm', DEFAULT_SETTINGS['min_size_mm']))
+        self.txtMaxSize.Text = to_text(s.get('max_size_mm', DEFAULT_SETTINGS['max_size_mm']))
+        self.chkLimitMaxSize.IsChecked = setting_to_bool(
+            s.get('use_max_size', DEFAULT_SETTINGS['use_max_size']), DEFAULT_SETTINGS['use_max_size'])
+        self.txtRangeBottom.Text = to_text(s.get('view_range_bottom_mm', DEFAULT_SETTINGS['view_range_bottom_mm']))
+        self.txtRangeTop.Text = to_text(s.get('view_range_top_mm', DEFAULT_SETTINGS['view_range_top_mm']))
+        self.txtDeviceOffset.Text = to_text(s.get('device_offset_mm', DEFAULT_SETTINGS['device_offset_mm']))
+        self.chkDeviceLeader.IsChecked = setting_to_bool(
+            s.get('device_leader', DEFAULT_SETTINGS['device_leader']), DEFAULT_SETTINGS['device_leader'])
 
-    if isinstance(element, IndependentTag):
-        tags.append(element)
+        self.set_radio_value({'view': self.rbView, 'selection': self.rbSelection},
+                             s.get('scope', 'selection'), 'selection')
+        self.set_radio_value({'all': self.rbOrientationAll,
+                              'horizontal': self.rbOrientationHorizontal,
+                              'vertical': self.rbOrientationVertical},
+                             s.get('orientation', 'all'), 'all')
+        self.set_radio_value({'all': self.rbAllPipes, 'untagged': self.rbUntaggedOnly},
+                             s.get('tag_condition', 'all'), 'all')
+        self.set_radio_value({'create': self.rbOperationCreate,
+                              'align': self.rbOperationAlign,
+                              'normalize': self.rbOperationNormalize},
+                             s.get('operation_mode', 'create'), 'create')
+        self.set_radio_value(self.tag_side_radios, s.get('tag_side', 'left'), 'left')
+        self.set_radio_value({'none': self.rbViewRangeNone,
+                              'manual': self.rbViewRangeManual,
+                              'active': self.rbViewRangeActive},
+                             s.get('view_range_mode', 'none'), 'none')
 
-    return tags
+        for kind in KIND_ORDER:
+            chk, cb, use_key, type_key = self.kind_controls[kind]
+            chk.IsChecked = setting_to_bool(s.get(use_key, DEFAULT_SETTINGS[use_key]), DEFAULT_SETTINGS[use_key])
+            saved_tag = s.get(type_key, '')
+            tag_map = self.tag_maps.get(kind, {})
+            if saved_tag and saved_tag in tag_map:
+                cb.SelectedItem = saved_tag
+            elif tag_map and cb.SelectedIndex < 0:
+                cb.SelectedIndex = 0
 
-
-# ============================================================
-# Tag helpers
-# ============================================================
-
-def get_first_tag_reference(tag):
-    try:
-        refs = list(tag.GetTaggedReferences())
-
-        if len(refs) > 0:
-            return refs[0]
-
-    except:
-        pass
-
-    return None
-
-
-def ensure_free_leader(tag):
-    try:
-        tag.LeaderEndCondition = LeaderEndCondition.Free
-    except:
-        pass
-
-
-def get_tag_current_direction_signs(tag, ref, right_axis, up_axis):
-    try:
-        leader_end = tag.GetLeaderEnd(ref)
-        tag_head = tag.TagHeadPosition
-
-        vector_value = tag_head - leader_end
-
-        right_sign = sign_from_dot(vector_value, right_axis)
-        up_sign = sign_from_dot(vector_value, up_axis)
-
-        return right_sign, up_sign
-
-    except:
-        return 1, 1
-
-
-# ============================================================
-# Geometry
-# ============================================================
-
-def get_current_leader_geometry(tag, ref):
-    leader_end = tag.GetLeaderEnd(ref)
-    tag_head = tag.TagHeadPosition
-
-    try:
-        leader_elbow = tag.GetLeaderElbow(ref)
-    except:
-        # A completely straight leader may not expose an elbow yet.
-        # Treat its current elbow length as zero instead of inventing a value.
-        leader_elbow = leader_end
-
-    return leader_end, leader_elbow, tag_head
-
-
-def get_planar_length(vector_value, right_axis, up_axis):
-    x_value = vector_value.DotProduct(right_axis)
-    y_value = vector_value.DotProduct(up_axis)
-    return math.sqrt(x_value * x_value + y_value * y_value)
-
-
-def get_axis_sign(vector_value, axis_value, fallback_sign):
-    try:
-        scalar_value = vector_value.DotProduct(axis_value)
-
-        if abs(scalar_value) > 0.0000001:
-            if scalar_value >= 0:
-                return 1
-
-            return -1
-
-    except:
-        pass
-
-    return fallback_sign
-
-
-def calculate_leader_points(
-        tag,
-        ref,
-        leader_type,
-        shoulder_ft,
-        elbow_ft,
-        right_axis,
-        up_axis,
-        use_custom_angle,
-        custom_angle_deg,
-        use_shoulder_length,
-        use_elbow_length):
-
-    leader_end, current_elbow, current_head = get_current_leader_geometry(tag, ref)
-
-    fallback_right_sign, fallback_up_sign = get_tag_current_direction_signs(
-        tag,
-        ref,
-        right_axis,
-        up_axis
-    )
-
-    current_elbow_vector = current_elbow - leader_end
-    current_shoulder_vector = current_head - current_elbow
-
-    current_elbow_length = get_planar_length(
-        current_elbow_vector,
-        right_axis,
-        up_axis
-    )
-    current_shoulder_length = get_planar_length(
-        current_shoulder_vector,
-        right_axis,
-        up_axis
-    )
-
-    elbow_right_sign = get_axis_sign(
-        current_elbow_vector,
-        right_axis,
-        fallback_right_sign
-    )
-    elbow_up_sign = get_axis_sign(
-        current_elbow_vector,
-        up_axis,
-        fallback_up_sign
-    )
-    shoulder_right_sign = get_axis_sign(
-        current_shoulder_vector,
-        right_axis,
-        fallback_right_sign
-    )
-    shoulder_up_sign = get_axis_sign(
-        current_shoulder_vector,
-        up_axis,
-        fallback_up_sign
-    )
-
-    target_shoulder_ft = shoulder_ft
-
-    if not use_shoulder_length:
-        target_shoulder_ft = current_shoulder_length
-
-    target_elbow_ft = elbow_ft
-
-    if not use_elbow_length:
-        target_elbow_ft = current_elbow_length
-
-    # Work in active-view X/Y scalar coordinates.
-    end_x = leader_end.DotProduct(right_axis)
-    end_y = leader_end.DotProduct(up_axis)
-
-    elbow_x = end_x
-    elbow_y = end_y
-    head_x = end_x
-    head_y = end_y
-
-    if leader_type == "90UD":
-        elbow_x = end_x
-        elbow_y = end_y + elbow_up_sign * target_elbow_ft
-        head_x = elbow_x + shoulder_right_sign * target_shoulder_ft
-        head_y = elbow_y
-
-    elif leader_type == "90LR":
-        elbow_x = end_x + elbow_right_sign * target_elbow_ft
-        elbow_y = end_y
-        head_x = elbow_x
-        head_y = elbow_y + shoulder_up_sign * target_shoulder_ft
-
-    elif leader_type == "45UD" or leader_type == "45LR":
-        angle_deg = 45.0
-
-        if use_custom_angle:
-            angle_deg = custom_angle_deg
-
-        angle_rad = math.radians(angle_deg)
-
-        if use_elbow_length:
-            # Keep the original behavior: the entered Elbow Length is the
-            # horizontal run used to build the diagonal segment.
-            diagonal_x = target_elbow_ft
-            diagonal_y = target_elbow_ft * math.tan(angle_rad)
+        if os.path.exists(CONFIG_FILE) or os.path.exists(FALLBACK_CONFIG_FILE):
+            self.set_status(u'Đã nạp cấu hình lần chạy trước.')
         else:
-            # The unchecked value means keep the actual current diagonal
-            # segment length, even when the selected angle is rebuilt.
-            diagonal_x = target_elbow_ft * math.cos(angle_rad)
-            diagonal_y = target_elbow_ft * math.sin(angle_rad)
+            self.set_status(u'Chưa có cấu hình đã lưu. Tool sẽ tự lưu sau khi bấm Thực hiện.')
 
-        diagonal_right_sign = elbow_right_sign
-        diagonal_up_sign = elbow_up_sign
+    # ------------------------------------------------------------------
+    def read_tag_side(self):
+        for side in TAG_SIDES:
+            if bool(self.tag_side_radios[side].IsChecked):
+                return side
+        return 'left'
 
-        elbow_x = end_x + diagonal_right_sign * diagonal_x
-        elbow_y = end_y + diagonal_up_sign * diagonal_y
-
-        if leader_type == "45UD":
-            head_x = elbow_x + shoulder_right_sign * target_shoulder_ft
-            head_y = elbow_y
+    def read_radio_options(self):
+        scope = 'selection' if bool(self.rbSelection.IsChecked) else 'view'
+        if bool(self.rbOrientationHorizontal.IsChecked):
+            orientation = 'horizontal'
+        elif bool(self.rbOrientationVertical.IsChecked):
+            orientation = 'vertical'
         else:
-            head_x = elbow_x
-            head_y = elbow_y + shoulder_up_sign * target_shoulder_ft
+            orientation = 'all'
+        tag_condition = 'untagged' if bool(self.rbUntaggedOnly.IsChecked) else 'all'
+        if bool(self.rbOperationAlign.IsChecked):
+            operation_mode = 'align'
+        elif bool(self.rbOperationNormalize.IsChecked):
+            operation_mode = 'normalize'
+        else:
+            operation_mode = 'create'
+        tag_side = self.read_tag_side()
+        if bool(self.rbViewRangeManual.IsChecked):
+            view_range_mode = 'manual'
+        elif bool(self.rbViewRangeActive.IsChecked):
+            view_range_mode = 'active'
+        else:
+            view_range_mode = 'none'
+        return scope, orientation, tag_condition, operation_mode, tag_side, view_range_mode
 
-    elif leader_type == "STRAIGHTUD":
-        straight_up_sign = get_axis_sign(
-            current_head - leader_end,
-            up_axis,
-            fallback_up_sign
-        )
-        elbow_x = end_x
-        elbow_y = end_y + straight_up_sign * target_elbow_ft
-        head_x = end_x
-        head_y = elbow_y + straight_up_sign * target_shoulder_ft
+    def get_current_settings(self):
+        scope, orientation, tag_condition, operation_mode, tag_side, view_range_mode = \
+            self.read_radio_options()
+        data = {
+            'spacing_mm': to_text(self.txtSpacing.Text),
+            'min_length_mm': to_text(self.txtMinLength.Text),
+            'max_length_mm': to_text(self.txtMaxLength.Text),
+            'use_max_length': bool(self.chkLimitMaxLength.IsChecked),
+            'min_size_mm': to_text(self.txtMinSize.Text),
+            'max_size_mm': to_text(self.txtMaxSize.Text),
+            'use_max_size': bool(self.chkLimitMaxSize.IsChecked),
+            'scope': scope,
+            'orientation': orientation,
+            'tag_condition': tag_condition,
+            'operation_mode': operation_mode,
+            'tag_side': tag_side,
+            'view_range_mode': view_range_mode,
+            'view_range_bottom_mm': to_text(self.txtRangeBottom.Text),
+            'view_range_top_mm': to_text(self.txtRangeTop.Text),
+            'device_offset_mm': to_text(self.txtDeviceOffset.Text),
+            'device_leader': bool(self.chkDeviceLeader.IsChecked),
+        }
+        for kind in KIND_ORDER:
+            chk, cb, use_key, type_key = self.kind_controls[kind]
+            data[use_key] = bool(chk.IsChecked)
+            data[type_key] = to_text(cb.SelectedItem) if cb.SelectedItem else u''
+        return data
 
-    elif leader_type == "STRAIGHTLR":
-        straight_right_sign = get_axis_sign(
-            current_head - leader_end,
-            right_axis,
-            fallback_right_sign
-        )
-        elbow_x = end_x + straight_right_sign * target_elbow_ft
-        elbow_y = end_y
-        head_x = elbow_x + straight_right_sign * target_shoulder_ft
-        head_y = end_y
+    # ------------------------------------------------------------------
+    def on_execute_click(self, sender, args):
+        """Chỉ đọc/kiểm tra UI rồi đóng WPF. Không Pick/Transaction trong event WPF."""
+        try:
+            scope, orientation, tag_condition, operation_mode, tag_side, view_range_mode = \
+                self.read_radio_options()
 
-    else:
-        elbow_x = end_x
-        elbow_y = end_y + elbow_up_sign * target_elbow_ft
-        head_x = elbow_x + shoulder_right_sign * target_shoulder_ft
-        head_y = elbow_y
+            selected_kinds = [k for k in KIND_ORDER if bool(self.kind_controls[k][0].IsChecked)]
+            if not selected_kinds:
+                alert_msg(u'Vui lòng tick ít nhất một loại đối tượng cần tag.')
+                return
 
-    elbow_pt = point_from_view_scalars(
-        leader_end,
-        right_axis,
-        up_axis,
-        elbow_x,
-        elbow_y
-    )
-    head_pt = point_from_view_scalars(
-        leader_end,
-        right_axis,
-        up_axis,
-        head_x,
-        head_y
-    )
+            tag_type_ids = {}
+            for kind in selected_kinds:
+                cb = self.kind_controls[kind][1]
+                name = cb.SelectedItem
+                tag_map = self.tag_maps.get(kind, {})
+                if name and name in tag_map:
+                    tag_type_ids[kind] = tag_map[name].Id
+                elif operation_mode in ('create', 'normalize'):
+                    alert_msg(u'Chưa có/chưa chọn Tag Type cho {}. Hãy load family tag hoặc bỏ tick đối tượng này.'.format(
+                        KIND_INFO[kind]['label']))
+                    return
 
-    return elbow_pt, head_pt
+            has_linear = any(KIND_INFO[k]['linear'] for k in selected_kinds)
+            has_device = any(not KIND_INFO[k]['linear'] for k in selected_kinds)
+
+            spacing_mm = parse_mm_value(self.txtSpacing.Text, u'Khoảng cách xếp bậc')
+            min_length_mm = parse_mm_value(self.txtMinLength.Text, u'Chiều dài tối thiểu')
+            use_max_length = bool(self.chkLimitMaxLength.IsChecked)
+            max_length_mm = parse_mm_value(self.txtMaxLength.Text, u'Chiều dài tối đa') if use_max_length else 0.0
+            min_size_mm = parse_mm_value(self.txtMinSize.Text, u'Đường kính nhỏ nhất')
+            use_max_size = bool(self.chkLimitMaxSize.IsChecked)
+            max_size_mm = parse_mm_value(self.txtMaxSize.Text, u'Đường kính lớn nhất') if use_max_size else 0.0
+
+            if has_linear:
+                if spacing_mm <= 0:
+                    alert_msg(u'Khoảng cách xếp bậc phải lớn hơn 0.')
+                    return
+                if min_length_mm < 0:
+                    alert_msg(u'Chiều dài tối thiểu không được nhỏ hơn 0.')
+                    return
+                if use_max_length and (max_length_mm < 0 or min_length_mm > max_length_mm):
+                    alert_msg(u'Chiều dài tối đa phải ≥ 0 và không nhỏ hơn chiều dài tối thiểu.')
+                    return
+                if min_size_mm < 0:
+                    alert_msg(u'Đường kính nhỏ nhất không được nhỏ hơn 0.')
+                    return
+                if use_max_size and (max_size_mm < 0 or min_size_mm > max_size_mm):
+                    alert_msg(u'Đường kính lớn nhất phải ≥ 0 và không nhỏ hơn đường kính nhỏ nhất.')
+                    return
+
+            device_offset_mm = 0.0
+            device_leader = bool(self.chkDeviceLeader.IsChecked)
+            if has_device:
+                device_offset_mm = parse_mm_value(self.txtDeviceOffset.Text, u'Khoảng cách tag thiết bị')
+                if device_offset_mm < 0:
+                    alert_msg(u'Khoảng cách tag thiết bị không được nhỏ hơn 0.')
+                    return
+
+            if view_range_mode == 'manual':
+                range_bottom_mm = parse_mm_value(self.txtRangeBottom.Text, u'Cao độ dưới View Range')
+                range_top_mm = parse_mm_value(self.txtRangeTop.Text, u'Cao độ trên View Range')
+                if range_top_mm <= range_bottom_mm:
+                    alert_msg(u'Cao độ trên View Range phải lớn hơn cao độ dưới.')
+                    return
+            else:
+                range_bottom_mm = 0.0
+                range_top_mm = 0.0
+
+            if save_settings(self.get_current_settings()):
+                self.set_status(u'Đã lưu cấu hình hiện tại.')
+
+            self.result = {
+                'kinds': selected_kinds,
+                'tag_type_ids': tag_type_ids,
+                'spacing_mm': spacing_mm,
+                'min_length_mm': min_length_mm,
+                'max_length_mm': max_length_mm,
+                'use_max_length': use_max_length,
+                'min_size_mm': min_size_mm,
+                'max_size_mm': max_size_mm,
+                'use_max_size': use_max_size,
+                'device_offset_mm': device_offset_mm,
+                'device_leader': device_leader,
+                'scope': scope,
+                'orientation': orientation,
+                'tag_condition': tag_condition,
+                'operation_mode': operation_mode,
+                'tag_side': tag_side,
+                'view_range_mode': view_range_mode,
+                'view_range_bottom_mm': range_bottom_mm,
+                'view_range_top_mm': range_top_mm,
+            }
+            self.Close()
+
+        except ValueError as ex:
+            alert_msg(ensure_unicode(ex))
+        except Exception as ex:
+            self.result = None
+            alert_msg(u'Lỗi giao diện: {}'.format(ensure_unicode(ex)))
+            log(traceback.format_exc())
+
+    def on_close_click(self, sender, args):
+        self.result = None
+        self.Close()
 
 
-def get_auto_leader_type(tag):
+# -----------------------------------------------------------------------------
+# COMMAND LOGIC - CHỈ CHẠY SAU KHI WPF ĐÃ ĐÓNG
+# -----------------------------------------------------------------------------
+def get_revit_year(doc):
     try:
-        ref = get_first_tag_reference(tag)
-
-        if ref is None:
-            return "90UD"
-
-        leader_end = tag.GetLeaderEnd(ref)
-        tag_head = tag.TagHeadPosition
-
-        right_axis, up_axis = get_view_axes()
-        vector_value = tag_head - leader_end
-
-        x_len = abs(vector_value.DotProduct(right_axis))
-        y_len = abs(vector_value.DotProduct(up_axis))
-
-        if x_len >= y_len:
-            return "90UD"
-
-        return "90LR"
-
+        return int(doc.Application.VersionNumber)
     except:
-        return "90UD"
+        return 2022
 
 
-def get_scalar_on_axis(point_value, axis_value):
-    return point_value.DotProduct(axis_value)
+def deduplicate_targets(elements, allowed_kinds):
+    result = []
+    seen_ids = set()
+    for elem in elements or []:
+        try:
+            if not is_valid_target(elem, allowed_kinds):
+                continue
+            eid = get_id_value(elem.Id)
+            if eid is None or eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            result.append(elem)
+        except:
+            continue
+    return result
 
 
-def distribute_items_by_spacing(items, spacing_ft, axis_mode, right_axis, up_axis):
-    """
-    Distribute tag heads by spacing and align the perpendicular coordinate.
-
-    If axis_mode == "X":
-        - Space tags along view X direction.
-        - Force all tag heads to have the same view Y coordinate.
-        - Result: tag text boxes align horizontally.
-
-    If axis_mode == "Y":
-        - Space tags along view Y direction.
-        - Force all tag heads to have the same view X coordinate.
-        - Result: tag text boxes align vertically.
-
-    TagHeadPosition is used as the center point of tag text box.
-    """
-
-    if len(items) < 2:
-        return items
-
-    if spacing_ft <= 0:
-        return items
-
-    # --------------------------------------------------------
-    # Define spacing axis and lock axis
-    # --------------------------------------------------------
-    if axis_mode == "Y":
-        # Spacing theo phuong Y, khoa toa do X
-        spacing_axis = up_axis
-        lock_axis = right_axis
+def get_tag_host_ids(doc, tag):
+    ids = []
+    if get_revit_year(doc) >= 2022:
+        try:
+            for tagged_ref in tag.GetTaggedReferences():
+                ids.append(tagged_ref.ElementId)
+        except:
+            pass
     else:
-        # Spacing theo phuong X, khoa toa do Y
-        spacing_axis = right_axis
-        lock_axis = up_axis
-
-    # --------------------------------------------------------
-    # Sort tags by current position on spacing axis
-    # --------------------------------------------------------
-    sorted_items = sorted(
-        items,
-        key=lambda item: get_scalar_on_axis(item["head"], spacing_axis)
-    )
-
-    # --------------------------------------------------------
-    # Base point:
-    # Lay tag dau tien sau khi sort lam moc.
-    # Tag dau giu scalar tren truc spacing va truc lock.
-    # --------------------------------------------------------
-    base_head = sorted_items[0]["head"]
-
-    base_spacing_scalar = get_scalar_on_axis(base_head, spacing_axis)
-    base_lock_scalar = get_scalar_on_axis(base_head, lock_axis)
-
-    # --------------------------------------------------------
-    # Re-position each tag
-    # --------------------------------------------------------
-    for index, item in enumerate(sorted_items):
-
-        current_head = item["head"]
-
-        current_spacing_scalar = get_scalar_on_axis(current_head, spacing_axis)
-        current_lock_scalar = get_scalar_on_axis(current_head, lock_axis)
-
-        target_spacing_scalar = base_spacing_scalar + spacing_ft * index
-        target_lock_scalar = base_lock_scalar
-
-        delta_spacing = target_spacing_scalar - current_spacing_scalar
-        delta_lock = target_lock_scalar - current_lock_scalar
-
-        delta_vector = spacing_axis.Multiply(delta_spacing) + lock_axis.Multiply(delta_lock)
-
-        # Move both tag head and elbow together to keep leader shape
-        item["head"] = item["head"] + delta_vector
-        item["elbow"] = item["elbow"] + delta_vector
-
-    return sorted_items
+        try:
+            ids.append(tag.TaggedLocalElementId)
+        except:
+            pass
+    return ids
 
 
-def process_tags(
-        tags,
-        selected_types,
-        use_auto,
-        shoulder_ft,
-        elbow_ft,
-        spacing_ft,
-        axis_mode,
-        use_custom_angle,
-        custom_angle_deg,
-        use_shoulder_length,
-        use_elbow_length):
-    right_axis, up_axis = get_view_axes()
+def get_hosts_from_tag(doc, tag, allowed_kinds):
+    result = []
+    if not tag or not isinstance(tag, IndependentTag):
+        return result
+    tag_kind = get_tag_kind(tag)
+    if tag_kind is None or tag_kind not in allowed_kinds:
+        return result
+    for host_id in get_tag_host_ids(doc, tag):
+        try:
+            elem = doc.GetElement(host_id)
+            if get_element_kind(elem) == tag_kind:
+                result.append(elem)
+        except:
+            pass
+    return result
 
-    items = []
-    failed_messages = []
 
-    with revit.Transaction("Align Tag Leader"):
-
-        for index, tag in enumerate(tags):
-
+def get_preselected_targets(doc, uidoc, active_view, allowed_kinds):
+    elements = []
+    try:
+        selected_ids = list(uidoc.Selection.GetElementIds())
+    except:
+        selected_ids = []
+    active_view_id = get_id_value(active_view.Id) if active_view else None
+    for elem_id in selected_ids:
+        try:
+            elem = doc.GetElement(elem_id)
+        except:
+            elem = None
+        if not elem:
+            continue
+        if get_element_kind(elem) in allowed_kinds:
+            elements.append(elem)
+            continue
+        if isinstance(elem, IndependentTag):
             try:
-                if not tag.HasLeader:
-                    tag.HasLeader = True
+                if active_view_id is not None and get_id_value(elem.OwnerViewId) != active_view_id:
+                    continue
             except:
                 pass
+            elements.extend(get_hosts_from_tag(doc, elem, allowed_kinds))
+    return deduplicate_targets(elements, allowed_kinds)
 
-            ref = get_first_tag_reference(tag)
 
-            if ref is None:
-                failed_messages.append(
-                    "Tag Id " + str(tag.Id.IntegerValue) + ": Can not get tag reference."
-                )
-                continue
+def resolve_view_range_bounds(doc, active_view, options):
+    mode = options['view_range_mode']
+    if mode == 'none':
+        return None
+    if mode == 'active':
+        bounds = get_active_view_range_bounds(doc, active_view)
+        if not bounds:
+            alert_msg(u'Active view hiện tại không hỗ trợ View Range. Hãy chọn Plan View hoặc dùng chế độ nhập View Range thủ công.')
+            return False
+        return bounds
+    base_z = get_view_base_elevation(active_view)
+    bottom_z = base_z + options['view_range_bottom_mm'] / 304.8
+    top_z = base_z + options['view_range_top_mm'] / 304.8
+    return (min(bottom_z, top_z), max(bottom_z, top_z))
 
-            ensure_free_leader(tag)
 
-            if use_auto:
-                leader_type = get_auto_leader_type(tag)
-            else:
-                if len(selected_types) == 1:
-                    leader_type = selected_types[0]
-                else:
-                    leader_type = selected_types[index % len(selected_types)]
+def kinds_label(kinds):
+    return u' / '.join([KIND_INFO[k]['label'] for k in kinds])
 
+
+def collect_input_targets(doc, uidoc, active_view, options, view_range_bounds):
+    kinds = options['kinds']
+    if options['scope'] == 'view':
+        elements = []
+        for kind in kinds:
             try:
-                elbow_pt, head_pt = calculate_leader_points(
-                    tag,
-                    ref,
-                    leader_type,
-                    shoulder_ft,
-                    elbow_ft,
-                    right_axis,
-                    up_axis,
-                    use_custom_angle,
-                    custom_angle_deg,
-                    use_shoulder_length,
-                    use_elbow_length
-                )
-
-                item = {}
-                item["tag"] = tag
-                item["ref"] = ref
-                item["leader_type"] = leader_type
-                item["elbow"] = elbow_pt
-                item["head"] = head_pt
-                items.append(item)
-
-            except Exception as ex:
-                failed_messages.append(
-                    "Tag Id " + str(tag.Id.IntegerValue) + ": " + str(ex)
-                )
-
-        # Exact spacing and fixed leader lengths are geometrically
-        # incompatible when each tag has a different fixed leader end.
-        # In partial-length mode, prioritize the user's request to preserve
-        # the unchecked segment and skip distribution.
-        if len(items) >= 2 and use_shoulder_length and use_elbow_length:
-            items = distribute_items_by_spacing(
-                items,
-                spacing_ft,
-                axis_mode,
-                right_axis,
-                up_axis
-            )
-
-        # Set tag heads first, regenerate, then set elbows.
-        # If SetLeaderElbow is called before TagHeadPosition, Revit can slightly
-        # recalculate the elbow while moving the tag head, creating a non-90 angle.
-        for item in items:
-            try:
-                item["tag"].TagHeadPosition = item["head"]
-
-            except Exception as ex:
-                failed_messages.append(
-                    "Tag Id " + str(item["tag"].Id.IntegerValue) + ": " + str(ex)
-                )
-
-        try:
-            doc.Regenerate()
-        except:
-            pass
-
-        for item in items:
-            try:
-                item["tag"].SetLeaderElbow(item["ref"], item["elbow"])
-
-            except Exception as ex:
-                failed_messages.append(
-                    "Tag Id " + str(item["tag"].Id.IntegerValue) + ": " + str(ex)
-                )
-
-        # One more regeneration helps Revit commit the tag-head/leader relation.
-        # Then re-apply the elbow for 90-degree types to keep the corner exact.
-        try:
-            doc.Regenerate()
-        except:
-            pass
-
-        for item in items:
-            try:
-                if item["leader_type"] == "90UD" or item["leader_type"] == "90LR":
-                    item["tag"].SetLeaderElbow(item["ref"], item["elbow"])
-
-            except Exception as ex:
-                failed_messages.append(
-                    "Tag Id " + str(item["tag"].Id.IntegerValue) + ": " + str(ex)
-                )
-
-    return failed_messages
-
-
-# ============================================================
-# Window
-# ============================================================
-
-class AlignTagLeaderWindow(forms.WPFWindow):
-
-    def __init__(self, xaml_file):
-        forms.WPFWindow.__init__(self, xaml_file)
-
-        self.btnApply.Click += self.apply_click
-        self.btnCancel.Click += self.cancel_click
-
-        self.cb90UD.Click += self.checkbox_click
-        self.cb90LR.Click += self.checkbox_click
-        self.cb45UD.Click += self.checkbox_click
-        self.cb45LR.Click += self.checkbox_click
-        self.cbStraightUD.Click += self.checkbox_click
-        self.cbStraightLR.Click += self.checkbox_click
-
-        self.cbDistributeX.Click += self.axis_x_click
-        self.cbDistributeY.Click += self.axis_y_click
-        self.cbCustomAngle.Click += self.custom_angle_click
-        self.cbUseShoulderLength.Click += self.length_checkbox_click
-        self.cbUseElbowLength.Click += self.length_checkbox_click
-
-        # Mo rong giao dien theo kich thuoc man hinh, nhung khong vuot qua
-        # vung lam viec cua Windows. ScrollViewer trong XAML van duoc giu lai
-        # de hien thanh cuon khi man hinh nho hoac user thu nho cua so.
-        self.configure_window_size()
-        self.load_ui_settings()
-
-    def configure_window_size(self):
-        """
-        Dat kich thuoc cua so lon de hien du thong tin tren man hinh thong dung.
-        Neu man hinh nho hon, cua so tu gioi han trong WorkArea va thanh cuon
-        ngang/doc cua ScrollViewer se tiep tuc hoat dong.
-        """
-        try:
-            work_area = SystemParameters.WorkArea
-
-            screen_margin = 36.0
-            available_width = max(900.0, work_area.Width - screen_margin)
-            available_height = max(600.0, work_area.Height - screen_margin)
-
-            self.MaxWidth = available_width
-            self.MaxHeight = available_height
-
-            self.Width = min(1680.0, available_width)
-            self.Height = min(850.0, available_height)
-
-        except:
-            # Neu khong doc duoc WorkArea, su dung kich thuoc khai bao trong XAML.
-            pass
-
-    def load_ui_settings(self):
-        settings = load_settings()
-
-        self.tbShoulder.Text = format_mm(settings["shoulder_mm"])
-        self.tbElbow.Text = format_mm(settings["elbow_mm"])
-        self.cbUseShoulderLength.IsChecked = bool(settings["shoulder_enabled"])
-        self.cbUseElbowLength.IsChecked = bool(settings["elbow_enabled"])
-        self.tbTagSpacing.Text = format_mm(settings["tag_spacing_mm"])
-        self.cbCustomAngle.IsChecked = bool(settings["custom_angle_enabled"])
-        self.tbCustomAngle.Text = format_degree(settings["custom_angle_deg"])
-        self.update_custom_angle_state()
-        self.update_length_input_states()
-
-        if settings["mode"] == "Auto":
-            self.rbAuto.IsChecked = True
-            self.rbCustomize.IsChecked = False
-        else:
-            self.rbAuto.IsChecked = False
-            self.rbCustomize.IsChecked = True
-
-        leader_types = settings["leader_types"]
-
-        self.cb90UD.IsChecked = "90UD" in leader_types
-        self.cb90LR.IsChecked = "90LR" in leader_types
-        self.cb45UD.IsChecked = "45UD" in leader_types
-        self.cb45LR.IsChecked = "45LR" in leader_types
-        self.cbStraightUD.IsChecked = "STRAIGHTUD" in leader_types
-        self.cbStraightLR.IsChecked = "STRAIGHTLR" in leader_types
-
-        axis_mode = settings["distribute_axis"]
-
-        if axis_mode == "Y":
-            self.cbDistributeX.IsChecked = False
-            self.cbDistributeY.IsChecked = True
-        else:
-            self.cbDistributeX.IsChecked = True
-            self.cbDistributeY.IsChecked = False
-
-    def save_ui_settings(
-            self,
-            shoulder_mm,
-            elbow_mm,
-            spacing_mm,
-            custom_angle_enabled,
-            custom_angle_deg,
-            shoulder_enabled,
-            elbow_enabled):
-        mode_value = "Customize"
-
-        if self.rbAuto.IsChecked:
-            mode_value = "Auto"
-
-        axis_mode = "X"
-
-        if self.cbDistributeY.IsChecked:
-            axis_mode = "Y"
-
-        settings = {}
-        settings["shoulder_mm"] = shoulder_mm
-        settings["elbow_mm"] = elbow_mm
-        settings["shoulder_enabled"] = shoulder_enabled
-        settings["elbow_enabled"] = elbow_enabled
-        settings["tag_spacing_mm"] = spacing_mm
-        settings["custom_angle_enabled"] = custom_angle_enabled
-        settings["custom_angle_deg"] = custom_angle_deg
-        settings["mode"] = mode_value
-        settings["leader_types"] = self.get_checked_leader_types()
-        settings["distribute_axis"] = axis_mode
-
-        save_settings(settings)
-
-    def update_custom_angle_state(self):
-        enabled = False
-
-        try:
-            enabled = bool(self.cbCustomAngle.IsChecked)
-        except:
-            enabled = False
-
-        self.tbCustomAngle.IsEnabled = enabled
-
-        if enabled:
-            self.tbCustomAngle.Opacity = 1.0
-        else:
-            self.tbCustomAngle.Opacity = 0.55
-
-    def update_length_input_states(self):
-        shoulder_enabled = bool(self.cbUseShoulderLength.IsChecked)
-        elbow_enabled = bool(self.cbUseElbowLength.IsChecked)
-
-        self.tbShoulder.IsEnabled = shoulder_enabled
-        self.tbElbow.IsEnabled = elbow_enabled
-
-        if shoulder_enabled:
-            self.tbShoulder.Opacity = 1.0
-        else:
-            self.tbShoulder.Opacity = 0.55
-
-        if elbow_enabled:
-            self.tbElbow.Opacity = 1.0
-        else:
-            self.tbElbow.Opacity = 0.55
-
-    def length_checkbox_click(self, sender, args):
-        shoulder_enabled = bool(self.cbUseShoulderLength.IsChecked)
-        elbow_enabled = bool(self.cbUseElbowLength.IsChecked)
-
-        # Always keep at least one length active. The requested mode is either
-        # both lengths, shoulder only, or elbow only.
-        if not shoulder_enabled and not elbow_enabled:
-            sender.IsChecked = True
-
-        self.update_length_input_states()
-
-    def custom_angle_click(self, sender, args):
-        self.update_custom_angle_state()
-
-    def cancel_click(self, sender, args):
-        self.Close()
-
-    def axis_x_click(self, sender, args):
-        self.cbDistributeX.IsChecked = True
-        self.cbDistributeY.IsChecked = False
-
-    def axis_y_click(self, sender, args):
-        self.cbDistributeX.IsChecked = False
-        self.cbDistributeY.IsChecked = True
-
-    def checkbox_click(self, sender, args):
-        """
-        Chi cho phep chon duy nhat 1 leader type.
-        Chon checkbox nay thi cac checkbox khac tu dong tat.
-        Neu user bo tick checkbox dang chon, tool se tick lai de dam bao luon co 1 type.
-        """
-
-        all_checkboxes = [
-            self.cb90UD,
-            self.cb90LR,
-            self.cb45UD,
-            self.cb45LR,
-            self.cbStraightUD,
-            self.cbStraightLR
-        ]
-
-        # Neu user dang tick vao checkbox nay
-        if sender.IsChecked:
-            for cb in all_checkboxes:
-                if cb != sender:
-                    cb.IsChecked = False
-
-        # Neu user bo tick checkbox duy nhat, tick lai checkbox do
-        else:
-            has_checked = False
-
-            for cb in all_checkboxes:
-                if cb.IsChecked:
-                    has_checked = True
-                    break
-
-            if not has_checked:
-                sender.IsChecked = True
-
-    def get_checked_leader_types(self):
-        result = []
-
-        if self.cb90UD.IsChecked:
-            result.append("90UD")
-
-        if self.cb90LR.IsChecked:
-            result.append("90LR")
-
-        if self.cb45UD.IsChecked:
-            result.append("45UD")
-
-        if self.cb45LR.IsChecked:
-            result.append("45LR")
-
-        if self.cbStraightUD.IsChecked:
-            result.append("STRAIGHTUD")
-
-        if self.cbStraightLR.IsChecked:
-            result.append("STRAIGHTLR")
-
-        return result
-
-    def apply_click(self, sender, args):
-        shoulder_mm = parse_mm(self.tbShoulder.Text)
-        elbow_mm = parse_mm(self.tbElbow.Text)
-        spacing_mm = parse_mm(self.tbTagSpacing.Text)
-
-        use_shoulder_length = bool(self.cbUseShoulderLength.IsChecked)
-        use_elbow_length = bool(self.cbUseElbowLength.IsChecked)
-        use_custom_angle = bool(self.cbCustomAngle.IsChecked)
-        custom_angle_deg = parse_mm(self.tbCustomAngle.Text)
-
-        # Khi checkbox tat, gia tri trong o goc khong anh huong den ket qua.
-        # Neu o dang rong/khong hop le thi van luu lai moc 45 do mac dinh.
-        if not use_custom_angle and custom_angle_deg <= 0:
-            custom_angle_deg = 45.0
-
-        if not use_shoulder_length and not use_elbow_length:
-            forms.alert(
-                "Phai tick it nhat Shoulder Length hoac Elbow Length.",
-                exitscript=False
-            )
-            return
-
-        if use_shoulder_length and shoulder_mm <= 0:
-            forms.alert("Shoulder Length phai lon hon 0.", exitscript=False)
-            return
-
-        if use_elbow_length and elbow_mm <= 0:
-            forms.alert("Elbow Length phai lon hon 0.", exitscript=False)
-            return
-
-        # A disabled text box is not used for geometry, but keep a valid value
-        # in settings so it is ready when the option is enabled again.
-        if shoulder_mm <= 0:
-            shoulder_mm = DEFAULT_SETTINGS["shoulder_mm"]
-
-        if elbow_mm <= 0:
-            elbow_mm = DEFAULT_SETTINGS["elbow_mm"]
-
-        if spacing_mm <= 0:
-            forms.alert("Tag spacing phai lon hon 0.", exitscript=False)
-            return
-
-        if use_custom_angle:
-            if custom_angle_deg <= 0 or custom_angle_deg >= 90:
-                forms.alert(
-                    "Custom Angle phai lon hon 0 do va nho hon 90 do.",
-                    exitscript=False
-                )
-                return
-
-        selected_types = self.get_checked_leader_types()
-
-        if self.rbCustomize.IsChecked:
-            if len(selected_types) == 0:
-                forms.alert("Vui long chon it nhat 1 leader type.", exitscript=False)
-                return
-
-        self.save_ui_settings(
-            shoulder_mm,
-            elbow_mm,
-            spacing_mm,
-            use_custom_angle,
-            custom_angle_deg,
-            use_shoulder_length,
-            use_elbow_length
-        )
-
-        shoulder_ft = mm_to_ft(shoulder_mm)
-        elbow_ft = mm_to_ft(elbow_mm)
-        spacing_ft = mm_to_ft(spacing_mm)
-
-        use_auto = False
-
-        if self.rbAuto.IsChecked:
-            use_auto = True
-
-        axis_mode = "X"
-
-        if self.cbDistributeY.IsChecked:
-            axis_mode = "Y"
-
-        # Lay trang thai Shift mot lan duy nhat tai luc nhan Apply
-        # Neu giu Shift khi nhan Apply, ca phien lenh se la multi-pick
-        # Neu khong giu Shift khi nhan Apply, ca phien lenh se la single-pick
-        allow_multiple_session = is_shift_pressed()
-
-        self.Hide()
-
-        # ====================================================
-        # Giu lenh lien tuc cho den khi nhan Esc
-        # ====================================================
-
-        while True:
-            try:
-                tags = pick_tags_after_apply(allow_multiple_session)
-
-            except OperationCanceledException:
-                break
-
+                elements.extend(
+                    FilteredElementCollector(doc, active_view.Id)
+                    .OfCategory(KIND_INFO[kind]['cat'])
+                    .WhereElementIsNotElementType()
+                    .ToElements())
             except:
-                break
+                pass
+        return deduplicate_targets(elements, kinds), False
 
-            if len(tags) == 0:
+    preselected = get_preselected_targets(doc, uidoc, active_view, kinds)
+    if preselected:
+        return preselected, True
+
+    label = kinds_label(kinds)
+    mode = options['view_range_mode']
+    if mode == 'manual':
+        pick_message = u'Chưa chọn trước. Chỉ chọn được {} nằm trong View Range thủ công -> Nhấn FINISH.'.format(label)
+    elif mode == 'active':
+        pick_message = u'Chưa chọn trước. Chỉ chọn được {} nằm trong View Range hiện hành -> Nhấn FINISH.'.format(label)
+    else:
+        pick_message = u'Chưa chọn trước. Quét/click chọn {} cần đặt Tag -> Nhấn FINISH.'.format(label)
+
+    selected_refs = uidoc.Selection.PickObjects(
+        ObjectType.Element,
+        TagTargetSelectionFilter(kinds, view_range_bounds),
+        pick_message)
+    elements = []
+    for ref in selected_refs:
+        try:
+            elements.append(doc.GetElement(ref.ElementId))
+        except:
+            pass
+    return deduplicate_targets(elements, kinds), False
+
+
+def get_tagged_dict(doc, active_view, kinds):
+    """{host_id_value: [tag ElementId,...]} - chỉ tính tag đúng category của host."""
+    existing_tags = FilteredElementCollector(doc, active_view.Id)\
+        .OfClass(IndependentTag)\
+        .ToElements()
+    tagged_dict = {}
+    for tag in existing_tags:
+        try:
+            tag_kind = get_tag_kind(tag)
+            if tag_kind is None or tag_kind not in kinds:
+                continue
+            for host_id in get_tag_host_ids(doc, tag):
+                hid = get_id_value(host_id)
+                if hid is None:
+                    continue
+                host = doc.GetElement(host_id)
+                if get_element_kind(host) != tag_kind:
+                    continue
+                tagged_dict.setdefault(hid, []).append(tag.Id)
+        except:
+            pass
+    return tagged_dict
+
+
+def get_size_ft(elem, kind):
+    bip = KIND_INFO[kind]['size_bip']
+    if bip is None:
+        return None
+    try:
+        p = elem.get_Parameter(bip)
+        if p and p.HasValue:
+            return p.AsDouble()
+    except:
+        pass
+    try:
+        return elem.Diameter
+    except:
+        return None
+
+
+def filter_targets(raw_elements, options, view_range_bounds, tagged_dict):
+    """Trả về (linear_elements, device_elements, view_range_skipped)."""
+    min_length_ft = options['min_length_mm'] / 304.8
+    use_max_length = options.get('use_max_length', False)
+    max_length_ft = options['max_length_mm'] / 304.8 if use_max_length else None
+    min_size_ft = options['min_size_mm'] / 304.8
+    use_max_size = options.get('use_max_size', True)
+    max_size_ft = options['max_size_mm'] / 304.8 if use_max_size else None
+    operation_mode = options.get('operation_mode', 'create')
+
+    linear_elements = []
+    device_elements = []
+    view_range_skipped = 0
+
+    for elem in deduplicate_targets(raw_elements, options['kinds']):
+        try:
+            kind = get_element_kind(elem)
+
+            if view_range_bounds and not element_overlaps_z_range(
+                    elem, view_range_bounds[0], view_range_bounds[1]):
+                view_range_skipped += 1
                 continue
 
-            failed_messages = process_tags(
-                tags,
-                selected_types,
-                use_auto,
-                shoulder_ft,
-                elbow_ft,
-                spacing_ft,
-                axis_mode,
-                use_custom_angle,
-                custom_angle_deg,
-                use_shoulder_length,
-                use_elbow_length
-            )
+            eid = get_id_value(elem.Id)
+            if operation_mode == 'create':
+                if options['tag_condition'] == 'untagged' and eid in tagged_dict:
+                    continue
+            else:
+                if eid not in tagged_dict:
+                    continue
 
-            if len(failed_messages) > 0:
-                forms.alert(
-                    "Mot so tag khong align duoc:\n\n" + "\n".join(failed_messages),
-                    exitscript=False
-                )
+            # Thiết bị dạng điểm: không lọc hướng/chiều dài/kích thước
+            if not KIND_INFO[kind]['linear']:
+                device_elements.append(elem)
+                continue
 
-        self.Close()
+            curve = elem.Location.Curve
+            vector = curve.GetEndPoint(1) - curve.GetEndPoint(0)
+            if vector.GetLength() <= 0.000001:
+                continue
+            is_vertical = abs(vector.Normalize().Z) > 0.99
+            if options['orientation'] == 'horizontal' and is_vertical:
+                continue
+            if options['orientation'] == 'vertical' and not is_vertical:
+                continue
+
+            length_param = elem.get_Parameter(BuiltInParameter.CURVE_ELEM_LENGTH)
+            if length_param:
+                length_ft = length_param.AsDouble()
+                if length_ft < min_length_ft:
+                    continue
+                if use_max_length and length_ft > max_length_ft:
+                    continue
+
+            size_ft = get_size_ft(elem, kind)
+            if size_ft is not None:
+                if size_ft < min_size_ft:
+                    continue
+                if use_max_size and size_ft > max_size_ft:
+                    continue
+
+            linear_elements.append(elem)
+        except Exception as ex:
+            log(u'Bỏ qua ID {} khi lọc: {}'.format(elem.Id, ensure_unicode(ex)))
+
+    return linear_elements, device_elements, view_range_skipped
 
 
-# ============================================================
-# Run
-# ============================================================
+def build_parallel_clusters(linear_elements):
+    """Gom cụm Pipe + Conduit song song gần nhau để xếp bậc tag không chồng nhau."""
+    clusters = []
+    unclustered = list(linear_elements)
+    while unclustered:
+        current = unclustered.pop(0)
+        cluster = [current]
+        remaining = []
+        for elem in unclustered:
+            try:
+                if are_curves_parallel(current, elem) and get_perpendicular_distance(current, elem) < 5.0:
+                    cluster.append(elem)
+                else:
+                    remaining.append(elem)
+            except:
+                remaining.append(elem)
+        unclustered = remaining
+        clusters.append(cluster)
+    return clusters
 
-if not os.path.exists(XAML_PATH):
-    forms.alert("Khong tim thay file ui.xaml.", exitscript=True)
 
-window = AlignTagLeaderWindow(XAML_PATH)
-window.ShowDialog()
+def get_side_vector(active_view, side):
+    """Vector hướng trên view tương ứng trái / phải / trên / dưới."""
+    view_right = active_view.RightDirection
+    view_up = active_view.UpDirection
+    if side == 'right':
+        return view_right
+    if side == 'top':
+        return view_up
+    if side == 'bottom':
+        return reverse_xyz(view_up)
+    return reverse_xyz(view_right)
+
+
+def get_cluster_layout(active_view, options, cluster):
+    """
+    Quy tắc vị trí tag cho Pipe / Conduit:
+    - Ống chạy NGANG trên view (song song RightDirection):
+        top / left / right -> tag nằm phía trên ống
+        bottom             -> tag nằm phía dưới ống
+        left -> xếp bậc sang trái, right -> xếp bậc sang phải,
+        top / bottom -> xếp bậc sang trái (mặc định)
+    - Ống chạy DỌC trên view (song song UpDirection) và ống đứng:
+        left / top / bottom -> tag nằm bên trái ống
+        right               -> tag nằm bên phải ống
+        top -> xếp bậc lên trên, bottom -> xếp bậc xuống dưới,
+        left / right -> xếp bậc lên trên (mặc định)
+    """
+    view_scale = active_view.Scale
+    if view_scale <= 0:
+        raise Exception(u'Active view không có tỷ lệ hợp lệ để tính khoảng cách tag.')
+    view_right = active_view.RightDirection
+    view_up = active_view.UpDirection
+    side = options.get('tag_side', 'left')
+
+    first_curve = cluster[0].Location.Curve
+    direction_vector = first_curve.GetEndPoint(1) - first_curve.GetEndPoint(0)
+    if direction_vector.GetLength() <= 0.000001:
+        raise Exception(u'Đối tượng trong cụm không có hướng hợp lệ.')
+    direction = direction_vector.Normalize()
+
+    if abs(direction.DotProduct(view_right)) > 0.707:
+        # Ống ngang trên view
+        dir_perp = reverse_xyz(view_up) if side == 'bottom' else view_up
+        dir_para = view_right if side == 'right' else reverse_xyz(view_right)
+        sorted_cluster = sorted(cluster, key=lambda e: e.Location.Curve.Evaluate(0.5, True).DotProduct(view_up))
+        if side == 'bottom':
+            # Ống thấp nhất lấy bậc đầu tiên khi tag nằm phía dưới
+            sorted_cluster = list(reversed(sorted_cluster))
+    else:
+        # Ống dọc trên view / ống đứng
+        dir_perp = view_right if side == 'right' else reverse_xyz(view_right)
+        dir_para = reverse_xyz(view_up) if side == 'bottom' else view_up
+        sorted_cluster = sorted(cluster, key=lambda e: e.Location.Curve.Evaluate(0.5, True).DotProduct(view_right))
+
+    model_first_offset = mm_to_feet(4.0, view_scale)
+    model_spacing = mm_to_feet(options['spacing_mm'], view_scale)
+    return sorted_cluster, dir_perp, dir_para, model_first_offset, model_spacing
+
+
+def get_linear_tag_head(elem, index, dir_perp, dir_para, model_first_offset, model_spacing):
+    mid_point = elem.Location.Curve.Evaluate(0.5, True)
+    return mid_point + dir_perp * model_first_offset + dir_para * (index * model_spacing)
+
+
+def get_device_tag_head(elem, active_view, options):
+    view_scale = active_view.Scale
+    if view_scale <= 0:
+        raise Exception(u'Active view không có tỷ lệ hợp lệ để tính khoảng cách tag.')
+    pt = get_element_point(elem)
+    if pt is None:
+        raise Exception(u'Không xác định được vị trí thiết bị.')
+    side_vec = get_side_vector(active_view, options.get('tag_side', 'left'))
+    return pt + side_vec * mm_to_feet(options['device_offset_mm'], view_scale)
+
+
+def build_tag_jobs(active_view, options, clusters, devices):
+    """Danh sách (element, kind, head_pos) dùng chung cho Create / Align / Normalize."""
+    jobs = []
+    skipped = 0
+    for cluster in clusters:
+        if not cluster:
+            continue
+        try:
+            sorted_cluster, dir_perp, dir_para, first_off, spacing = \
+                get_cluster_layout(active_view, options, cluster)
+        except Exception as ex:
+            skipped += len(cluster)
+            log(u'Lỗi xử lý cụm: {}'.format(ensure_unicode(ex)))
+            continue
+        for index, elem in enumerate(sorted_cluster):
+            try:
+                head = get_linear_tag_head(elem, index, dir_perp, dir_para, first_off, spacing)
+                jobs.append((elem, get_element_kind(elem), head))
+            except Exception as ex:
+                skipped += 1
+                log(u'Lỗi tính vị trí tag ID {}: {}'.format(elem.Id, ensure_unicode(ex)))
+    for elem in devices:
+        try:
+            jobs.append((elem, get_element_kind(elem), get_device_tag_head(elem, active_view, options)))
+        except Exception as ex:
+            skipped += 1
+            log(u'Lỗi tính vị trí tag thiết bị ID {}: {}'.format(elem.Id, ensure_unicode(ex)))
+    return jobs, skipped
+
+
+def kind_wants_leader(kind, options):
+    if KIND_INFO[kind]['linear']:
+        return True
+    return bool(options.get('device_leader', False))
+
+
+def apply_leader(tag, want_leader):
+    try:
+        tag.HasLeader = want_leader
+    except:
+        pass
+    if want_leader:
+        try:
+            tag.LeaderEndCondition = LeaderEndCondition.Attached
+        except:
+            pass
+
+
+def get_tag_symbols(doc, options, kinds_needed):
+    symbols = {}
+    for kind in kinds_needed:
+        type_id = options['tag_type_ids'].get(kind)
+        sym = doc.GetElement(type_id) if type_id else None
+        if not sym:
+            raise Exception(u'Không tìm thấy Tag Type đã chọn cho {}.'.format(KIND_INFO[kind]['label']))
+        symbols[kind] = sym
+    return symbols
+
+
+def activate_symbols(doc, symbols):
+    changed = False
+    for sym in symbols.values():
+        if not sym.IsActive:
+            sym.Activate()
+            changed = True
+    if changed:
+        doc.Regenerate()
+
+
+def new_counter():
+    return dict((k, 0) for k in KIND_ORDER)
+
+
+def create_tags(doc, active_view, options, jobs, tagged_dict):
+    kinds_needed = sorted(set([j[1] for j in jobs]))
+    symbols = get_tag_symbols(doc, options, kinds_needed)
+    tag_all = options['tag_condition'] == 'all'
+
+    created = new_counter()
+    deleted_count = 0
+    skipped_count = 0
+    deleted_keys = set()
+
+    with revit.Transaction('Tag MEP Pro - Create'):
+        activate_symbols(doc, symbols)
+        for elem, kind, head_pos in jobs:
+            try:
+                eid = get_id_value(elem.Id)
+                if tag_all and eid in tagged_dict:
+                    for old_tag_id in tagged_dict[eid]:
+                        key = get_id_value(old_tag_id)
+                        if key in deleted_keys:
+                            continue
+                        try:
+                            doc.Delete(old_tag_id)
+                            deleted_keys.add(key)
+                            deleted_count += 1
+                        except:
+                            pass
+
+                want_leader = kind_wants_leader(kind, options)
+                new_tag = IndependentTag.Create(
+                    doc,
+                    symbols[kind].Id,
+                    active_view.Id,
+                    Reference(elem),
+                    want_leader,
+                    TagOrientation.Horizontal,
+                    head_pos)
+                apply_leader(new_tag, want_leader)
+                try:
+                    new_tag.TagHeadPosition = head_pos
+                except:
+                    pass
+                created[kind] += 1
+            except Exception as ex:
+                skipped_count += 1
+                log(u'Lỗi tại {} ID {}: {}'.format(KIND_INFO[kind]['label'], elem.Id, ensure_unicode(ex)))
+
+    return {'created': created, 'deleted': deleted_count, 'aligned': new_counter(),
+            'type_changed': 0, 'skipped': skipped_count, 'duplicate_tags': 0}
+
+
+def process_existing_tags(doc, active_view, options, jobs, tagged_dict, change_type=False):
+    """Align hoặc Đổi Type + Align tag hiện có. Không xóa/tạo lại tag."""
+    symbols = {}
+    if change_type:
+        kinds_needed = sorted(set([j[1] for j in jobs]))
+        symbols = get_tag_symbols(doc, options, kinds_needed)
+
+    aligned = new_counter()
+    type_changed_count = 0
+    skipped_count = 0
+    duplicate_tags = 0
+
+    name = 'Tag MEP Pro - Normalize' if change_type else 'Tag MEP Pro - Align'
+    with revit.Transaction(name):
+        if change_type:
+            activate_symbols(doc, symbols)
+        for elem, kind, head_pos in jobs:
+            tag_ids = list(tagged_dict.get(get_id_value(elem.Id), []))
+            if not tag_ids:
+                continue
+            if len(tag_ids) > 1:
+                duplicate_tags += len(tag_ids) - 1
+            for tag_id in tag_ids:
+                subtrans = None
+                type_changed_this = False
+                try:
+                    tag = doc.GetElement(tag_id)
+                    if not tag or not isinstance(tag, IndependentTag):
+                        skipped_count += 1
+                        continue
+                    if change_type:
+                        subtrans = SubTransaction(doc)
+                        subtrans.Start()
+                        sym = symbols[kind]
+                        if get_id_value(tag.GetTypeId()) != get_id_value(sym.Id):
+                            tag.ChangeTypeId(sym.Id)
+                            type_changed_this = True
+                        try:
+                            tag.TagOrientation = TagOrientation.Horizontal
+                        except:
+                            pass
+                        apply_leader(tag, kind_wants_leader(kind, options))
+                    tag.TagHeadPosition = head_pos
+                    if subtrans:
+                        subtrans.Commit()
+                    aligned[kind] += 1
+                    if type_changed_this:
+                        type_changed_count += 1
+                except Exception as ex:
+                    if subtrans:
+                        try:
+                            subtrans.RollBack()
+                        except:
+                            pass
+                    skipped_count += 1
+                    log(u'Lỗi xử lý Tag ID {} của {} ID {}: {}'.format(
+                        tag_id, KIND_INFO[kind]['label'], elem.Id, ensure_unicode(ex)))
+
+    return {'created': new_counter(), 'deleted': 0, 'aligned': aligned,
+            'type_changed': type_changed_count, 'skipped': skipped_count,
+            'duplicate_tags': duplicate_tags}
+
+
+SIDE_LABELS = {'left': u'Bên trái', 'right': u'Bên phải', 'top': u'Phía trên', 'bottom': u'Phía dưới'}
+
+
+def format_breakdown(counter):
+    parts = [u'{}: {}'.format(KIND_INFO[k]['label'], counter[k]) for k in KIND_ORDER if counter.get(k)]
+    return u' ({})'.format(u', '.join(parts)) if parts else u''
+
+
+def show_result(options, result, view_range_skipped, used_preselection):
+    lines = []
+    mode = options.get('operation_mode', 'create')
+    if mode == 'create':
+        if options['tag_condition'] == 'all' and result['deleted'] > 0:
+            lines.append(u'Đã xóa {} tag cũ.'.format(result['deleted']))
+        total = sum(result['created'].values())
+        lines.append(u'Đã tạo mới {} tag{}.'.format(total, format_breakdown(result['created'])))
+    elif mode == 'align':
+        total = sum(result['aligned'].values())
+        lines.append(u'Đã align {} tag hiện có{}.'.format(total, format_breakdown(result['aligned'])))
+        lines.append(u'Không đổi Tag Type, leader hoặc orientation.')
+    else:
+        total = sum(result['aligned'].values())
+        lines.append(u'Đã đưa {} tag về vị trí cấu hình{}.'.format(total, format_breakdown(result['aligned'])))
+        lines.append(u'Đã đổi type cho {} tag.'.format(result['type_changed']))
+        lines.append(u'Đã áp dụng Horizontal + Leader theo cấu hình.')
+    lines.append(u'Vị trí tag: {}.'.format(SIDE_LABELS.get(options.get('tag_side', 'left'), u'Bên trái')))
+    if result['duplicate_tags'] > 0:
+        lines.append(u'Phát hiện {} tag bổ sung trên các đối tượng có nhiều tag; các tag này cũng được xử lý.'.format(result['duplicate_tags']))
+    if result['skipped'] > 0:
+        lines.append(u'Bỏ qua {} tag/đối tượng do lỗi (xem cửa sổ pyRevit).'.format(result['skipped']))
+    if view_range_skipped > 0:
+        lines.append(u'Bỏ qua {} đối tượng nằm ngoài View Range.'.format(view_range_skipped))
+    if used_preselection:
+        lines.append(u'Đã dùng trực tiếp các đối tượng được chọn trước khi mở lệnh.')
+    toast_msg(u'\n'.join(lines))
+
+
+def run_tool():
+    doc = revit.doc
+    uidoc = revit.uidoc
+    active_view = doc.ActiveView
+
+    win = TagMEPWPF(xaml_file)
+    win.show_dialog()
+    options = win.result
+    if not options:
+        return
+
+    view_range_bounds = resolve_view_range_bounds(doc, active_view, options)
+    if view_range_bounds is False:
+        return
+
+    try:
+        raw_elements, used_preselection = collect_input_targets(
+            doc, uidoc, active_view, options, view_range_bounds)
+    except OperationCanceledException:
+        return
+
+    label = kinds_label(options['kinds'])
+    if not raw_elements:
+        alert_msg(u'Không có {} nào trong phạm vi xử lý.'.format(label))
+        return
+
+    try:
+        tagged_dict = get_tagged_dict(doc, active_view, options['kinds'])
+        linear_elements, devices, view_range_skipped = filter_targets(
+            raw_elements, options, view_range_bounds, tagged_dict)
+
+        if not linear_elements and not devices:
+            mode = options.get('operation_mode', 'create')
+            if mode in ('align', 'normalize'):
+                alert_msg(u'Không tìm thấy {} đã có tag trong active view và thỏa mãn các điều kiện lọc.'.format(label))
+            elif view_range_bounds and view_range_skipped > 0:
+                alert_msg(u'Không có đối tượng thỏa mãn điều kiện lọc. {} đối tượng bị bỏ qua vì nằm ngoài View Range.'.format(view_range_skipped))
+            else:
+                alert_msg(u'Không tìm thấy {} nào thỏa mãn các điều kiện lọc.'.format(label))
+            return
+
+        clusters = build_parallel_clusters(linear_elements)
+        jobs, layout_skipped = build_tag_jobs(active_view, options, clusters, devices)
+
+        mode = options.get('operation_mode', 'create')
+        if mode == 'align':
+            result = process_existing_tags(doc, active_view, options, jobs, tagged_dict, False)
+        elif mode == 'normalize':
+            result = process_existing_tags(doc, active_view, options, jobs, tagged_dict, True)
+        else:
+            result = create_tags(doc, active_view, options, jobs, tagged_dict)
+
+        result['skipped'] += layout_skipped
+        show_result(options, result, view_range_skipped, used_preselection)
+
+    except Exception as ex:
+        alert_msg(u'Lỗi hệ thống: {}'.format(ensure_unicode(ex)))
+        log(traceback.format_exc())
+
+
+if __name__ == '__main__':
+    run_tool()

@@ -1,7 +1,7 @@
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="Drainage Schematic Generator"
-        Width="1260" Height="880" MinWidth="1000" MinHeight="660"
+        Width="1380" Height="900" MinWidth="1100" MinHeight="660"
         WindowStartupLocation="CenterScreen"
         FontFamily="Segoe UI" FontSize="12"
         Background="#F5F6F8">
@@ -76,6 +76,29 @@
                         <TextBox x:Name="tb_scale"/>
                     </DockPanel>
 
+                    <!-- ===== CHANGE TRACKING ===== -->
+                    <TextBlock Style="{StaticResource Section}" Text="Change tracking (log)"/>
+                    <Border Background="#FFF4F4" BorderBrush="#E8B4B4" BorderThickness="1" Padding="6,4">
+                        <StackPanel>
+                            <CheckBox x:Name="ck_mark" FontWeight="SemiBold" Foreground="#B00000"
+                                      Content="Mark changes vs previous run (NEW / MOD / DEL)"
+                                      ToolTip="Log of all Element IDs is saved every run. When ticked, positions that changed since the previous run of the same schematic are circled."/>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Mark style"/>
+                                <ComboBox x:Name="cb_markstyle"/>
+                            </DockPanel>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Mark radius (paper mm)"/>
+                                <TextBox x:Name="tb_mrad"/>
+                            </DockPanel>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Ignore movement below (mm)"/>
+                                <TextBox x:Name="tb_mtol"/>
+                            </DockPanel>
+                            <TextBlock x:Name="txt_loginfo" Foreground="#666" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                        </StackPanel>
+                    </Border>
+
                     <TextBlock Style="{StaticResource Section}" Text="Network &amp; order"/>
                     <DockPanel>
                         <TextBlock Style="{StaticResource RowLabel}" Text="Symbol order"/>
@@ -89,10 +112,31 @@
                         <TextBlock Style="{StaticResource RowLabel}" Text="Main pipe"/>
                         <ComboBox x:Name="cb_mainmode"/>
                     </DockPanel>
-                    <DockPanel>
-                        <TextBlock Style="{StaticResource RowLabel}" Text="Horizontal main below level (mm)"/>
-                        <TextBox x:Name="tb_hdrop"/>
-                    </DockPanel>
+
+                    <!-- ===== HORIZONTAL MAIN ELEVATION ===== -->
+                    <Border Background="#EEF6EE" BorderBrush="#B9D8B9" BorderThickness="1" Padding="6,4" Margin="0,2">
+                        <StackPanel>
+                            <CheckBox x:Name="ck_hreal" FontWeight="SemiBold" Foreground="#1E6B1E"
+                                      Content="Horizontal main at REAL elevation (interpolated between levels)"
+                                      ToolTip="Y of the horizontal main = model Z of its pipes, interpolated between the two levels that bracket it. Unticked = old behaviour: level of the main - drop."/>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Main elevation from"
+                                           ToolTip="Average = median Z of the main pipes (graded pipe drawn flat). Lowest point = lowest pipe end (outlet end)."/>
+                                <ComboBox x:Name="cb_hz"/>
+                            </DockPanel>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Min. clearance from level (paper mm)"
+                                           ToolTip="If the main is closer than this to a level line, it is pushed away so it never overlaps the level line."/>
+                                <TextBox x:Name="tb_hclear"/>
+                            </DockPanel>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Horizontal main below level (mm)"
+                                           ToolTip="Only used when REAL elevation is unticked."/>
+                                <TextBox x:Name="tb_hdrop"/>
+                            </DockPanel>
+                        </StackPanel>
+                    </Border>
+
                     <DockPanel>
                         <TextBlock Style="{StaticResource RowLabel}" Text="Outlet (start of network)"/>
                         <ComboBox x:Name="cb_root"/>
@@ -106,7 +150,10 @@
                         <ComboBox x:Name="cb_group"/>
                     </DockPanel>
                     <CheckBox x:Name="ck_btag" Content="Show branch tag  B(order) (fixture count)"/>
-                    <CheckBox x:Name="ck_xconn" Content="Mark system change / connection points (vent = riser)"/>
+                    <CheckBox x:Name="ck_nocross"
+                              Content="Avoid crossing: push sub-stacks left (lowest junction left-most)"
+                              ToolTip="Sub-stacks / risers joining a stack are ordered by the height of their junction: the lowest junction is placed furthest left, so its horizontal branch passes below the risers to its right instead of crossing them. Unticked = old order (farthest from outlet left-most)."/>
+                    <CheckBox x:Name="ck_xconn" Content="Mark system change / connection points (vent risers always drawn)"/>
 
                     <TextBlock Style="{StaticResource Section}" Text="Levels"/>
                     <DockPanel>
@@ -126,9 +173,31 @@
 
                     <TextBlock Style="{StaticResource Section}" Text="Layout (paper mm)"/>
                     <DockPanel>
-                        <TextBlock Style="{StaticResource RowLabel}" Text="Level spacing"/>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Level spacing (minimum)"/>
                         <TextBox x:Name="tb_lsp"/>
                     </DockPanel>
+                    <Border Background="#EEF6EE" BorderBrush="#B9D8B9" BorderThickness="1" Padding="6,4" Margin="0,2">
+                        <StackPanel>
+                            <CheckBox x:Name="ck_autolsp" FontWeight="SemiBold" Foreground="#1E6B1E"
+                                      Content="Auto-expand level spacing to fit branches"
+                                      ToolTip="Each storey grows so that all horizontal branches hanging below a level (and the horizontal main) stay between that level and the level below."/>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Free space above level"
+                                           ToolTip="Paper mm kept free above every level for symbols and labels."/>
+                                <TextBox x:Name="tb_lfree"/>
+                            </DockPanel>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Main gap below lowest branch"
+                                           ToolTip="Paper mm between the lowest branch of the level above and the horizontal main."/>
+                                <TextBox x:Name="tb_hgap"/>
+                            </DockPanel>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="Main gap above level below"
+                                           ToolTip="Paper mm minimum between the horizontal main and the level line under it. When the main is pushed down by branches above, it is centred between those branches and this limit."/>
+                                <TextBox x:Name="tb_habove"/>
+                            </DockPanel>
+                        </StackPanel>
+                    </Border>
                     <DockPanel>
                         <TextBlock Style="{StaticResource RowLabel}" Text="Symbol spacing"/>
                         <TextBox x:Name="tb_ssp"/>
@@ -171,13 +240,44 @@
                         <TextBox x:Name="tb_boff"/>
                     </DockPanel>
                     <DockPanel>
-                        <TextBlock Style="{StaticResource RowLabel}" Text="Label offset above symbol"/>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Label gap above symbol top"
+                                   ToolTip="Paper mm between the top of the symbol graphics and the bottom of its label"/>
                         <TextBox x:Name="tb_loff"/>
                     </DockPanel>
                     <DockPanel>
                         <TextBlock Style="{StaticResource RowLabel}" Text="Level text width"/>
                         <TextBox x:Name="tb_ltw"/>
                     </DockPanel>
+
+                    <!-- ===== FLOOR WASTE (FWG / FW) ===== -->
+                    <TextBlock Style="{StaticResource Section}" Text="Floor waste inlet (FWG / FW)"/>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Floor waste names"
+                                   ToolTip="Schematic Name of floor waste symbols, comma separated (e.g. FWG, FW)"/>
+                        <TextBox x:Name="tb_fwgnames"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Inlet below level (paper mm)"
+                                   ToolTip="Inlet point of fixtures into FWG / FW is this far below the level line (0 = on level)"/>
+                        <TextBox x:Name="tb_fwgdrop"/>
+                    </DockPanel>
+                    <DockPanel>
+                        <TextBlock Style="{StaticResource RowLabel}" Text="Single inlet side"
+                                   ToolTip="FWG / FW with only ONE inlet: the fixture drop is shifted half a symbol spacing to this side so it always enters the FWG centre. Center = old behaviour."/>
+                        <ComboBox x:Name="cb_fwgside"/>
+                    </DockPanel>
+                    <Border Background="#EEF6EE" BorderBrush="#B9D8B9" BorderThickness="1" Padding="6,4" Margin="0,2">
+                        <StackPanel>
+                            <CheckBox x:Name="ck_fwg45" FontWeight="SemiBold" Foreground="#1E6B1E"
+                                      Content="45° segment into FWG / FW"
+                                      ToolTip="Horizontal pipe from fixtures runs below the FWG inlet, then rises 45° into the FWG centre (one 45° segment per side). Unticked = straight horizontal pipe into the FWG centre."/>
+                            <DockPanel>
+                                <TextBlock Style="{StaticResource RowLabel}" Text="45° segment size (paper mm)"
+                                           ToolTip="Horizontal and vertical length of the 45° segment. Reduced automatically when a fixture is closer to the FWG than this. 0 = off."/>
+                                <TextBox x:Name="tb_fwg45"/>
+                            </DockPanel>
+                        </StackPanel>
+                    </Border>
 
                     <TextBlock Style="{StaticResource Section}" Text="Graphics"/>
                     <DockPanel>
@@ -191,7 +291,7 @@
 
                     <TextBlock Style="{StaticResource Section}" Text="Options"/>
                     <CheckBox x:Name="ck_combine" Content="Combine consecutive identical items in branch (xN)"/>
-                    <CheckBox x:Name="ck_label" Content="Add label (Type Mark / Type Name)"/>
+                    <CheckBox x:Name="ck_label" Content="Add label (Schematic Name, else Type Mark / Type Name)"/>
                     <CheckBox x:Name="ck_ph" Content="Text placeholder for unmapped families"/>
                     <CheckBox x:Name="ck_vent" Content="Extend Vent stacks to atmosphere"/>
                 </StackPanel>
@@ -236,7 +336,7 @@
                     <Button x:Name="btn_clear" Content="Clear symbol" Margin="4,0,0,0"/>
                 </StackPanel>
                 <TextBlock VerticalAlignment="Center" TextWrapping="Wrap">
-                    <Run FontWeight="SemiBold" Foreground="#1F4E79" Text="Model family  →  Schematic symbol"/>
+                    <Run FontWeight="SemiBold" Foreground="#1F4E79" Text="Model family  →  Schematic symbol  /  name"/>
                     <Run Foreground="#666" Text="  (saved after each run)"/>
                 </TextBlock>
             </DockPanel>
@@ -264,8 +364,19 @@
                     <DataGridTextColumn Header="Category" Binding="{Binding Category}" IsReadOnly="True" Width="130"/>
                     <DataGridTextColumn Header="Model Family : Type" Binding="{Binding ModelKey}" IsReadOnly="True" Width="2*"/>
                     <DataGridTextColumn Header="Qty" Binding="{Binding Qty}" IsReadOnly="True" Width="50"/>
+                    <!-- index 3: script fills ItemsSource of this column -->
                     <DataGridComboBoxColumn Header="Schematic Symbol" Width="2*"
                                             SelectedItemBinding="{Binding Symbol, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+                    <!-- index 4: custom label written on the schematic, empty = Type Mark / Type Name -->
+                    <DataGridTextColumn Header="Schematic Name (empty = auto)" Width="1.5*"
+                                        Binding="{Binding SchName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}">
+                        <DataGridTextColumn.CellStyle>
+                            <Style TargetType="DataGridCell">
+                                <Setter Property="Background" Value="#FFFDE7"/>
+                                <Setter Property="ToolTip" Value="Double-click / F2 to type the name shown on the schematic"/>
+                            </Style>
+                        </DataGridTextColumn.CellStyle>
+                    </DataGridTextColumn>
                 </DataGrid.Columns>
             </DataGrid>
         </Grid>
